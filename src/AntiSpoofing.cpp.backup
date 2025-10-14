@@ -1,0 +1,1729 @@
+#include "AntiSpoofing.hpp"
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+
+namespace mdai {
+
+// ============================================================================
+// QualityGate Implementation
+// ============================================================================
+
+QualityGate::QualityGate(const AntiSpoofingConfig& config) : config_(config) {
+#ifdef HAVE_OPENCV
+    // Load face cascade classifier
+    std::string cascade_path = "haarcascade_frontalface_alt.xml";
+    face_cascade_loaded_ = face_cascade_.load(cascade_path);
+    
+    if (!face_cascade_loaded_) {
+        std::cerr << "WARNING: Failed to load face cascade from " << cascade_path << std::endl;
+        std::cerr << "Face detection will be disabled. Anti-spoofing will use fallback mode." << std::endl;
+    } else {
+        std::cout << "✓ Face cascade loaded successfully" << std::endl;
+    }
+#else
+    std::cerr << "WARNING: OpenCV not available. Face detection disabled." << std::endl;
+#endif
+}
+
+FaceROI QualityGate::detect_face(const FrameBox* frame) {
+    FaceROI face;
+    face.detected = false;
+    
+    if (!frame || frame->color_data.empty()) {
+        return face;
+    }
+    
+#ifdef HAVE_OPENCV
+    if (!face_cascade_loaded_) {
+        return face;
+    }
+    
+    // Get color image
+    cv::Mat color_mat = frame->get_color_mat();
+    if (color_mat.empty()) {
+        return face;
+    }
+    
+    // Convert to grayscale
+    cv::Mat gray;
+    cv::cvtColor(color_mat, gray, cv::COLOR_BGR2GRAY);
+    
+    // Apply CLAHE for better detection across skin tones
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat enhanced;
+    clahe->apply(gray, enhanced);
+    
+    // Detect faces with proper parameters
+    std::vector<cv::Rect> faces;
+    std::vector<int> num_detections;
+    face_cascade_.detectMultiScale(
+        enhanced,
+        faces,
+        num_detections,
+        1.1,           // scaleFactor
+        3,             // minNeighbors
+        cv::CASCADE_SCALE_IMAGE,
+        cv::Size(30, 30),   // minSize
+        cv::Size(300, 300)  // maxSize
+    );
+    
+    // DEBUG
+    static int face_debug_counter = 0;
+    if (++face_debug_counter % 30 == 0) {
+        std::cout << "[DEBUG Face] Detected " << faces.size() << " faces" << std::endl;
+    }
+    
+    if (faces.empty()) {
+        return face;
+    }
+    
+    // Find best face (highest confidence + largest)
+    int best_idx = 0;
+    float best_score = 0.0f;
+    for (size_t i = 0; i < faces.size(); ++i) {
+        float size_score = faces[i].area() / (100.0f * 100.0f);
+        float detection_score = num_detections[i] / 10.0f;
+        float total_score = (size_score + detection_score) / 2.0f;
+        
+        if (total_score > best_score) {
+            best_score = total_score;
+            best_idx = i;
+        }
+    }
+    
+    face.detected = true;
+    face.bbox = faces[best_idx];
+    face.confidence = std::min(1.0f, best_score);
+    
+    // Generate facial landmarks (5 points based on face geometry)
+    float cx = face.bbox.x + face.bbox.width * 0.5f;
+    float eye_y = face.bbox.y + face.bbox.height * 0.35f;
+    float nose_y = face.bbox.y + face.bbox.height * 0.6f;
+    float mouth_y = face.bbox.y + face.bbox.height * 0.8f;
+    float eye_width = face.bbox.width * 0.25f;
+    float mouth_width = face.bbox.width * 0.4f;
+    
+    face.landmarks = {
+        cv::Point2f(cx - eye_width, eye_y),         // Left eye
+        cv::Point2f(cx + eye_width, eye_y),         // Right eye
+        cv::Point2f(cx, nose_y),                    // Nose tip
+        cv::Point2f(cx - mouth_width/2, mouth_y),   // Left mouth corner
+        cv::Point2f(cx + mouth_width/2, mouth_y)    // Right mouth corner
+    };
+    
+#endif
+    
+    return face;
+}
+
+bool QualityGate::process_frame(FrameBox* frame) {
+    if (!frame) return false;
+    
+    // Reset quality gate results
+    frame->metadata.quality_gate = FrameBoxMetadata::QualityGateResults{};
+    
+    // STEP 1: Detect face - this is critical!
+    FaceROI face = detect_face(frame);
+    // If current frame fails detection but we have a recent face, reuse last ROI (stabilize)
+    if (!face.detected && !face_history_.empty()) {
+        const FaceROI& last = face_history_.back();
+        if (last.detected && last.confidence >= 0.7f) {
+            face = last;
+        }
+    }
+    
+    // Store face in history for temporal analysis
+    face_history_.push_back(face);
+    if (face_history_.size() > HISTORY_SIZE) {
+        face_history_.pop_front();
+    }
+    
+    // Propagate face ROI to metadata for downstream stages
+    frame->metadata.face_detected = face.detected;
+    if (face.detected) {
+        frame->metadata.face_x = face.bbox.x;
+        frame->metadata.face_y = face.bbox.y;
+        frame->metadata.face_w = face.bbox.width;
+        frame->metadata.face_h = face.bbox.height;
+        frame->metadata.face_detection_confidence = face.confidence;
+    }
+
+    // If no face detected (and no stable reuse), fail immediately
+    if (!face.detected) {
+        frame->metadata.quality_gate.quality_gate_passed = false;
+        frame->metadata.quality_gate.quality_issues = "No face detected";
+        return false;
+    }
+    
+    // STEP 2: Analyze each quality aspect using ROI-driven methods
+    frame->metadata.quality_gate.lighting_score = analyze_lighting_quality(frame, face);
+    frame->metadata.quality_gate.motion_score = analyze_motion_stability(frame, face);
+    frame->metadata.quality_gate.positioning_score = analyze_face_positioning(frame, face);
+    frame->metadata.quality_gate.synchronization_score = analyze_sensor_synchronization(frame);
+    frame->metadata.quality_gate.stability_score = analyze_camera_stability(frame);
+    
+    // Set individual gate results
+    frame->metadata.quality_gate.lighting_ok = frame->metadata.quality_gate.lighting_score >= config_.min_lighting_score;
+    frame->metadata.quality_gate.motion_stable = frame->metadata.quality_gate.motion_score >= config_.min_motion_score;
+    frame->metadata.quality_gate.face_positioned = frame->metadata.quality_gate.positioning_score >= config_.min_positioning_score;
+    frame->metadata.quality_gate.sensors_synced = frame->metadata.quality_gate.synchronization_score >= config_.min_synchronization_score;
+    frame->metadata.quality_gate.camera_stable = frame->metadata.quality_gate.stability_score >= config_.min_stability_score;
+    
+    // Calculate overall quality score (weighted average)
+    frame->metadata.quality_gate.overall_quality_score = 
+        (frame->metadata.quality_gate.lighting_score * 0.25f +
+         frame->metadata.quality_gate.motion_score * 0.20f +
+         frame->metadata.quality_gate.positioning_score * 0.25f +
+         frame->metadata.quality_gate.synchronization_score * 0.15f +
+         frame->metadata.quality_gate.stability_score * 0.15f);
+    
+    // Overall quality gate decision
+    frame->metadata.quality_gate.quality_gate_passed = 
+        frame->metadata.quality_gate.overall_quality_score >= config_.min_overall_quality;
+    
+    // Generate quality issues if failed
+    if (!frame->metadata.quality_gate.quality_gate_passed) {
+        frame->metadata.quality_gate.quality_issues = generate_quality_issues(frame);
+    }
+    
+    frame->metadata.quality_gate_processed = true;
+    return frame->metadata.quality_gate.quality_gate_passed;
+}
+
+float QualityGate::analyze_lighting_quality(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected) {
+        return 0.0f;
+    }
+    
+#ifdef HAVE_OPENCV
+    // Get color image
+    cv::Mat color_mat = frame->get_color_mat();
+    if (color_mat.empty()) {
+        return 0.0f;
+    }
+    
+    // Extract face ROI
+    cv::Rect roi = face.bbox;
+    if (roi.x < 0 || roi.y < 0 || 
+        roi.x + roi.width > color_mat.cols || 
+        roi.y + roi.height > color_mat.rows) {
+        return 0.0f;
+    }
+    
+    cv::Mat face_region = color_mat(roi);
+    
+    // Convert to grayscale
+    cv::Mat gray;
+    cv::cvtColor(face_region, gray, cv::COLOR_BGR2GRAY);
+    
+    // Apply CLAHE for fair analysis across all skin tones
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat enhanced;
+    clahe->apply(gray, enhanced);
+    
+    // Calculate lighting metrics
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(enhanced, mean, stddev);
+    
+    float brightness = static_cast<float>(mean[0]) / 255.0f;
+    float contrast = static_cast<float>(stddev[0]) / 255.0f;
+    
+    // Fair scoring - inclusive for all skin tones
+    float brightness_score = 1.0f;
+    if (brightness < 0.15f) brightness_score = 0.0f;        // Too dark
+    else if (brightness < 0.25f) brightness_score = 0.5f;   // Dark but workable
+    else if (brightness > 0.85f) brightness_score = 0.0f;   // Too bright (overexposed)
+    else if (brightness > 0.75f) brightness_score = 0.5f;   // Bright but workable
+    else if (brightness >= 0.35f && brightness <= 0.65f) brightness_score = 1.0f;  // Optimal
+    else brightness_score = 0.8f;  // Acceptable
+    
+    // Contrast check
+    float contrast_score = 1.0f;
+    if (contrast < 0.08f) contrast_score = 0.3f;     // Low contrast
+    else if (contrast < 0.15f) contrast_score = 0.7f;  // Medium contrast
+    else contrast_score = 1.0f;  // Good contrast
+    
+    return (brightness_score * 0.6f + contrast_score * 0.4f);
+#else
+    return 0.5f;  // Fallback when OpenCV not available
+#endif
+}
+
+float QualityGate::analyze_motion_stability(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected) {
+        return 0.0f;
+    }
+    
+#ifdef HAVE_OPENCV
+    // Get color image
+    cv::Mat color_mat = frame->get_color_mat();
+    if (color_mat.empty()) {
+        return 0.0f;
+    }
+    
+    // Extract face ROI
+    cv::Rect roi = face.bbox;
+    if (roi.x < 0 || roi.y < 0 || 
+        roi.x + roi.width > color_mat.cols || 
+        roi.y + roi.height > color_mat.rows) {
+        return 0.0f;
+    }
+    
+    cv::Mat face_region = color_mat(roi);
+    
+    // Convert to grayscale
+    cv::Mat gray;
+    cv::cvtColor(face_region, gray, cv::COLOR_BGR2GRAY);
+    
+    // Calculate Laplacian variance (motion blur detection)
+    cv::Mat laplacian;
+    cv::Laplacian(gray, laplacian, CV_64F);
+    
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(laplacian, mean, stddev);
+    float laplacian_variance = static_cast<float>(stddev[0] * stddev[0]);
+    
+    // Score based on sharpness (higher variance = sharper = more stable)
+    float motion_score = 1.0f;
+    if (laplacian_variance < 50.0f) motion_score = 0.0f;       // Very blurry
+    else if (laplacian_variance < 100.0f) motion_score = 0.3f;  // Blurry
+    else if (laplacian_variance < 200.0f) motion_score = 0.6f;  // Slight blur
+    else if (laplacian_variance >= 300.0f) motion_score = 1.0f; // Sharp
+    else motion_score = 0.8f;  // Acceptable
+    
+    return motion_score;
+#else
+    return 0.5f;  // Fallback
+#endif
+}
+
+float QualityGate::analyze_face_positioning(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected) {
+        return 0.0f;
+    }
+    
+    // Check if face is well-centered and sized properly
+    cv::Mat color_mat = frame->get_color_mat();
+    if (color_mat.empty()) {
+        return 0.0f;
+    }
+    
+    float img_center_x = color_mat.cols / 2.0f;
+    float img_center_y = color_mat.rows / 2.0f;
+    
+    float face_center_x = face.bbox.x + face.bbox.width / 2.0f;
+    float face_center_y = face.bbox.y + face.bbox.height / 2.0f;
+    
+    // Calculate offset from center (normalized)
+    float offset_x = std::abs(face_center_x - img_center_x) / img_center_x;
+    float offset_y = std::abs(face_center_y - img_center_y) / img_center_y;
+    
+    // Calculate face size relative to image
+    float face_size_ratio = (face.bbox.width * face.bbox.height) / (float)(color_mat.cols * color_mat.rows);
+    
+    // Score based on centering
+    float centering_score = 1.0f;
+    if (offset_x > 0.5f || offset_y > 0.5f) centering_score = 0.2f;  // Very off-center
+    else if (offset_x > 0.3f || offset_y > 0.3f) centering_score = 0.5f;  // Off-center
+    else if (offset_x < 0.1f && offset_y < 0.1f) centering_score = 1.0f;  // Well-centered
+    else centering_score = 0.8f;  // Acceptable
+    
+    // Score based on size
+    float size_score = 1.0f;
+    if (face_size_ratio < 0.02f) size_score = 0.2f;      // Too small
+    else if (face_size_ratio < 0.05f) size_score = 0.5f;  // Small
+    else if (face_size_ratio > 0.5f) size_score = 0.2f;   // Too large (too close)
+    else if (face_size_ratio > 0.3f) size_score = 0.5f;   // Large
+    else if (face_size_ratio >= 0.1f && face_size_ratio <= 0.25f) size_score = 1.0f;  // Optimal
+    else size_score = 0.8f;  // Acceptable
+    
+    return (centering_score * 0.6f + size_score * 0.4f);
+}
+
+
+// Helper function to convert RGB to HSV
+void rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b, float& h, float& s, float& v) {
+    float rf = r / 255.0f;
+    float gf = g / 255.0f;
+    float bf = b / 255.0f;
+    
+    float max_val = std::max({rf, gf, bf});
+    float min_val = std::min({rf, gf, bf});
+    float delta = max_val - min_val;
+    
+    v = max_val;
+    
+    if (delta < 0.00001f) {
+        s = 0.0f;
+        h = 0.0f;
+        return;
+    }
+    
+    s = delta / max_val;
+    
+    if (max_val == rf) {
+        h = 60.0f * fmod(((gf - bf) / delta), 6.0f);
+    } else if (max_val == gf) {
+        h = 60.0f * ((bf - rf) / delta + 2.0f);
+    } else {
+        h = 60.0f * ((rf - gf) / delta + 4.0f);
+    }
+    
+    if (h < 0.0f) h += 360.0f;
+}
+
+float QualityGate::analyze_sensor_synchronization(const FrameBox* frame) {
+    if (!frame) {
+        return 0.0f;
+    }
+
+    // Presence of streams
+    bool has_depth = !frame->depth_data.empty();
+    bool has_color = !frame->color_data.empty();
+    bool has_ir_left = !frame->ir_left_data.empty();
+    bool has_ir_right = !frame->ir_right_data.empty();
+
+    float presence = ((has_depth?1.0f:0.0f) + (has_color?1.0f:0.0f) + (has_ir_left?1.0f:0.0f) + (has_ir_right?1.0f:0.0f)) / 4.0f;
+
+    // Timestamp alignment (ms)
+    double times[4]; int n=0;
+    if (has_depth) times[n++] = frame->time_depth;
+    if (has_color) times[n++] = frame->time_color;
+    if (has_ir_left) times[n++] = frame->time_ir_left;
+    if (has_ir_right) times[n++] = frame->time_ir_right;
+    float sync_score = 0.0f;
+    if (n >= 2) {
+        double min_t = times[0], max_t = times[0];
+        for (int i=1;i<n;++i){ min_t = std::min(min_t, times[i]); max_t = std::max(max_t, times[i]); }
+        double delta = std::abs(max_t - min_t); // ms
+        // 0-10ms perfect, 10-30ms acceptable, >30ms poor
+        if (delta <= 10.0) sync_score = 1.0f;
+        else if (delta <= 30.0) sync_score = 0.6f;
+        else sync_score = 0.2f;
+    }
+
+    // Combine presence and sync
+    return 0.5f * presence + 0.5f * sync_score;
+}
+
+float QualityGate::analyze_camera_stability(const FrameBox* frame) {
+    if (!frame) {
+        return 0.0f;
+    }
+
+    // Basic checks using captured camera settings snapshot
+    float score = 1.0f;
+
+    // Exposure sanity (assumes microseconds)
+    if (frame->exposure <= 100.0f || frame->exposure >= 60000.0f) {
+        score *= 0.5f; // extreme exposure
+    }
+
+    // Gain sanity
+    if (frame->gain <= 0.0f || frame->gain > 128.0f) {
+        score *= 0.7f;
+    }
+
+    // IR emitter state (prefer enabled for IR/Depth quality)
+    if (frame->emitter_state == 0) {
+        score *= 0.6f; // emitter off degrades stability
+    }
+
+    return std::max(0.0f, std::min(1.0f, score));
+}
+
+std::string QualityGate::generate_quality_issues(const FrameBox* frame) {
+    std::string issues = "";
+    
+    if (!frame->metadata.quality_gate.lighting_ok) {
+        issues += "Poor lighting; ";
+    }
+    if (!frame->metadata.quality_gate.motion_stable) {
+        issues += "Too much movement; ";
+    }
+    if (!frame->metadata.quality_gate.face_positioned) {
+        issues += "Face not properly positioned; ";
+    }
+    if (!frame->metadata.quality_gate.sensors_synced) {
+        issues += "Sensor synchronization issues; ";
+    }
+    if (!frame->metadata.quality_gate.camera_stable) {
+        issues += "Camera stability issues; ";
+    }
+    
+    return issues;
+}
+
+// ============================================================================
+// AntiSpoofingDetector Implementation
+// ============================================================================
+
+AntiSpoofingDetector::AntiSpoofingDetector(const AntiSpoofingConfig& config) : config_(config) {
+    // AntiSpoofingDetector will use QualityGate's face detection
+    // No need to load cascade again - will get FaceROI from QualityGate
+}
+
+bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
+    if (!frame) return false;
+    
+    // Reset anti-spoofing results
+    frame->metadata.anti_spoofing = FrameBoxMetadata::AntiSpoofingResults{};
+    
+    // CRITICAL: We need face detection first!
+    // This should be called AFTER QualityGate::process_frame() which detects face
+    FaceROI face;
+    face.detected = frame->metadata.face_detected;
+    if (face.detected) {
+        face.bbox = cv::Rect(frame->metadata.face_x, frame->metadata.face_y,
+                              frame->metadata.face_w, frame->metadata.face_h);
+        face.confidence = frame->metadata.face_detection_confidence;
+    }
+    
+    // If no face detected, fail anti-spoofing
+    if (!face.detected) {
+        frame->metadata.anti_spoofing.is_live = false;
+        frame->metadata.anti_spoofing.confidence = 0.0f;
+        frame->metadata.anti_spoofing.rejection_reason = "No face detected for anti-spoofing analysis";
+        return false;
+    }
+    
+    // Store face in history for temporal analysis
+    face_history_.push_back(face);
+    if (face_history_.size() > TEMPORAL_WINDOW) {
+        face_history_.pop_front();
+    }
+    
+    // Analyze each anti-spoofing component with face ROI
+    frame->metadata.anti_spoofing.depth_analysis_score = analyze_depth_geometry(frame, face);
+    frame->metadata.anti_spoofing.ir_texture_score = analyze_ir_texture(frame, face);
+    frame->metadata.anti_spoofing.cross_modal_score = analyze_cross_modal_consistency(frame, face);
+    frame->metadata.anti_spoofing.temporal_consistency_score = analyze_temporal_consistency(face);
+    
+    // Set component flags
+    frame->metadata.anti_spoofing.depth_anomaly_detected = 
+        frame->metadata.anti_spoofing.depth_analysis_score < config_.min_depth_analysis_score;
+    frame->metadata.anti_spoofing.ir_material_mismatch = 
+        frame->metadata.anti_spoofing.ir_texture_score < config_.min_ir_texture_score;
+    frame->metadata.anti_spoofing.cross_modal_disagreement = 
+        frame->metadata.anti_spoofing.cross_modal_score < config_.min_cross_modal_score;
+    
+    // Calculate overall liveness score (weighted average)
+    // PRIORITIZE depth geometry - most reliable for detecting flat surfaces
+    frame->metadata.anti_spoofing.overall_liveness_score = 
+        (frame->metadata.anti_spoofing.depth_analysis_score * 0.45f +
+         frame->metadata.anti_spoofing.ir_texture_score * 0.30f +
+         frame->metadata.anti_spoofing.temporal_consistency_score * 0.15f +
+         frame->metadata.anti_spoofing.cross_modal_score * 0.10f);
+    
+    // Detect attack type
+    frame->metadata.anti_spoofing.detected_attack_type = detect_attack_type(frame, face);
+    
+    // Calculate confidence
+    frame->metadata.anti_spoofing.confidence = calculate_confidence(frame, face);
+    
+    // Final liveness decision with dynamic gating
+    bool passes_score = frame->metadata.anti_spoofing.overall_liveness_score >= config_.min_overall_liveness;
+    bool passes_confidence = frame->metadata.anti_spoofing.confidence >= config_.min_confidence;
+
+    bool depth_ok = frame->metadata.anti_spoofing.depth_analysis_score >= config_.min_depth_analysis_score;
+    bool ir_ok = frame->metadata.anti_spoofing.ir_texture_score >= config_.min_ir_texture_score;
+    bool xmodal_ok = frame->metadata.anti_spoofing.cross_modal_score >= config_.min_cross_modal_score;
+    bool temporal_ok = frame->metadata.anti_spoofing.temporal_consistency_score >= config_.min_temporal_consistency_score;
+
+    // Require agreement of at least two signals; emphasize depth or cross-modal when available
+    bool logic_ok = (depth_ok && (xmodal_ok || temporal_ok)) || (xmodal_ok && ir_ok) || (depth_ok && ir_ok);
+    frame->metadata.anti_spoofing.is_live = logic_ok && passes_confidence;
+    
+    // Generate rejection reason if failed
+    if (!frame->metadata.anti_spoofing.is_live) {
+        std::vector<std::string> reasons;
+        if (!depth_ok) reasons.push_back("depth geometry weak");
+        if (!ir_ok) reasons.push_back("IR texture weak");
+        if (!xmodal_ok) reasons.push_back("cross-modal inconsistent");
+        if (!temporal_ok) reasons.push_back("temporal weak");
+        if (!passes_score) reasons.push_back("low liveness score");
+        if (!passes_confidence) reasons.push_back("low confidence");
+        
+        if (!reasons.empty()) {
+            frame->metadata.anti_spoofing.rejection_reason = "";
+            for (size_t i = 0; i < reasons.size(); i++) {
+                frame->metadata.anti_spoofing.rejection_reason += reasons[i];
+                if (i < reasons.size() - 1) frame->metadata.anti_spoofing.rejection_reason += ", ";
+            }
+        } else {
+            frame->metadata.anti_spoofing.rejection_reason = generate_rejection_reason(frame);
+        }
+    }
+    
+    frame->metadata.anti_spoofing_processed = true;
+    return frame->metadata.anti_spoofing.is_live;
+}
+
+float AntiSpoofingDetector::process_temporal_analysis(const std::vector<FrameBox*>& frames, FrameBox* current_frame) {
+    // PLACEHOLDER: Temporal analysis
+    // TODO: Implement actual temporal analysis
+    // - Analyze micro-movements across frames
+    // - Check for natural breathing patterns
+    // - Detect blink patterns
+    // - Validate temporal consistency
+    
+    if (frames.empty() || !current_frame) {
+        return 0.0f;
+    }
+    
+    // Simple placeholder: assume good temporal consistency if frames exist
+    // In real implementation, this would analyze frame sequences
+    current_frame->metadata.anti_spoofing.temporal_consistency_score = 0.8f;
+    current_frame->metadata.anti_spoofing.temporal_inconsistency = false;
+    
+    return current_frame->metadata.anti_spoofing.temporal_consistency_score;
+}
+
+float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || frame->depth_data.empty() || frame->depth_width <= 0 || frame->depth_height <= 0) {
+        return 0.0f;
+    }
+
+#ifdef HAVE_OPENCV
+    // Convert face bbox from color space to depth space
+    // Prefer exact mapping when aligned; otherwise scale by actual resolutions
+    cv::Rect depth_roi;
+    if (frame->color_width > 0 && frame->color_height > 0) {
+        depth_roi.x = static_cast<int>(face.bbox.x * static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width));
+        depth_roi.y = static_cast<int>(face.bbox.y * static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height));
+        depth_roi.width = static_cast<int>(face.bbox.width * static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width));
+        depth_roi.height = static_cast<int>(face.bbox.height * static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height));
+    } else {
+        // Fallback: use face bbox directly
+        depth_roi = face.bbox;
+    }
+    
+    // Clamp to depth image bounds
+    depth_roi.x = std::max(0, std::min(depth_roi.x, frame->depth_width - 1));
+    depth_roi.y = std::max(0, std::min(depth_roi.y, frame->depth_height - 1));
+    depth_roi.width = std::min(depth_roi.width, frame->depth_width - depth_roi.x);
+    depth_roi.height = std::min(depth_roi.height, frame->depth_height - depth_roi.y);
+    
+    if (depth_roi.width <= 0 || depth_roi.height <= 0) {
+        return 0.0f;
+    }
+    
+    // Extract deprojected 3D points in meters from the face region
+    std::vector<cv::Point3f> face_points_all;
+    std::vector<float> depth_values_all;
+    face_points_all.reserve(static_cast<size_t>(depth_roi.width * depth_roi.height / 4));
+    for (int y = depth_roi.y; y < depth_roi.y + depth_roi.height; y += 2) {
+        for (int x = depth_roi.x; x < depth_roi.x + depth_roi.width; x += 2) {
+            int idx = y * frame->depth_width + x;
+            if (idx < (int)frame->depth_data.size()) {
+                uint16_t depth_raw = frame->depth_data[idx];
+                if (depth_raw > 0) {
+                    float z = depth_raw * frame->depth_scale; // meters
+                    float pix[2] = { static_cast<float>(x), static_cast<float>(y) };
+                    float p3[3];
+                    rs2_deproject_pixel_to_point(p3, &frame->depth_intrinsics, pix, z);
+                    face_points_all.emplace_back(p3[0], p3[1], p3[2]);
+                    depth_values_all.push_back(p3[2]);
+                }
+            }
+        }
+    }
+    
+    if (face_points_all.size() < 10) {
+        return 0.0f;  // Not enough depth data
+    }
+
+    // Robust depth masking: keep points near median depth to remove background leakage
+    std::vector<float> tmp = depth_values_all;
+    std::nth_element(tmp.begin(), tmp.begin() + tmp.size()/2, tmp.end());
+    float median_z = tmp[tmp.size()/2];
+    const float band = 0.08f; // +/- 8 cm around median depth
+    std::vector<cv::Point3f> face_points;
+    std::vector<float> depth_values;
+    face_points.reserve(face_points_all.size());
+    depth_values.reserve(depth_values_all.size());
+    for (size_t i=0;i<face_points_all.size();++i){
+        if (std::abs(depth_values_all[i]-median_z) <= band){
+            face_points.push_back(face_points_all[i]);
+            depth_values.push_back(depth_values_all[i]);
+        }
+    }
+    if (face_points.size() < 10) return 0.0f;
+    
+    // REAL 3D Analysis
+    float geometry_score = 0.0f;
+    
+    // 1. PLANE FITTING - detect flat surfaces (photos, screens)
+    if (face_points.size() >= 3) {
+        // Fit plane Z = aX + bY + c (all in meters) using least squares
+        cv::Mat A((int)face_points.size(), 3, CV_32F);
+        cv::Mat B((int)face_points.size(), 1, CV_32F);
+        for (size_t i = 0; i < face_points.size(); i++) {
+            A.at<float>((int)i, 0) = face_points[i].x;
+            A.at<float>((int)i, 1) = face_points[i].y;
+            A.at<float>((int)i, 2) = 1.0f;
+            B.at<float>((int)i, 0) = face_points[i].z;
+        }
+        cv::Mat plane_params;
+        cv::solve(A, B, plane_params, cv::DECOMP_SVD);
+
+        // Calculate residual error (meters)
+        float total_error = 0.0f;
+        for (size_t i = 0; i < face_points.size(); i++) {
+            float predicted_z = plane_params.at<float>(0) * face_points[i].x +
+                                plane_params.at<float>(1) * face_points[i].y +
+                                plane_params.at<float>(2);
+            total_error += std::abs(face_points[i].z - predicted_z);
+        }
+        float avg_plane_error = total_error / face_points.size();
+        
+        // Approximate face size in meters at median depth, using bbox width/height
+        float tl_pix[2] = { (float)depth_roi.x, (float)depth_roi.y };
+        float tr_pix[2] = { (float)(depth_roi.x + depth_roi.width), (float)depth_roi.y };
+        float bl_pix[2] = { (float)depth_roi.x, (float)(depth_roi.y + depth_roi.height) };
+        float tl3[3], tr3[3], bl3[3];
+        rs2_deproject_pixel_to_point(tl3, &frame->depth_intrinsics, tl_pix, median_z);
+        rs2_deproject_pixel_to_point(tr3, &frame->depth_intrinsics, tr_pix, median_z);
+        rs2_deproject_pixel_to_point(bl3, &frame->depth_intrinsics, bl_pix, median_z);
+        float width_m = std::abs(tr3[0]-tl3[0]);
+        float height_m = std::abs(bl3[1]-tl3[1]);
+        float diag_m = std::sqrt(width_m*width_m + height_m*height_m) + 1e-6f;
+        float norm_plane_error = avg_plane_error / diag_m; // scale-invariant
+        
+        static int debug_counter = 0;
+        if (++debug_counter % 30 == 0) {
+            std::cout << "[DEBUG Depth] Plane error: " << (avg_plane_error * 1000.0f) << "mm, "
+                      << "Norm: " << norm_plane_error << ", Face diag: " << (diag_m*1000.0f) << "mm" << std::endl;
+        }
+        
+        // If points fit a plane too well, it's likely a flat surface (spoof)
+        // Strict but human-tolerant thresholds (meters)
+        if (norm_plane_error < 0.01f || avg_plane_error < 0.006f) {            // very flat
+            return 0.0f;                           // immediate reject (flat surface)
+        } else if (avg_plane_error < 0.015f) {     // 6–15 mm
+            geometry_score += 0.2f;                // suspicious
+        } else if (avg_plane_error < 0.025f) {     // 15–25 mm
+            geometry_score += 0.6f;                // moderate
+        } else {
+            geometry_score += 1.0f;                // strong 3D structure
+        }
+    }
+    
+    // 2. FACE CURVATURE - real faces have natural curvature
+    if (depth_values.size() >= 5) {
+        float min_depth = *std::min_element(depth_values.begin(), depth_values.end());
+        float max_depth = *std::max_element(depth_values.begin(), depth_values.end());
+        float depth_range = max_depth - min_depth;  // Fixed: always positive
+        
+        // Real faces should have 30-100mm depth variation
+        // STRICT: Photos/screens will have <20mm variation
+        if (depth_range < 0.02f) {  // < 20mm
+            geometry_score += 0.0f;  // Too flat - REJECT (photo/screen)
+        } else if (depth_range < 0.03f) {  // 20-30mm
+            geometry_score += 0.2f;  // Minimal depth - SUSPICIOUS
+        } else if (depth_range > 0.15f) {  // > 150mm
+            geometry_score += 0.1f;  // Too much variation (noise/background)
+        } else {
+            geometry_score += 1.0f;  // Good face depth range (30-150mm)
+        }
+    }
+    
+    // 3. SURFACE NORMAL VARIANCE - real faces have varying surface normals
+    if (face_points.size() >= 9) {  // Need at least 3x3 for gradients
+        float normal_variance = 0.0f;
+        int valid_normals = 0;
+        
+        // Calculate surface normals using neighboring points
+        for (int y = 1; y < depth_roi.height - 1; y++) {
+            for (int x = 1; x < depth_roi.width - 1; x++) {
+                int center_idx = y * frame->depth_width + (depth_roi.x + x);
+                int right_idx = center_idx + 1;
+                int down_idx = center_idx + frame->depth_width;
+                
+                if (center_idx < frame->depth_data.size() && 
+                    right_idx < frame->depth_data.size() && 
+                    down_idx < frame->depth_data.size()) {
+                    
+                    uint16_t center_depth = frame->depth_data[center_idx];
+                    uint16_t right_depth = frame->depth_data[right_idx];
+                    uint16_t down_depth = frame->depth_data[down_idx];
+                    
+                    if (center_depth > 0 && right_depth > 0 && down_depth > 0) {
+                        // Calculate gradient
+                        float dx = (right_depth - center_depth) * 0.001f;
+                        float dy = (down_depth - center_depth) * 0.001f;
+                        float gradient_magnitude = std::sqrt(dx*dx + dy*dy);
+                        normal_variance += gradient_magnitude;
+                        valid_normals++;
+                    }
+                }
+            }
+        }
+        
+        if (valid_normals > 0) {
+            normal_variance /= valid_normals;
+            
+            // Real faces have moderate surface normal variance
+            if (normal_variance < 0.001f) {
+                geometry_score += 0.0f;  // Too smooth (flat surface)
+            } else if (normal_variance > 0.05f) {
+                geometry_score += 0.2f;  // Too noisy
+            } else {
+                geometry_score += 1.0f;  // Good surface variation
+            }
+        }
+    }
+    
+    return geometry_score / 3.0f;  // Average of three tests
+#else
+    return 0.5f;  // Fallback when OpenCV not available
+#endif
+}
+
+float AntiSpoofingDetector::analyze_ir_texture(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || frame->ir_left_data.empty() || frame->ir_width <= 0 || frame->ir_height <= 0) {
+        return 0.0f;
+    }
+
+#ifdef HAVE_OPENCV
+    // Convert face bbox to IR space using actual resolutions
+    cv::Rect ir_roi;
+    if (frame->color_width > 0 && frame->color_height > 0) {
+        ir_roi.x = static_cast<int>(face.bbox.x * static_cast<float>(frame->ir_width) / static_cast<float>(frame->color_width));
+        ir_roi.y = static_cast<int>(face.bbox.y * static_cast<float>(frame->ir_height) / static_cast<float>(frame->color_height));
+        ir_roi.width = static_cast<int>(face.bbox.width * static_cast<float>(frame->ir_width) / static_cast<float>(frame->color_width));
+        ir_roi.height = static_cast<int>(face.bbox.height * static_cast<float>(frame->ir_height) / static_cast<float>(frame->color_height));
+    } else {
+        // Fallback: assume same resolution
+        ir_roi = face.bbox;
+    }
+    
+    // Clamp to IR image bounds
+    ir_roi.x = std::max(0, std::min(ir_roi.x, frame->ir_width - 1));
+    ir_roi.y = std::max(0, std::min(ir_roi.y, frame->ir_height - 1));
+    ir_roi.width = std::min(ir_roi.width, frame->ir_width - ir_roi.x);
+    ir_roi.height = std::min(ir_roi.height, frame->ir_height - ir_roi.y);
+    
+    if (ir_roi.width <= 0 || ir_roi.height <= 0) {
+        return 0.0f;
+    }
+    
+    // Create IR Mat from raw data
+    cv::Mat ir_left(frame->ir_height, frame->ir_width, CV_8UC1, 
+                    const_cast<uint8_t*>(frame->ir_left_data.data()));
+    cv::Mat face_ir = ir_left(ir_roi);
+
+    float texture_score = 0.0f;
+
+    // 0) IR uniformity (screen-like) check using stddev
+    {
+        cv::Scalar mean_ir, std_ir;
+        cv::meanStdDev(face_ir, mean_ir, std_ir);
+        float ir_std = static_cast<float>(std_ir[0]);
+        // Very uniform IR (e.g., screens) often show low stddev; penalize 0-20 strongly
+        if (ir_std < 10.0f) {
+            texture_score += 0.0f; // extremely uniform, but allow other cues to rescue
+        } else if (ir_std < 20.0f) {
+            texture_score += 0.1f; // borderline uniform
+        } else {
+            texture_score += 0.3f; // acceptable baseline
+        }
+    }
+    
+    // 1. SPECULAR vs DIFFUSE REFLECTION ANALYSIS
+    // Real skin has diffuse reflection, screens/photos have specular
+    cv::Scalar mean_intensity, std_intensity;
+    cv::meanStdDev(face_ir, mean_intensity, std_intensity);
+    
+    float mean_ir = static_cast<float>(mean_intensity[0]);
+    float std_ir = static_cast<float>(std_intensity[0]);
+    
+    // DEBUG: Print IR analysis results
+    static int ir_debug_counter = 0;
+    if (++ir_debug_counter % 30 == 0) {
+        std::cout << "[DEBUG IR] Mean: " << mean_ir << ", Std: " << std_ir << std::endl;
+    }
+    
+    // Real skin: moderate intensity with GOOD variation (std > 25)
+    // Screens: have LOW variation (uniform backlight) - std < 25
+    // CRITICAL: The debug shows std 14-18 for phone screens - REJECT ALL
+    if (std_ir < 25.0f) {
+        texture_score += 0.0f;  // REJECT - Too uniform (SCREEN/PHOTO detected)
+    } else if (mean_ir > 200.0f) {
+        texture_score += 0.0f;  // REJECT - Too bright (screen emission)
+    } else if (mean_ir < 20.0f) {
+        texture_score += 0.0f;  // REJECT - Too dark (no IR reflection)
+    } else if (std_ir > 70.0f) {
+        texture_score += 0.2f;  // Very noisy (could be textured mask)
+    } else if (std_ir >= 25.0f && std_ir <= 60.0f && mean_ir >= 30.0f && mean_ir <= 150.0f) {
+        texture_score += 1.0f;  // Good skin-like: moderate intensity + good variation
+    } else {
+        texture_score += 0.4f;  // Borderline
+    }
+    
+    // 2. TEXTURE PATTERN ANALYSIS
+    // Calculate local binary patterns for texture analysis
+    cv::Mat lbp = cv::Mat::zeros(face_ir.size(), CV_8UC1);
+    for (int y = 1; y < face_ir.rows - 1; y++) {
+        for (int x = 1; x < face_ir.cols - 1; x++) {
+            uint8_t center = face_ir.at<uint8_t>(y, x);
+            uint8_t pattern = 0;
+            
+            // 8-connected neighbors
+            if (face_ir.at<uint8_t>(y-1, x-1) >= center) pattern |= 1;
+            if (face_ir.at<uint8_t>(y-1, x) >= center) pattern |= 2;
+            if (face_ir.at<uint8_t>(y-1, x+1) >= center) pattern |= 4;
+            if (face_ir.at<uint8_t>(y, x+1) >= center) pattern |= 8;
+            if (face_ir.at<uint8_t>(y+1, x+1) >= center) pattern |= 16;
+            if (face_ir.at<uint8_t>(y+1, x) >= center) pattern |= 32;
+            if (face_ir.at<uint8_t>(y+1, x-1) >= center) pattern |= 64;
+            if (face_ir.at<uint8_t>(y, x-1) >= center) pattern |= 128;
+            
+            lbp.at<uint8_t>(y, x) = pattern;
+        }
+    }
+    
+    // Analyze LBP histogram
+    cv::Mat hist;
+    int histSize = 256;
+    float range[] = {0, 256};
+    const float* histRange = {range};
+    cv::calcHist(&lbp, 1, 0, cv::Mat(), hist, 1, &histSize, &histRange);
+    
+    // Real skin has characteristic LBP distribution
+    // Screens/photos have different patterns
+    cv::normalize(hist, hist, 0, 1, cv::NORM_L1);
+    
+    // Count uniform patterns (real skin has more uniform patterns)
+    float uniform_patterns = 0.0f;
+    for (int i = 0; i < 256; i++) {
+        // Count bit transitions in pattern
+        int transitions = 0;
+        for (int j = 0; j < 8; j++) {
+            int bit1 = (i >> j) & 1;
+            int bit2 = (i >> ((j + 1) % 8)) & 1;
+            if (bit1 != bit2) transitions++;
+        }
+        
+        if (transitions <= 2) {  // Uniform pattern
+            uniform_patterns += hist.at<float>(i);
+        }
+    }
+    
+    // Real skin typically has 60-85% uniform patterns
+    // Screens often have >90% uniform (too smooth) or <50% (artificial)
+    if (uniform_patterns < 0.5f) {
+        texture_score += 0.0f;  // Too few uniform patterns - REJECT (artificial/noisy)
+    } else if (uniform_patterns > 0.88f) {
+        texture_score += 0.0f;  // Too many uniform patterns - REJECT (screen/too smooth)
+    } else if (uniform_patterns >= 0.6f && uniform_patterns <= 0.85f) {
+        texture_score += 1.0f;  // Good skin-like pattern distribution
+    } else {
+        texture_score += 0.3f;  // Borderline
+    }
+    
+    // 3. DISPLAY EMISSION DETECTION
+    // Screens emit light (high IR), real faces reflect it (moderate IR)
+    // Phones/tablets: typically mean_ir > 180 with low variation
+    if (mean_ir > 180.0f) {
+        texture_score += 0.0f;  // REJECT - likely screen emission
+    } else if (mean_ir > 160.0f && std_ir < 25.0f) {
+        texture_score += 0.0f;  // REJECT - bright uniform (screen)
+    } else if (mean_ir < 30.0f) {
+        texture_score += 0.0f;  // REJECT - too dark (absorptive surface)
+    } else {
+        texture_score += 1.0f;  // Normal skin reflection
+    }
+    
+    return texture_score / 3.0f;  // Average of three tests
+#else
+    return 0.5f;  // Fallback
+#endif
+}
+
+float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
+    if (!face.detected || face_history_.size() < 3) {
+        return 0.5f;  // Not enough history
+    }
+    
+    // REAL TEMPORAL ANALYSIS
+    float temporal_score = 0.0f;
+    
+    // 1. MICRO-MOTION DETECTION
+    // Real faces have subtle natural movements
+    float total_motion = 0.0f;
+    for (size_t i = 1; i < face_history_.size(); i++) {
+        const FaceROI& prev = face_history_[i-1];
+        const FaceROI& curr = face_history_[i];
+        
+        if (prev.detected && curr.detected) {
+            float dx = curr.bbox.x - prev.bbox.x;
+            float dy = curr.bbox.y - prev.bbox.y;
+            float motion = std::sqrt(dx*dx + dy*dy);
+            total_motion += motion;
+        }
+    }
+    
+    float avg_motion = total_motion / (face_history_.size() - 1);
+    
+    // Real faces: 0.5-5 pixels motion per frame
+    if (avg_motion < 0.1f) {
+        temporal_score += 0.0f;  // Too static (likely photo/screen)
+    } else if (avg_motion > 10.0f) {
+        temporal_score += 0.2f;  // Too much motion (unstable)
+    } else {
+        temporal_score += 1.0f;  // Good natural motion
+    }
+    
+    // 2. BLINK DETECTION (simplified)
+    // Real faces blink periodically
+    // This is a placeholder - real implementation would analyze eye regions
+    if (face_history_.size() >= 30) {  // 1 second of history
+        // Assume some natural variation in face detection confidence indicates blinking
+        float confidence_variance = 0.0f;
+        float avg_confidence = 0.0f;
+        
+        for (const auto& f : face_history_) {
+            avg_confidence += f.confidence;
+        }
+        avg_confidence /= face_history_.size();
+        
+        for (const auto& f : face_history_) {
+            float diff = f.confidence - avg_confidence;
+            confidence_variance += diff * diff;
+        }
+        confidence_variance /= face_history_.size();
+        
+        // Some variance in confidence suggests natural movement/blinking
+        if (confidence_variance > 0.01f) {
+            temporal_score += 1.0f;  // Natural variation
+        } else {
+            temporal_score += 0.3f;  // Too consistent (static image)
+        }
+    } else {
+        temporal_score += 0.5f;  // Not enough data
+    }
+    
+    return temporal_score / 2.0f;  // Average of tests
+}
+
+float AntiSpoofingDetector::analyze_cross_modal_consistency(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected) {
+        return 0.0f;
+    }
+
+#ifdef HAVE_OPENCV
+    float score = 0.0f;
+    int checks = 0;
+
+    // 1) Depth vs Color edge consistency in ROI
+    if (!frame->depth_data.empty() && !frame->color_data.empty()) {
+        cv::Mat color = frame->get_color_mat();
+        if (!color.empty()) {
+            // ROI in color
+            cv::Rect croi = face.bbox & cv::Rect(0,0,color.cols,color.rows);
+            if (croi.width > 0 && croi.height > 0) {
+                cv::Mat gray, edges;
+                cv::cvtColor(color(croi), gray, cv::COLOR_BGR2GRAY);
+                cv::Canny(gray, edges, 50, 150);
+                float color_edge_density = static_cast<float>(cv::countNonZero(edges)) / (edges.total());
+
+                // Map ROI to depth space
+                int dx = (frame->color_width>0)? static_cast<int>(croi.x * (float)frame->depth_width / (float)frame->color_width) : croi.x;
+                int dy = (frame->color_height>0)? static_cast<int>(croi.y * (float)frame->depth_height / (float)frame->color_height) : croi.y;
+                int dw = (frame->color_width>0)? static_cast<int>(croi.width * (float)frame->depth_width / (float)frame->color_width) : croi.width;
+                int dh = (frame->color_height>0)? static_cast<int>(croi.height * (float)frame->depth_height / (float)frame->color_height) : croi.height;
+                dx = std::max(0, std::min(dx, frame->depth_width-1));
+                dy = std::max(0, std::min(dy, frame->depth_height-1));
+                dw = std::min(dw, frame->depth_width - dx);
+                dh = std::min(dh, frame->depth_height - dy);
+                if (dw>1 && dh>1) {
+                    cv::Mat depth_roi(dh, dw, CV_32FC1);
+                    for (int j=0;j<dh;++j){
+                        for (int i=0;i<dw;++i){
+                            int idx = (dy+j)*frame->depth_width + (dx+i);
+                            float z = 0.0f;
+                            if (idx < (int)frame->depth_data.size()) {
+                                z = frame->depth_data[idx] * frame->depth_scale; // meters
+                            }
+                            depth_roi.at<float>(j,i) = z;
+                        }
+                    }
+                    // Depth gradient magnitude
+                    cv::Mat gx, gy, mag;
+                    cv::Sobel(depth_roi, gx, CV_32F, 1, 0, 3);
+                    cv::Sobel(depth_roi, gy, CV_32F, 0, 1, 3);
+                    cv::magnitude(gx, gy, mag);
+                    // Threshold to get depth edges
+                    cv::Mat depth_edges;
+                    // Threshold in meters per pixel (tuned): ~3mm
+                    cv::threshold(mag, depth_edges, 0.003f, 1.0f, cv::THRESH_BINARY);
+                    float depth_edge_density = static_cast<float>(cv::countNonZero(depth_edges)) / (depth_edges.total());
+
+                    // Consistency rule: color_edge_density should correlate with depth_edge_density
+                    // If color edges are high but depth edges are near-zero => likely a flat screen/photo
+                    if (color_edge_density > 0.08f && depth_edge_density < 0.003f) {
+                        score += 0.0f; // inconsistent
+                    } else if (depth_edge_density > 0.003f) {
+                        score += 1.0f; // consistent
+                    } else {
+                        score += 0.5f; // neutral
+                    }
+                    checks++;
+                }
+            }
+        }
+    }
+
+    // 2) IR vs Depth consistency in ROI (similar edge correlation)
+    if (!frame->ir_left_data.empty() && frame->ir_width>0 && frame->ir_height>0 && !frame->depth_data.empty()) {
+        cv::Mat ir(frame->ir_height, frame->ir_width, CV_8UC1, const_cast<uint8_t*>(frame->ir_left_data.data()));
+        cv::Rect irroi;
+        if (frame->color_width>0 && frame->color_height>0) {
+            irroi.x = static_cast<int>(face.bbox.x * (float)frame->ir_width / (float)frame->color_width);
+            irroi.y = static_cast<int>(face.bbox.y * (float)frame->ir_height / (float)frame->color_height);
+            irroi.width = static_cast<int>(face.bbox.width * (float)frame->ir_width / (float)frame->color_width);
+            irroi.height = static_cast<int>(face.bbox.height * (float)frame->ir_height / (float)frame->color_height);
+        } else { irroi = face.bbox; }
+        irroi &= cv::Rect(0,0,ir.cols,ir.rows);
+        if (irroi.width>1 && irroi.height>1) {
+            cv::Mat ir_edges;
+            cv::Canny(ir(irroi), ir_edges, 30, 90);
+            float ir_edge_density = static_cast<float>(cv::countNonZero(ir_edges)) / (ir_edges.total());
+
+            // Map IR ROI to depth
+            int dx = static_cast<int>(irroi.x * (float)frame->depth_width / (float)frame->ir_width);
+            int dy = static_cast<int>(irroi.y * (float)frame->depth_height / (float)frame->ir_height);
+            int dw = static_cast<int>(irroi.width * (float)frame->depth_width / (float)frame->ir_width);
+            int dh = static_cast<int>(irroi.height * (float)frame->depth_height / (float)frame->ir_height);
+            dx = std::max(0, std::min(dx, frame->depth_width-1));
+            dy = std::max(0, std::min(dy, frame->depth_height-1));
+            dw = std::min(dw, frame->depth_width - dx);
+            dh = std::min(dh, frame->depth_height - dy);
+            if (dw>1 && dh>1) {
+                cv::Mat depth_roi(dh, dw, CV_32FC1);
+                for (int j=0;j<dh;++j){
+                    for (int i=0;i<dw;++i){
+                        int idx = (dy+j)*frame->depth_width + (dx+i);
+                        float z = 0.0f;
+                        if (idx < (int)frame->depth_data.size()) {
+                            z = frame->depth_data[idx] * frame->depth_scale;
+                        }
+                        depth_roi.at<float>(j,i) = z;
+                    }
+                }
+                cv::Mat gx, gy, mag;
+                cv::Sobel(depth_roi, gx, CV_32F, 1, 0, 3);
+                cv::Sobel(depth_roi, gy, CV_32F, 0, 1, 3);
+                cv::Mat depth_edges;
+                cv::magnitude(gx, gy, mag);
+                cv::threshold(mag, depth_edges, 0.003f, 1.0f, cv::THRESH_BINARY);
+                float depth_edge_density = static_cast<float>(cv::countNonZero(depth_edges)) / (depth_edges.total());
+
+                if (ir_edge_density > 0.08f && depth_edge_density < 0.003f) {
+                    score += 0.0f;
+                } else if (depth_edge_density > 0.003f) {
+                    score += 1.0f;
+                } else {
+                    score += 0.5f;
+                }
+                checks++;
+            }
+        }
+    }
+
+    if (checks == 0) return 0.0f;
+    return score / checks;
+#else
+    return 0.5f;
+#endif
+}
+
+float calculate_depth_smoothness(const FrameBox* frame, int face_x, int face_y, int face_w, int face_h) {
+    if (!frame || frame->depth_data.empty()) return 0.0f;
+    
+    float total_gradient = 0.0f;
+    int gradient_count = 0;
+    
+    // Calculate depth gradients (measure of smoothness)
+    for (int y = face_y + 1; y < face_y + face_h - 1 && y < frame->depth_height - 1; y++) {
+        for (int x = face_x + 1; x < face_x + face_w - 1 && x < frame->depth_width - 1; x++) {
+            int center_idx = y * frame->depth_width + x;
+            int right_idx = y * frame->depth_width + (x + 1);
+            int down_idx = (y + 1) * frame->depth_width + x;
+            
+            if (center_idx < frame->depth_data.size() && 
+                right_idx < frame->depth_data.size() && 
+                down_idx < frame->depth_data.size()) {
+                
+                float center_depth = frame->depth_data[center_idx] * frame->depth_scale * 1000.0f;
+                float right_depth = frame->depth_data[right_idx] * frame->depth_scale * 1000.0f;
+                float down_depth = frame->depth_data[down_idx] * frame->depth_scale * 1000.0f;
+                
+                // Filter valid depths
+                if (center_depth > 100.0f && center_depth < 5000.0f &&
+                    right_depth > 100.0f && right_depth < 5000.0f &&
+                    down_depth > 100.0f && down_depth < 5000.0f) {
+                    
+                    float grad_x = std::abs(right_depth - center_depth);
+                    float grad_y = std::abs(down_depth - center_depth);
+                    
+                    total_gradient += grad_x + grad_y;
+                    gradient_count++;
+                }
+            }
+        }
+    }
+    
+    if (gradient_count == 0) return 0.0f;
+    
+    float avg_gradient = total_gradient / gradient_count;
+    
+    // Real faces have moderate gradients (not too smooth, not too rough)
+    if (avg_gradient > 5.0f && avg_gradient < 50.0f) {
+        return 1.0f;  // Good smoothness
+    } else if (avg_gradient > 2.0f && avg_gradient < 100.0f) {
+        return 0.5f;  // Acceptable smoothness
+    } else {
+        return 0.0f;  // Poor smoothness (too flat or too rough)
+    }
+}
+
+std::string AntiSpoofingDetector::detect_attack_type(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || frame->ir_left_data.empty() || frame->ir_width <= 0 || frame->ir_height <= 0) {
+        return 0.0f;
+    }
+    
+    // Analyze IR texture patterns to detect material differences
+    int face_x = frame->ir_width * 0.2f;
+    int face_y = frame->ir_height * 0.1f;
+    int face_w = frame->ir_width * 0.6f;
+    int face_h = frame->ir_height * 0.8f;
+    
+    // Calculate texture variance in IR image
+    float total_variance = 0.0f;
+    int sample_count = 0;
+    
+    // Sample every 2nd pixel to reduce computation
+    for (int y = face_y + 1; y < face_y + face_h - 1 && y < frame->ir_height - 1; y += 2) {
+        for (int x = face_x + 1; x < face_x + face_w - 1 && x < frame->ir_width - 1; x += 2) {
+            int pixel_idx = y * frame->ir_width + x;
+            if (pixel_idx < frame->ir_left_data.size()) {
+                uint8_t center = frame->ir_left_data[pixel_idx];
+                
+                // Calculate local variance (texture measure)
+                float local_variance = 0.0f;
+                int neighbor_count = 0;
+                
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        
+                        int nx = x + dx;
+                        int ny = y + dy;
+                        if (nx >= 0 && nx < frame->ir_width && ny >= 0 && ny < frame->ir_height) {
+                            int n_idx = ny * frame->ir_width + nx;
+                            if (n_idx < frame->ir_left_data.size()) {
+                                uint8_t neighbor = frame->ir_left_data[n_idx];
+                                float diff = static_cast<float>(center) - static_cast<float>(neighbor);
+                                local_variance += diff * diff;
+                                neighbor_count++;
+                            }
+                        }
+                    }
+                }
+                
+                if (neighbor_count > 0) {
+                    local_variance /= neighbor_count;
+                    total_variance += local_variance;
+                    sample_count++;
+                }
+            }
+        }
+    }
+    
+    if (sample_count == 0) return 0.0f;
+    
+    float avg_variance = total_variance / sample_count;
+    
+    // Calculate IR intensity distribution
+    std::vector<int> intensity_histogram(256, 0);
+    int total_pixels = 0;
+    
+    for (int y = face_y; y < face_y + face_h && y < frame->ir_height; y++) {
+        for (int x = face_x; x < face_x + face_w && x < frame->ir_width; x++) {
+            int pixel_idx = y * frame->ir_width + x;
+            if (pixel_idx < frame->ir_left_data.size()) {
+                uint8_t intensity = frame->ir_left_data[pixel_idx];
+                intensity_histogram[intensity]++;
+                total_pixels++;
+            }
+        }
+    }
+    
+    if (total_pixels == 0) return 0.0f;
+    
+    // Calculate intensity distribution characteristics
+    float intensity_variance = 0.0f;
+    float mean_intensity = 0.0f;
+    
+    for (int i = 0; i < 256; i++) {
+        mean_intensity += i * intensity_histogram[i];
+    }
+    mean_intensity /= total_pixels;
+    
+    for (int i = 0; i < 256; i++) {
+        float diff = i - mean_intensity;
+        intensity_variance += diff * diff * intensity_histogram[i];
+    }
+    intensity_variance /= total_pixels;
+    
+    // Score based on IR characteristics (legacy path)
+    float ir_score = 0.0f; // legacy function no longer uses texture_score
+    
+    // Check texture variance (real skin has natural texture variation)
+    if (avg_variance > 50.0f) {  // Good texture variation
+        ir_score += 0.4f;
+    } else if (avg_variance > 20.0f) {  // Some texture variation
+        ir_score += 0.2f;
+    }
+    
+    // Check intensity distribution (real skin has natural IR response)
+    if (intensity_variance > 200.0f) {  // Good intensity variation
+        ir_score += 0.3f;
+    } else if (intensity_variance > 100.0f) {  // Some intensity variation
+        ir_score += 0.15f;
+    }
+    
+    // Check for artificial materials (very uniform IR response)
+    if (avg_variance < 5.0f && intensity_variance < 50.0f) {  // Too uniform - likely artificial
+        ir_score = 0.0f;
+    }
+    
+    // Check for screen reflection (very high or very low IR response)
+    if (mean_intensity > 200.0f || mean_intensity < 30.0f) {  // Unnatural IR response
+        ir_score *= 0.5f;
+    }
+    
+    // PLACEHOLDER: Temporal consistency analysis
+    // TODO: Implement actual temporal analysis
+    // - Check for natural micro-movements
+    // - Validate breathing patterns
+    // - Detect blink patterns
+    // - Analyze temporal variance
+    
+    if (!frame) {
+        return 0.0f;
+    }
+    
+    // Check if all sensors have data
+    bool has_depth = !frame->depth_data.empty() && frame->depth_width > 0 && frame->depth_height > 0;
+    bool has_color = !frame->color_data.empty() && frame->color_width > 0 && frame->color_height > 0;
+    bool has_ir_left = !frame->ir_left_data.empty() && frame->ir_width > 0 && frame->ir_height > 0;
+    bool has_ir_right = !frame->ir_right_data.empty() && frame->ir_width > 0 && frame->ir_height > 0;
+    
+    if (!has_depth || !has_color || !has_ir_left) {
+        return 0.0f;  // Need at least depth, color, and IR left
+    }
+    
+    float consistency_score = 0.0f;
+    
+    // 1. Check depth-color consistency (face region should have reasonable depth)
+    if (has_depth && has_color) {
+        float depth_color_consistency = check_depth_color_consistency(frame);
+        consistency_score += depth_color_consistency * 0.4f;
+    }
+    
+    // 2. Check depth-IR consistency (depth and IR should correlate)
+    if (has_depth && has_ir_left) {
+        float depth_ir_consistency = check_depth_ir_consistency(frame);
+        consistency_score += depth_ir_consistency * 0.3f;
+    }
+    
+    // 3. Check color-IR consistency (skin regions should have similar patterns)
+    if (has_color && has_ir_left) {
+        float color_ir_consistency = check_color_ir_consistency(frame);
+        consistency_score += color_ir_consistency * 0.3f;
+    }
+    
+    // Check if face region in color image has reasonable depth values
+    int face_x = frame->color_width * 0.2f;
+    int face_y = frame->color_height * 0.1f;
+    int face_w = frame->color_width * 0.6f;
+    int face_h = frame->color_height * 0.8f;
+    
+    int valid_depth_pixels = 0;
+    int total_face_pixels = 0;
+    float avg_depth = 0.0f;
+    
+    for (int y = face_y; y < face_y + face_h && y < frame->color_height; y++) {
+        for (int x = face_x; x < face_x + face_w && x < frame->color_width; x++) {
+            total_face_pixels++;
+            
+            // Map color pixel to depth pixel
+            int depth_x = (x * frame->depth_width) / frame->color_width;
+            int depth_y = (y * frame->depth_height) / frame->color_height;
+            
+            if (depth_x < frame->depth_width && depth_y < frame->depth_height) {
+                int depth_idx = depth_y * frame->depth_width + depth_x;
+                if (depth_idx < frame->depth_data.size()) {
+                    float depth_mm = frame->depth_data[depth_idx] * frame->depth_scale * 1000.0f;
+                    
+                    // Check if depth is reasonable for face (300mm to 2000mm)
+                    if (depth_mm > 300.0f && depth_mm < 2000.0f) {
+                        valid_depth_pixels++;
+                        avg_depth += depth_mm;
+                    }
+                }
+            }
+        }
+    }
+    
+    if (total_face_pixels == 0) return 0.0f;
+    
+    float depth_coverage = static_cast<float>(valid_depth_pixels) / total_face_pixels;
+    
+    // Score based on depth coverage in face region
+    if (depth_coverage > 0.8f) return 1.0f;
+    else if (depth_coverage > 0.6f) return 0.7f;
+    else if (depth_coverage > 0.4f) return 0.4f;
+    // Check if depth and IR have similar edge patterns
+    int face_x = frame->depth_width * 0.2f;
+    int face_y = frame->depth_height * 0.1f;
+    int face_w = frame->depth_width * 0.6f;
+    int face_h = frame->depth_height * 0.8f;
+    
+    float depth_edge_strength = 0.0f;
+    float ir_edge_strength = 0.0f;
+    int sample_count = 0;
+    
+    // Sample every 4th pixel to reduce computation
+    for (int y = face_y + 1; y < face_y + face_h - 1 && y < frame->depth_height - 1; y += 4) {
+        for (int x = face_x + 1; x < face_x + face_w - 1 && x < frame->depth_width - 1; x += 4) {
+            int depth_idx = y * frame->depth_width + x;
+            int ir_idx = y * frame->ir_width + x;
+            
+            if (depth_idx < frame->depth_data.size() && ir_idx < frame->ir_left_data.size()) {
+                // Calculate depth gradient
+                float depth_center = frame->depth_data[depth_idx] * frame->depth_scale * 1000.0f;
+                float depth_right = frame->depth_data[depth_idx + 1] * frame->depth_scale * 1000.0f;
+                float depth_down = frame->depth_data[depth_idx + frame->depth_width] * frame->depth_scale * 1000.0f;
+                
+                if (depth_center > 100.0f && depth_center < 5000.0f &&
+                    depth_right > 100.0f && depth_right < 5000.0f &&
+                    depth_down > 100.0f && depth_down < 5000.0f) {
+                    
+                    float depth_grad = std::abs(depth_right - depth_center) + std::abs(depth_down - depth_center);
+                    depth_edge_strength += depth_grad;
+                    
+                    // Calculate IR gradient
+                    float ir_center = static_cast<float>(frame->ir_left_data[ir_idx]);
+                    float ir_right = static_cast<float>(frame->ir_left_data[ir_idx + 1]);
+                    float ir_down = static_cast<float>(frame->ir_left_data[ir_idx + frame->ir_width]);
+                    
+                    float ir_grad = std::abs(ir_right - ir_center) + std::abs(ir_down - ir_center);
+                    ir_edge_strength += ir_grad;
+                    
+                    sample_count++;
+                }
+            }
+        }
+    }
+    
+    if (sample_count == 0) return 0.0f;
+    
+    depth_edge_strength /= sample_count;
+    ir_edge_strength /= sample_count;
+    
+    // Check if edge strengths are correlated (both should have similar patterns)
+    float edge_ratio = (depth_edge_strength > 0.0f) ? ir_edge_strength / depth_edge_strength : 0.0f;
+    
+    // Good consistency if edge ratios are reasonable
+    if (edge_ratio > 0.1f && edge_ratio < 10.0f) {
+        return 1.0f;
+    } else if (edge_ratio > 0.05f && edge_ratio < 20.0f) {
+        return 0.5f;
+    } else {
+    // Check if skin regions in color image have reasonable IR response
+    int face_x = frame->color_width * 0.2f;
+    int face_y = frame->color_height * 0.1f;
+    int face_w = frame->color_width * 0.6f;
+    int face_h = frame->color_height * 0.8f;
+    
+    int skin_pixels = 0;
+    int total_skin_ir_sum = 0;
+    int total_pixels = 0;
+    
+    for (int y = face_y; y < face_y + face_h && y < frame->color_height; y++) {
+        for (int x = face_x; x < face_x + face_w && x < frame->color_width; x++) {
+            int color_idx = (y * frame->color_width + x) * frame->color_bytes_per_pixel;
+            if (color_idx + 2 < frame->color_data.size()) {
+                uint8_t r = frame->color_data[color_idx + 2];
+                uint8_t g = frame->color_data[color_idx + 1];
+                uint8_t b = frame->color_data[color_idx];
+                
+                // Simple skin detection
+                float h, s, v;
+                rgb_to_hsv(r, g, b, h, s, v);
+                bool is_skin = (h >= 0 && h <= 50) && (s >= 0.2f && s <= 0.7f) && (v >= 0.3f && v <= 1.0f);
+                
+                if (is_skin) {
+                    // Map to IR coordinates
+                    int ir_x = (x * frame->ir_width) / frame->color_width;
+                    int ir_y = (y * frame->ir_height) / frame->color_height;
+                    
+                    if (ir_x < frame->ir_width && ir_y < frame->ir_height) {
+                        int ir_idx = ir_y * frame->ir_width + ir_x;
+                        if (ir_idx < frame->ir_left_data.size()) {
+                            total_skin_ir_sum += frame->ir_left_data[ir_idx];
+                            skin_pixels++;
+                        }
+                    }
+                }
+                total_pixels++;
+            }
+        }
+    }
+    
+    if (skin_pixels == 0 || total_pixels == 0) return 0.0f;
+    
+    float avg_skin_ir = static_cast<float>(total_skin_ir_sum) / skin_pixels;
+    float skin_ratio = static_cast<float>(skin_pixels) / total_pixels;
+    
+    // Score based on skin detection and IR response
+    float consistency_score = 0.0f;
+    
+    // Check if we detected reasonable amount of skin
+    if (skin_ratio > 0.05f && skin_ratio < 0.4f) {
+        consistency_score += 0.5f;
+    }
+    
+    // Check if skin has reasonable IR response (not too high/low)
+    if (avg_skin_ir > 50.0f && avg_skin_ir < 200.0f) {
+        consistency_score += 0.5f;
+    }
+    
+    // PLACEHOLDER: Attack type detection
+    // - Analyze patterns to determine attack type
+    // - Classify as screen, mask, photo, AI-generated, etc.
+    
+    if (!frame) {
+        return "unknown";
+    }
+    
+    // Simple placeholder logic based on scores
+    if (frame->metadata.anti_spoofing.depth_analysis_score < 0.5f) {
+        return "screen_or_photo";  // Likely flat surface
+    } else if (frame->metadata.anti_spoofing.ir_texture_score < 0.5f) {
+        return "mask";  // Likely material mismatch
+    } else if (frame->metadata.anti_spoofing.cross_modal_score < 0.5f) {
+        return "ai_generated";  // Likely sensor disagreement
+    }
+    
+    return "none";  // No attack detected
+}
+
+std::string AntiSpoofingDetector::generate_rejection_reason(const FrameBox* frame) {
+    std::string reason = "";
+    
+    if (frame->metadata.anti_spoofing.depth_anomaly_detected) {
+        reason += "Depth analysis failed; ";
+    }
+    if (frame->metadata.anti_spoofing.ir_material_mismatch) {
+        reason += "IR texture analysis failed; ";
+    }
+    if (frame->metadata.anti_spoofing.temporal_inconsistency) {
+        reason += "Temporal analysis failed; ";
+    }
+    if (frame->metadata.anti_spoofing.cross_modal_disagreement) {
+        reason += "Cross-modal analysis failed; ";
+    }
+    
+    if (reason.empty()) {
+        reason = "Overall liveness score too low";
+    }
+    
+    return reason;
+}
+
+float AntiSpoofingDetector::calculate_confidence(const FrameBox* frame, const FaceROI& face) {
+    if (!frame) {
+        return 0.0f;
+    }
+
+    // Penalize disagreement: confidence is bounded by weakest component
+    float d = frame->metadata.anti_spoofing.depth_analysis_score;
+    float ir = frame->metadata.anti_spoofing.ir_texture_score;
+    float cm = frame->metadata.anti_spoofing.cross_modal_score;
+    float t = frame->metadata.anti_spoofing.temporal_consistency_score;
+
+    float min_comp = std::min(std::min(d, ir), std::min(cm, t));
+    float mean_comp = (d + ir + cm + t) / 4.0f;
+
+    // Confidence emphasizes the minimum to reflect required agreement, blended with mean
+    float confidence = 0.7f * min_comp + 0.3f * mean_comp;
+    return confidence;
+}
+
+// ============================================================================
+// AntiSpoofingPipeline Implementation
+// ============================================================================
+
+AntiSpoofingPipeline::AntiSpoofingPipeline(const AntiSpoofingConfig& config) 
+    : config_(config) {
+    quality_gate_ = std::make_unique<QualityGate>(config_);
+    anti_spoofing_detector_ = std::make_unique<AntiSpoofingDetector>(config_);
+}
+
+bool AntiSpoofingPipeline::process_frame(FrameBox* frame) {
+    if (!frame) return false;
+    
+    // Step 1: Quality Gate
+    bool quality_passed = quality_gate_->process_frame(frame);
+    
+    // Step 2: Anti-Spoofing (only if quality gate passed)
+    bool anti_spoofing_passed = false;
+    if (quality_passed) {
+        anti_spoofing_passed = anti_spoofing_detector_->process_frame(frame);
+    }
+    
+    // Step 3: Combined decision
+    bool overall_passed = quality_passed && anti_spoofing_passed;
+    
+    // Update frame metadata
+    frame->metadata.is_ready_for_processing = overall_passed;
+    if (!overall_passed) {
+        if (!quality_passed) {
+            frame->metadata.final_rejection_reason = frame->metadata.quality_gate.quality_issues;
+        } else {
+            frame->metadata.final_rejection_reason = frame->metadata.anti_spoofing.rejection_reason;
+        }
+    }
+    
+    // Update statistics
+    update_stats(quality_passed, anti_spoofing_passed, overall_passed);
+    
+    return overall_passed;
+}
+
+bool AntiSpoofingPipeline::process_frame_with_temporal_context(FrameBox* frame, const std::vector<FrameBox*>& recent_frames) {
+    if (!frame) return false;
+    
+    // Step 1: Quality Gate
+    bool quality_passed = quality_gate_->process_frame(frame);
+    
+    // Step 2: Anti-Spoofing with temporal context
+    bool anti_spoofing_passed = false;
+    if (quality_passed) {
+        anti_spoofing_passed = anti_spoofing_detector_->process_frame(frame);
+        
+        // Add temporal analysis
+        float temporal_score = anti_spoofing_detector_->process_temporal_analysis(recent_frames, frame);
+        frame->metadata.anti_spoofing.temporal_consistency_score = temporal_score;
+        
+        // Update overall score with temporal component
+        frame->metadata.anti_spoofing.overall_liveness_score = 
+            (frame->metadata.anti_spoofing.depth_analysis_score * 0.25f +
+             frame->metadata.anti_spoofing.ir_texture_score * 0.25f +
+             frame->metadata.anti_spoofing.cross_modal_score * 0.25f +
+             frame->metadata.anti_spoofing.temporal_consistency_score * 0.25f);
+        
+        // Re-evaluate liveness with temporal component
+        anti_spoofing_passed = 
+            frame->metadata.anti_spoofing.overall_liveness_score >= config_.min_overall_liveness &&
+            frame->metadata.anti_spoofing.confidence >= config_.min_confidence;
+    }
+    
+    // Step 3: Combined decision
+    bool overall_passed = quality_passed && anti_spoofing_passed;
+    
+    // Update frame metadata
+    frame->metadata.is_ready_for_processing = overall_passed;
+    if (!overall_passed) {
+        if (!quality_passed) {
+            frame->metadata.final_rejection_reason = frame->metadata.quality_gate.quality_issues;
+        } else {
+            frame->metadata.final_rejection_reason = frame->metadata.anti_spoofing.rejection_reason;
+        }
+    }
+    
+    // Update statistics
+    update_stats(quality_passed, anti_spoofing_passed, overall_passed);
+    
+    return overall_passed;
+}
+
+void AntiSpoofingPipeline::update_stats(bool quality_passed, bool anti_spoofing_passed, bool overall_passed) {
+    stats_.total_frames_processed++;
+    
+    if (quality_passed) {
+        stats_.quality_gate_passed++;
+    } else {
+        stats_.quality_gate_failed++;
+    }
+    
+    if (anti_spoofing_passed) {
+        stats_.anti_spoofing_passed++;
+    } else {
+        stats_.anti_spoofing_failed++;
+    }
+    
+    if (overall_passed) {
+        stats_.overall_passed++;
+    } else {
+        stats_.overall_failed++;
+    }
+    
+    // Calculate pass rates
+    if (stats_.total_frames_processed > 0) {
+        stats_.quality_gate_pass_rate = static_cast<float>(stats_.quality_gate_passed) / stats_.total_frames_processed;
+        stats_.anti_spoofing_pass_rate = static_cast<float>(stats_.anti_spoofing_passed) / stats_.total_frames_processed;
+        stats_.overall_pass_rate = static_cast<float>(stats_.overall_passed) / stats_.total_frames_processed;
+    }
+}
+
+// ============================================================================
+// AdaptiveThresholdManager Implementation (Placeholder)
+// ============================================================================
+
+AdaptiveThresholdManager::AdaptiveThresholdManager() {
+}
+
+AntiSpoofingConfig AdaptiveThresholdManager::get_adaptive_config(
+    const AntiSpoofingConfig& base_config,
+    const std::map<std::string, float>& environmental_factors) {
+    
+    // PLACEHOLDER: Adaptive threshold management
+    // TODO: Implement actual adaptive threshold logic
+    // - Analyze environmental factors
+    // - Adjust thresholds based on conditions
+    // - Learn from historical data
+    // - Optimize for current conditions
+    
+    AntiSpoofingConfig adapted_config = base_config;
+    
+    // Simple placeholder: return base config for now
+    // In real implementation, this would analyze environmental factors
+    // and adjust thresholds accordingly
+    
+    return adapted_config;
+}
+
+void AdaptiveThresholdManager::learn_from_result(const FrameBox* frame, bool success) {
+    // PLACEHOLDER: Learning from results
+    // TODO: Implement actual learning logic
+    // - Analyze successful/failed cases
+    // - Identify patterns
+    // - Update threshold models
+    // - Improve future decisions
+    
+    learning_stats_.total_samples++;
+    if (success) {
+        learning_stats_.successful_samples++;
+    }
+    
+    learning_stats_.success_rate = static_cast<float>(learning_stats_.successful_samples) / learning_stats_.total_samples;
+}
+
+} // namespace mdai
