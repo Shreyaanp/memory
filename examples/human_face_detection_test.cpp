@@ -95,6 +95,7 @@ public:
         
         // Initialize components
         CameraConfig camera_config;
+        camera_config.align_to_color = true;  // Required for accurate ROI mapping
         DynamicRingBuffer ring_buffer(32, 5ULL * 1024 * 1024 * 1024); // 5GB limit
         Producer producer(camera_config, &ring_buffer);
         QualityGate quality_gate(config_);

@@ -10,6 +10,15 @@
 #include <opencv2/opencv.hpp>
 #endif
 
+// MediaPipe GPU-accelerated face detection (optional C++ build)
+#ifdef USE_MEDIAPIPE
+#include <mediapipe/framework/calculator_framework.h>
+#include <mediapipe/framework/formats/image_frame.h>
+#include <mediapipe/framework/formats/image_frame_opencv.h>
+#include <mediapipe/framework/port/opencv_core_inc.h>
+#include <mediapipe/framework/port/parse_text_proto.h>
+#endif
+
 namespace mdai {
 
 // Face detection result
@@ -22,10 +31,6 @@ struct FaceROI {
 
 // Helper function for color conversion
 void rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b, float& h, float& s, float& v);
-
-// Helper function for depth analysis
-float calculate_depth_smoothness(const FrameBox* frame, int face_x, int face_y, int face_w, int face_h);
-
 
 /**
  * @brief Configuration for anti-spoofing algorithms
@@ -99,7 +104,14 @@ public:
 private:
     AntiSpoofingConfig config_;
     
+#ifdef USE_MEDIAPIPE
+    // MediaPipe GPU-accelerated face detection (optional, requires C++ build)
+    std::unique_ptr<mediapipe::CalculatorGraph> mediapipe_graph_;
+    bool use_mediapipe_ = false;
+#endif
+    
 #ifdef HAVE_OPENCV
+    // OpenCV face detection (primary, reliable cross-platform)
     cv::CascadeClassifier face_cascade_;
     bool face_cascade_loaded_ = false;
 #endif

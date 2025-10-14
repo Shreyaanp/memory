@@ -1,5 +1,5 @@
 ---
-description: do not generate docs aftewr every improvement automatically, i will ask if needed
+description: do not generate docs after every improvement automatically, i will ask if needed
 globs:
 alwaysApply: true
 ---

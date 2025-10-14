@@ -12,8 +12,18 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 
 # Find dependencies
 find_package(realsense2 REQUIRED)
-find_package(OpenCV QUIET)  # Optional - for Utils
+find_package(OpenCV QUIET)  # Optional - for Utils and fallback face detection
 find_package(Threads REQUIRED)
+
+# MediaPipe - Optional for GPU-accelerated face detection  
+# Falls back to OpenCV Haar cascade if not available
+find_package(mediapipe QUIET)
+if(mediapipe_FOUND)
+    add_definitions(-DUSE_MEDIAPIPE)
+    message(STATUS "MediaPipe C++ found - GPU-accelerated face detection enabled")
+else()
+    message(STATUS "MediaPipe not found - using OpenCV Haar cascade (acceptable for now)")
+endif()
 
 # Check if OpenCV was found
 if(OpenCV_FOUND)
@@ -29,6 +39,10 @@ include_directories(
     ${realsense2_INCLUDE_DIR}
     ${OpenCV_INCLUDE_DIRS}
 )
+
+if(mediapipe_FOUND)
+    include_directories(${mediapipe_INCLUDE_DIRS})
+endif()
 
 # Source files
 set(SOURCES
@@ -47,11 +61,14 @@ endif()
 
 # Create shared library
 add_library(mdai_realsense SHARED ${SOURCES})
-
-target_link_libraries(mdai_realsense
+target_link_libraries(mdai_realsense 
     ${realsense2_LIBRARY}
     Threads::Threads
 )
+
+if(mediapipe_FOUND)
+    target_link_libraries(mdai_realsense ${mediapipe_LIBRARIES})
+endif()
 
 if(OpenCV_FOUND)
     target_link_libraries(mdai_realsense ${OpenCV_LIBS})
@@ -64,6 +81,10 @@ target_link_libraries(mdai_realsense_static
     ${realsense2_LIBRARY}
     Threads::Threads
 )
+
+if(mediapipe_FOUND)
+    target_link_libraries(mdai_realsense_static ${mediapipe_LIBRARIES})
+endif()
 
 if(OpenCV_FOUND)
     target_link_libraries(mdai_realsense_static ${OpenCV_LIBS})

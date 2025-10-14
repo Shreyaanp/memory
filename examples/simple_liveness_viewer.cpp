@@ -46,19 +46,19 @@ public:
         std::cout << "  - IR Texture Analysis" << std::endl;
         std::cout << "  - Cross-Modal Consistency" << std::endl;
         
-        // Initialize configuration (balanced for real-world use)
-        config_.min_lighting_score = 0.4f;
-        config_.min_motion_score = 0.3f;
-        config_.min_positioning_score = 0.5f;
-        config_.min_synchronization_score = 0.6f;
-        config_.min_stability_score = 0.5f;
-        config_.min_overall_quality = 0.5f;
-        config_.min_depth_analysis_score = 0.55f;
-        config_.min_ir_texture_score = 0.4f;
-        config_.min_temporal_consistency_score = 0.4f;
-        config_.min_cross_modal_score = 0.5f;
-        config_.min_overall_liveness = 0.6f;
-        config_.min_confidence = 0.6f;
+        // Initialize configuration (optimized for real humans)
+        config_.min_lighting_score = 0.3f;         // Lenient lighting
+        config_.min_motion_score = 0.25f;          // Lenient sharpness
+        config_.min_positioning_score = 0.4f;      // FIXED: Accept off-center faces
+        config_.min_synchronization_score = 0.5f;  // Basic sensor sync
+        config_.min_stability_score = 0.4f;        // Lenient camera settings
+        config_.min_overall_quality = 0.4f;        // Lower quality gate
+        config_.min_depth_analysis_score = 0.5f;   // Key anti-spoof metric
+        config_.min_ir_texture_score = 0.35f;      // FIXED: Accept human IR variance
+        config_.min_temporal_consistency_score = 0.35f;  // FIXED: Don't penalize steady subjects
+        config_.min_cross_modal_score = 0.4f;      // Basic cross-modal check
+        config_.min_overall_liveness = 0.5f;       // Overall liveness threshold
+        config_.min_confidence = 0.5f;             // Lower confidence requirement
     }
     
     void run() {
@@ -320,7 +320,7 @@ private:
         try {
             // Initialize components
             CameraConfig camera_config;
-            camera_config.align_to_color = true; // ensure depth/color alignment for anti-spoofing
+            camera_config.align_to_color = true;  // CRITICAL: Required for accurate ROI mapping
             ring_buffer_ = std::make_unique<DynamicRingBuffer>(32, 5ULL * 1024 * 1024 * 1024);
             producer_ = std::make_unique<Producer>(camera_config, ring_buffer_.get());
             quality_gate_ = std::make_unique<QualityGate>(config_);

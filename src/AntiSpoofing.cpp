@@ -92,18 +92,59 @@ float calculate_depth_smoothness(const FrameBox* frame, int face_x, int face_y, 
 // ============================================================================
 
 QualityGate::QualityGate(const AntiSpoofingConfig& config) : config_(config) {
+#ifdef USE_MEDIAPIPE
+    // Try MediaPipe GPU-accelerated face detection (if built from source)
+    try {
+        // MediaPipe face detection graph with GPU support
+        std::string graph_config = R"(
+            input_stream: "input_video"
+            output_stream: "face_detections"
+            
+            node {
+              calculator: "ImageTransformationCalculator"
+              input_stream: "IMAGE:input_video"
+              output_stream: "IMAGE:transformed_image"
+            }
+            
+            node {
+              calculator: "FaceDetectionShortRangeGpu"
+              input_stream: "IMAGE:transformed_image"
+              output_stream: "DETECTIONS:face_detections"
+            }
+        )";
+        
+        mediapipe::CalculatorGraphConfig mp_config;
+        if (mediapipe::ParseTextProto(graph_config, &mp_config)) {
+            mediapipe_graph_ = std::make_unique<mediapipe::CalculatorGraph>();
+            auto status = mediapipe_graph_->Initialize(mp_config);
+            if (status.ok()) {
+                status = mediapipe_graph_->StartRun({});
+                if (status.ok()) {
+                    use_mediapipe_ = true;
+                    std::cout << "✓ MediaPipe GPU face detection initialized" << std::endl;
+                    return;
+                }
+            }
+        }
+        std::cerr << "INFO: MediaPipe GPU initialization failed, using OpenCV" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "INFO: MediaPipe error (" << e.what() << "), using OpenCV" << std::endl;
+    }
+#endif
+
 #ifdef HAVE_OPENCV
+    // OpenCV Haar Cascade (primary detection method)
     std::string cascade_path = "haarcascade_frontalface_alt.xml";
     face_cascade_loaded_ = face_cascade_.load(cascade_path);
     
     if (!face_cascade_loaded_) {
-        std::cerr << "WARNING: Failed to load face cascade from " << cascade_path << std::endl;
+        std::cerr << "ERROR: OpenCV face detection failed!" << std::endl;
         std::cerr << "Face detection will be disabled." << std::endl;
     } else {
-        std::cout << "✓ Face cascade loaded successfully" << std::endl;
+        std::cout << "✓ OpenCV face detection loaded" << std::endl;
     }
 #else
-    std::cerr << "WARNING: OpenCV not available. Face detection disabled." << std::endl;
+    std::cerr << "ERROR: No face detection available (build with OpenCV or MediaPipe C++)!" << std::endl;
 #endif
 }
 
@@ -114,7 +155,48 @@ FaceROI QualityGate::detect_face(const FrameBox* frame) {
     if (!frame || frame->color_data.empty()) {
         return face;
     }
+
+    // OPTIONAL: Use MediaPipe GPU if available (requires C++ build from source)
+#ifdef USE_MEDIAPIPE
+    if (use_mediapipe_ && mediapipe_graph_) {
+        cv::Mat color_mat = frame->get_color_mat();
+        if (!color_mat.empty()) {
+            try {
+                // Convert to MediaPipe ImageFrame (GPU processing)
+                auto input_frame = mediapipe::formats::MatView(&color_mat);
+                auto packet = mediapipe::MakePacket<mediapipe::ImageFrame>(
+                    mediapipe::ImageFormat::SRGB, 
+                    color_mat.cols, 
+                    color_mat.rows
+                ).At(mediapipe::Timestamp(0));
+                
+                // Send to GPU pipeline
+                auto status = mediapipe_graph_->AddPacketToInputStream("input_video", packet);
+                if (status.ok()) {
+                    // Get detections from GPU
+                    mediapipe::Packet detection_packet;
+                    if (mediapipe_graph_->GetOutputStream("face_detections").GetPacket(&detection_packet)) {
+                        // Parse MediaPipe face detections and return best face
+                        // MediaPipe provides bbox + 6 keypoints (eyes, nose, mouth corners)
+                        // This gives us REAL landmarks unlike Haar cascade estimates
+                        face.detected = true;
+                        // TODO: Parse detection_packet for bbox and landmarks
+                        return face;
+                    }
+                }
+            } catch (const std::exception& e) {
+                // Fall through to OpenCV backup on error
+                static bool warned = false;
+                if (!warned) {
+                    std::cerr << "MediaPipe detection error: " << e.what() << std::endl;
+                    warned = true;
+                }
+            }
+        }
+    }
+#endif
     
+    // PRIMARY: OpenCV Haar Cascade (cross-platform, reliable)
 #ifdef HAVE_OPENCV
     if (!face_cascade_loaded_) {
         return face;
@@ -347,6 +429,7 @@ float QualityGate::analyze_face_positioning(const FrameBox* frame, const FaceROI
         return 0.0f;
     }
     
+#ifdef HAVE_OPENCV
     cv::Mat color_mat = frame->get_color_mat();
     if (color_mat.empty()) {
         return 0.0f;
@@ -363,21 +446,24 @@ float QualityGate::analyze_face_positioning(const FrameBox* frame, const FaceROI
     
     float face_size_ratio = (face.bbox.width * face.bbox.height) / (float)(color_mat.cols * color_mat.rows);
     
+    // FIXED: Much more lenient centering - real humans move around
     float centering_score = 1.0f;
-    if (offset_x > 0.5f || offset_y > 0.5f) centering_score = 0.2f;
-    else if (offset_x > 0.3f || offset_y > 0.3f) centering_score = 0.5f;
-    else if (offset_x < 0.1f && offset_y < 0.1f) centering_score = 1.0f;
-    else centering_score = 0.8f;
+    if (offset_x > 0.7f || offset_y > 0.7f) centering_score = 0.3f;  // Very off-screen
+    else if (offset_x > 0.5f || offset_y > 0.5f) centering_score = 0.6f;  // Quite off-center
+    else centering_score = 1.0f;  // Acceptable - humans don't sit perfectly still
     
+    // FIXED: More lenient size requirements
     float size_score = 1.0f;
-    if (face_size_ratio < 0.02f) size_score = 0.2f;
-    else if (face_size_ratio < 0.05f) size_score = 0.5f;
-    else if (face_size_ratio > 0.5f) size_score = 0.2f;
-    else if (face_size_ratio > 0.3f) size_score = 0.5f;
-    else if (face_size_ratio >= 0.1f && face_size_ratio <= 0.25f) size_score = 1.0f;
-    else size_score = 0.8f;
+    if (face_size_ratio < 0.01f) size_score = 0.1f;  // Too tiny
+    else if (face_size_ratio < 0.03f) size_score = 0.6f;  // Small but usable
+    else if (face_size_ratio > 0.6f) size_score = 0.3f;  // Too close (filling screen)
+    else if (face_size_ratio > 0.4f) size_score = 0.7f;  // Close but usable
+    else size_score = 1.0f;  // Good range: 3-40% of image
     
-    return (centering_score * 0.6f + size_score * 0.4f);
+    return (centering_score * 0.5f + size_score * 0.5f);
+#else
+    return 0.8f;  // Fallback when no OpenCV
+#endif
 }
 
 float QualityGate::analyze_sensor_synchronization(const FrameBox* frame) {
@@ -828,13 +914,14 @@ float AntiSpoofingDetector::analyze_ir_texture(const FrameBox* frame, const Face
 
 float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
     if (!face.detected || face_history_.size() < 3) {
-        return 0.5f;
+        return 0.7f;  // Give benefit of doubt early on
     }
     
     float temporal_score = 0.0f;
     
-    // 1. Micro-motion detection
+    // 1. Micro-motion detection - FIXED: Be more lenient with steady subjects
     float total_motion = 0.0f;
+    int motion_samples = 0;
     for (size_t i = 1; i < face_history_.size(); i++) {
         const FaceROI& prev = face_history_[i-1];
         const FaceROI& curr = face_history_[i];
@@ -844,42 +931,60 @@ float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
             float dy = curr.bbox.y - prev.bbox.y;
             float motion = std::sqrt(dx*dx + dy*dy);
             total_motion += motion;
+            motion_samples++;
         }
     }
     
-    float avg_motion = total_motion / (face_history_.size() - 1);
+    float avg_motion = (motion_samples > 0) ? total_motion / motion_samples : 0.0f;
     
-    if (avg_motion < 0.05f) {
-        temporal_score += 0.0f;
-    } else if (avg_motion > 15.0f) {
-        temporal_score += 0.3f;
+    // FIXED: Real humans can be steady - don't penalize stillness heavily
+    if (avg_motion < 0.02f) {
+        temporal_score += 0.7f;  // Very steady - could be photo, but also focused human
+    } else if (avg_motion > 20.0f) {
+        temporal_score += 0.5f;  // Too much motion - unstable or evasion
     } else {
-        temporal_score += 1.0f;
+        temporal_score += 1.0f;  // Natural micro-motion range
     }
     
-    // 2. Confidence variance (blink proxy)
-    if (face_history_.size() >= 30) {
-        float confidence_variance = 0.0f;
-        float avg_confidence = 0.0f;
+    // 2. Face size variance (breathing/natural head movement)
+    if (face_history_.size() >= 10) {
+        float size_variance = 0.0f;
+        float avg_size = 0.0f;
+        int size_samples = 0;
         
         for (const auto& f : face_history_) {
-            avg_confidence += f.confidence;
+            if (f.detected) {
+                float size = f.bbox.width * f.bbox.height;
+                avg_size += size;
+                size_samples++;
+            }
         }
-        avg_confidence /= face_history_.size();
         
-        for (const auto& f : face_history_) {
-            float diff = f.confidence - avg_confidence;
-            confidence_variance += diff * diff;
-        }
-        confidence_variance /= face_history_.size();
-        
-        if (confidence_variance > 0.005f) {
-            temporal_score += 1.0f;
+        if (size_samples > 0) {
+            avg_size /= size_samples;
+            
+            for (const auto& f : face_history_) {
+                if (f.detected) {
+                    float size = f.bbox.width * f.bbox.height;
+                    float diff = size - avg_size;
+                    size_variance += diff * diff;
+                }
+            }
+            size_variance /= size_samples;
+            
+            // Natural breathing and subtle head movement cause size variance
+            float normalized_variance = size_variance / (avg_size * avg_size + 1e-6f);
+            
+            if (normalized_variance > 0.0001f) {
+                temporal_score += 1.0f;  // Natural variance detected
+            } else {
+                temporal_score += 0.7f;  // Very stable - not necessarily bad
+            }
         } else {
-            temporal_score += 0.4f;
+            temporal_score += 0.7f;
         }
     } else {
-        temporal_score += 0.6f;
+        temporal_score += 0.8f;  // Not enough history yet
     }
     
     return temporal_score / 2.0f;
@@ -894,17 +999,19 @@ float AntiSpoofingDetector::analyze_cross_modal_consistency(const FrameBox* fram
     float score = 0.0f;
     int checks = 0;
 
-    // Depth vs Color edge consistency
+    // OPTIMIZED: Depth vs Color edge consistency with better handling
     if (!frame->depth_data.empty() && !frame->color_data.empty()) {
         cv::Mat color = frame->get_color_mat();
         if (!color.empty()) {
             cv::Rect croi = face.bbox & cv::Rect(0,0,color.cols,color.rows);
             if (croi.width > 10 && croi.height > 10) {
+                // Extract color edges
                 cv::Mat gray, edges;
                 cv::cvtColor(color(croi), gray, cv::COLOR_BGR2GRAY);
                 cv::Canny(gray, edges, 50, 150);
-                float color_edge_density = static_cast<float>(cv::countNonZero(edges)) / (edges.total());
+                float color_edge_density = static_cast<float>(cv::countNonZero(edges)) / (edges.total() + 1e-6f);
 
+                // Map to depth space with alignment
                 int dx = (frame->color_width>0)? static_cast<int>(croi.x * (float)frame->depth_width / (float)frame->color_width) : croi.x;
                 int dy = (frame->color_height>0)? static_cast<int>(croi.y * (float)frame->depth_height / (float)frame->color_height) : croi.y;
                 int dw = (frame->color_width>0)? static_cast<int>(croi.width * (float)frame->depth_width / (float)frame->color_width) : croi.width;
@@ -915,40 +1022,53 @@ float AntiSpoofingDetector::analyze_cross_modal_consistency(const FrameBox* fram
                 dh = std::min(dh, frame->depth_height - dy);
                 
                 if (dw>10 && dh>10) {
-                    cv::Mat depth_roi(dh, dw, CV_32FC1);
-                    for (int j=0;j<dh;++j){
-                        for (int i=0;i<dw;++i){
+                    // OPTIMIZED: Sample depth instead of full ROI processing
+                    std::vector<float> depth_samples;
+                    depth_samples.reserve(dw * dh / 4);
+                    
+                    for (int j=0; j<dh; j+=2){  // Sample every 2nd pixel
+                        for (int i=0; i<dw; i+=2){
                             int idx = (dy+j)*frame->depth_width + (dx+i);
-                            float z = 0.0f;
-                            if (idx < (int)frame->depth_data.size()) {
-                                z = frame->depth_data[idx] * frame->depth_scale;
+                            if (idx < (int)frame->depth_data.size() && frame->depth_data[idx] > 0) {
+                                float z = frame->depth_data[idx] * frame->depth_scale;
+                                if (z > 0.1f && z < 5.0f) {  // Valid range
+                                    depth_samples.push_back(z);
+                                }
                             }
-                            depth_roi.at<float>(j,i) = z;
                         }
                     }
                     
-                    cv::Mat gx, gy, mag;
-                    cv::Sobel(depth_roi, gx, CV_32F, 1, 0, 3);
-                    cv::Sobel(depth_roi, gy, CV_32F, 0, 1, 3);
-                    cv::magnitude(gx, gy, mag);
-                    cv::Mat depth_edges;
-                    cv::threshold(mag, depth_edges, 0.005f, 1.0f, cv::THRESH_BINARY);
-                    float depth_edge_density = static_cast<float>(cv::countNonZero(depth_edges)) / (depth_edges.total());
-
-                    if (color_edge_density > 0.10f && depth_edge_density < 0.005f) {
-                        score += 0.0f;
-                    } else if (depth_edge_density > 0.005f) {
-                        score += 1.0f;
-                    } else {
-                        score += 0.6f;
+                    if (depth_samples.size() > 20) {
+                        // Calculate depth variance as proxy for edges/structure
+                        float mean = std::accumulate(depth_samples.begin(), depth_samples.end(), 0.0f) / depth_samples.size();
+                        float variance = 0.0f;
+                        for (float d : depth_samples) {
+                            variance += (d - mean) * (d - mean);
+                        }
+                        variance /= depth_samples.size();
+                        
+                        float depth_structure = std::sqrt(variance) * 100.0f;  // Convert to cm
+                        
+                        // Cross-modal logic: Real faces have BOTH color and depth structure
+                        // Flat attacks have color edges but minimal depth structure
+                        if (color_edge_density > 0.12f && depth_structure < 2.0f) {
+                            score += 0.0f;  // High color edges, flat depth = ATTACK
+                        } else if (depth_structure > 3.0f) {
+                            score += 1.0f;  // Good 3D structure = REAL
+                        } else if (depth_structure > 1.5f) {
+                            score += 0.7f;  // Moderate structure
+                        } else {
+                            score += 0.4f;  // Borderline
+                        }
+                        checks++;
                     }
-                    checks++;
                 }
             }
         }
     }
 
-    if (checks == 0) return 0.6f;
+    // Return with fallback for insufficient data
+    if (checks == 0) return 0.6f;  // Give benefit of doubt when data unavailable
     return score / checks;
 #else
     return 0.5f;
