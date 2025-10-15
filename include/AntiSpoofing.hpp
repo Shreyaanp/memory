@@ -10,14 +10,10 @@
 #include <opencv2/opencv.hpp>
 #endif
 
-// MediaPipe GPU-accelerated face detection (optional C++ build)
-#ifdef USE_MEDIAPIPE
-#include <mediapipe/framework/calculator_framework.h>
-#include <mediapipe/framework/formats/image_frame.h>
-#include <mediapipe/framework/formats/image_frame_opencv.h>
-#include <mediapipe/framework/port/opencv_core_inc.h>
-#include <mediapipe/framework/port/parse_text_proto.h>
-#endif
+// MediaPipe GPU face detection via Python bridge
+// Uses the working Python MediaPipe installation
+#include <stdio.h>
+#include <memory>
 
 namespace mdai {
 
@@ -96,7 +92,7 @@ public:
     void update_config(const AntiSpoofingConfig& config) { config_ = config; }
 
     /**
-     * @brief Detect face in frame using OpenCV cascade classifier
+     * @brief Detect face in frame using modern face detector
      * @return FaceROI with detection results
      */
     FaceROI detect_face(const FrameBox* frame);
@@ -104,25 +100,23 @@ public:
 private:
     AntiSpoofingConfig config_;
     
-#ifdef USE_MEDIAPIPE
-    // MediaPipe GPU-accelerated face detection (optional, requires C++ build)
-    std::unique_ptr<mediapipe::CalculatorGraph> mediapipe_graph_;
-    bool use_mediapipe_ = false;
-#endif
-    
 #ifdef HAVE_OPENCV
-    // OpenCV face detection (primary, reliable cross-platform)
-    cv::CascadeClassifier face_cascade_;
-    bool face_cascade_loaded_ = false;
+    // Face detection handled externally - no internal detector
+    
+    // Motion analysis state
+    cv::Mat previous_gray_;
+    std::deque<cv::Mat> motion_frame_history_;
+    static constexpr int MOTION_HISTORY_SIZE = 5;
 #endif
     
     // Temporal buffer for motion analysis
     std::deque<FaceROI> face_history_;
     static constexpr int HISTORY_SIZE = 30;  // 1 second at 30fps
     
-    // Quality gate implementations (now ROI-driven)
+    // Quality gate implementations (now ROI-driven) - FIXED NAMES
     float analyze_lighting_quality(const FrameBox* frame, const FaceROI& face);
-    float analyze_motion_stability(const FrameBox* frame, const FaceROI& face);
+    float analyze_sharpness(const FrameBox* frame, const FaceROI& face);  // RENAMED from motion_stability
+    float analyze_motion_stability(const FrameBox* frame, const FaceROI& face);  // NEW: real motion via optical flow
     float analyze_face_positioning(const FrameBox* frame, const FaceROI& face);
     float analyze_sensor_synchronization(const FrameBox* frame);
     float analyze_camera_stability(const FrameBox* frame);
@@ -175,7 +169,7 @@ private:
     
     // Core detection algorithms (now ROI-driven)
     float analyze_depth_geometry(const FrameBox* frame, const FaceROI& face);
-    float analyze_ir_texture(const FrameBox* frame, const FaceROI& face);
+    float analyze_ir_texture(const FrameBox* frame, const FaceROI& face);  // Now includes stereo consistency
     float analyze_temporal_consistency(const FaceROI& face);
     float analyze_cross_modal_consistency(const FrameBox* frame, const FaceROI& face);
     

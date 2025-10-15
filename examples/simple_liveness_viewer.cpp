@@ -6,6 +6,7 @@
 #include "Producer.hpp"
 #include "RingBuffer.hpp"
 #include "AntiSpoofing.hpp"
+#include "FaceDetector.hpp"
 
 using namespace mdai;
 
@@ -14,6 +15,7 @@ private:
     // Components
     std::unique_ptr<Producer> producer_;
     std::unique_ptr<DynamicRingBuffer> ring_buffer_;
+    std::unique_ptr<FaceDetector> face_detector_;
     std::unique_ptr<QualityGate> quality_gate_;
     std::unique_ptr<AntiSpoofingDetector> anti_spoofing_;
     AntiSpoofingConfig config_;
@@ -27,6 +29,14 @@ private:
     int face_detected_ = 0;
     int live_detected_ = 0;
     int spoof_detected_ = 0;
+    
+    // Face detection cache (for frame skipping optimization)
+    bool last_face_detected_ = false;
+    int last_face_x_ = 0;
+    int last_face_y_ = 0;
+    int last_face_w_ = 0;
+    int last_face_h_ = 0;
+    float last_face_confidence_ = 0.0f;
     
 public:
     SimpleLivenessViewer() {
@@ -141,24 +151,48 @@ private:
     void process_frame(FrameBox* frame) {
         total_frames_++;
         
-        // Process with new anti-spoofing system
-        // Process with quality gate first
+        // OPTIMIZATION: Run face detection every 3 frames (reduces CPU load by 66%)
+        if (total_frames_ % 3 == 0) {
+            if (face_detector_) {
+                face_detector_->detect(frame);
+            }
+        } else {
+            // Reuse previous face detection if available
+            if (last_face_detected_) {
+                frame->metadata.face_detected = last_face_detected_;
+                frame->metadata.face_x = last_face_x_;
+                frame->metadata.face_y = last_face_y_;
+                frame->metadata.face_w = last_face_w_;
+                frame->metadata.face_h = last_face_h_;
+                frame->metadata.face_detection_confidence = last_face_confidence_;
+            }
+        }
+        
+        // Cache face detection results
+        last_face_detected_ = frame->metadata.face_detected;
+        last_face_x_ = frame->metadata.face_x;
+        last_face_y_ = frame->metadata.face_y;
+        last_face_w_ = frame->metadata.face_w;
+        last_face_h_ = frame->metadata.face_h;
+        last_face_confidence_ = frame->metadata.face_detection_confidence;
+        
+        // Step 2: Quality gate analysis (lightweight)
         bool quality_ok = quality_gate_->process_frame(frame);
         
-        // Process with anti-spoofing system
-        bool anti_spoof_ok = anti_spoofing_->process_frame(frame);
+        // Step 3: Anti-spoofing analysis (only if face detected to save CPU)
+        bool anti_spoof_ok = false;
+        if (frame->metadata.face_detected) {
+            anti_spoof_ok = anti_spoofing_->process_frame(frame);
+        }
         
         // Calculate final decision
         bool final_ok = quality_ok && anti_spoof_ok;
         frame->metadata.is_ready_for_processing = final_ok;
         
         // Update statistics
-        if (frame->metadata.quality_gate.quality_gate_passed) face_detected_++;
+        if (frame->metadata.face_detected) face_detected_++;
         if (final_ok) live_detected_++;
         else spoof_detected_++;
-        
-        // Store result in frame metadata for compatibility
-        frame->metadata.is_ready_for_processing = final_ok;
         
         // Print detailed scores every 30 frames
         if (total_frames_ % 30 == 0) {
@@ -323,12 +357,22 @@ private:
             camera_config.align_to_color = true;  // CRITICAL: Required for accurate ROI mapping
             ring_buffer_ = std::make_unique<DynamicRingBuffer>(32, 5ULL * 1024 * 1024 * 1024);
             producer_ = std::make_unique<Producer>(camera_config, ring_buffer_.get());
+            
+            // Initialize face detector (MediaPipe GPU or OpenCV DNN fallback)
+            face_detector_ = create_face_detector();
+            if (!face_detector_) {
+                std::cerr << "❌ No face detector available!" << std::endl;
+                ring_buffer_.reset();
+                producer_.reset();
+                return;
+            }
+            
             quality_gate_ = std::make_unique<QualityGate>(config_);
             anti_spoofing_ = std::make_unique<AntiSpoofingDetector>(config_);
             
             if (producer_->start()) {
                 camera_running_ = true;
-                std::cout << "✅ Camera started successfully!" << std::endl;
+                std::cout << "✅ Camera started with " << face_detector_->name() << " face detector!" << std::endl;
             } else {
                 std::cout << "❌ Failed to start camera" << std::endl;
             }
@@ -343,6 +387,12 @@ private:
         if (producer_) {
             producer_->stop();
         }
+        
+        producer_.reset();
+        ring_buffer_.reset();
+        face_detector_.reset();
+        quality_gate_.reset();
+        anti_spoofing_.reset();
         
         camera_running_ = false;
         std::cout << "🛑 Camera stopped" << std::endl;

@@ -15,15 +15,11 @@ find_package(realsense2 REQUIRED)
 find_package(OpenCV QUIET)  # Optional - for Utils and fallback face detection
 find_package(Threads REQUIRED)
 
-# MediaPipe - Optional for GPU-accelerated face detection  
-# Falls back to OpenCV Haar cascade if not available
-find_package(mediapipe QUIET)
-if(mediapipe_FOUND)
-    add_definitions(-DUSE_MEDIAPIPE)
-    message(STATUS "MediaPipe C++ found - GPU-accelerated face detection enabled")
-else()
-    message(STATUS "MediaPipe not found - using OpenCV Haar cascade (acceptable for now)")
-endif()
+# MediaPipe C++ GPU face detection (DISABLED - using OpenCV DNN for portability)
+# MediaPipe has complex linking dependencies and is not easily portable to Jetson
+# Using OpenCV DNN with automatic CUDA/CPU backend selection instead
+set(MEDIAPIPE_AVAILABLE FALSE)
+message(STATUS "Face detection: OpenCV DNN (portable Desktop + Jetson)")
 
 # Check if OpenCV was found
 if(OpenCV_FOUND)
@@ -40,9 +36,7 @@ include_directories(
     ${OpenCV_INCLUDE_DIRS}
 )
 
-if(mediapipe_FOUND)
-    include_directories(${mediapipe_INCLUDE_DIRS})
-endif()
+# No additional includes needed - using OpenCV DNN
 
 # Source files
 set(SOURCES
@@ -52,6 +46,7 @@ set(SOURCES
     src/Pipeline.cpp
     src/CameraInitializer.cpp
     src/AntiSpoofing.cpp
+    src/FaceDetector.cpp
 )
 
 # Add Utils only if OpenCV is available
@@ -66,10 +61,6 @@ target_link_libraries(mdai_realsense
     Threads::Threads
 )
 
-if(mediapipe_FOUND)
-    target_link_libraries(mdai_realsense ${mediapipe_LIBRARIES})
-endif()
-
 if(OpenCV_FOUND)
     target_link_libraries(mdai_realsense ${OpenCV_LIBS})
 endif()
@@ -81,10 +72,6 @@ target_link_libraries(mdai_realsense_static
     ${realsense2_LIBRARY}
     Threads::Threads
 )
-
-if(mediapipe_FOUND)
-    target_link_libraries(mdai_realsense_static ${mediapipe_LIBRARIES})
-endif()
 
 if(OpenCV_FOUND)
     target_link_libraries(mdai_realsense_static ${OpenCV_LIBS})
