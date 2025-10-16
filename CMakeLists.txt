@@ -12,14 +12,23 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 
 # Find dependencies
 find_package(realsense2 REQUIRED)
-find_package(OpenCV QUIET)  # Optional - for Utils and fallback face detection
+find_package(OpenCV QUIET)  # Optional - for Utils
 find_package(Threads REQUIRED)
 
-# MediaPipe C++ GPU face detection (DISABLED - using OpenCV DNN for portability)
-# MediaPipe has complex linking dependencies and is not easily portable to Jetson
-# Using OpenCV DNN with automatic CUDA/CPU backend selection instead
-set(MEDIAPIPE_AVAILABLE FALSE)
-message(STATUS "Face detection: OpenCV DNN (portable Desktop + Jetson)")
+# ONNX Runtime for 68-landmark face detection with GPU support
+set(ONNXRUNTIME_ROOT "/usr/local/onnxruntime")
+set(ONNXRUNTIME_INCLUDE_DIRS "${ONNXRUNTIME_ROOT}/include")
+set(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_ROOT}/lib")
+
+if(EXISTS "${ONNXRUNTIME_INCLUDE_DIRS}/onnxruntime_cxx_api.h")
+    set(ONNXRUNTIME_FOUND TRUE)
+    message(STATUS "ONNX Runtime found: ${ONNXRUNTIME_ROOT}")
+    message(STATUS "Face detection: ONNX Runtime 68-landmark (GPU/CPU portable)")
+else()
+    set(ONNXRUNTIME_FOUND FALSE)
+    message(WARNING "ONNX Runtime not found at ${ONNXRUNTIME_ROOT}")
+    message(WARNING "Face detection will not be available")
+endif()
 
 # Check if OpenCV was found
 if(OpenCV_FOUND)
@@ -34,9 +43,8 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${realsense2_INCLUDE_DIR}
     ${OpenCV_INCLUDE_DIRS}
+    ${ONNXRUNTIME_INCLUDE_DIRS}
 )
-
-# No additional includes needed - using OpenCV DNN
 
 # Source files
 set(SOURCES
@@ -65,6 +73,10 @@ if(OpenCV_FOUND)
     target_link_libraries(mdai_realsense ${OpenCV_LIBS})
 endif()
 
+if(ONNXRUNTIME_FOUND)
+    target_link_libraries(mdai_realsense ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so)
+endif()
+
 # Create static library for Python bindings and tests
 add_library(mdai_realsense_static STATIC ${SOURCES})
 
@@ -75,6 +87,10 @@ target_link_libraries(mdai_realsense_static
 
 if(OpenCV_FOUND)
     target_link_libraries(mdai_realsense_static ${OpenCV_LIBS})
+endif()
+
+if(ONNXRUNTIME_FOUND)
+    target_link_libraries(mdai_realsense_static ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so)
 endif()
 
 # Install targets

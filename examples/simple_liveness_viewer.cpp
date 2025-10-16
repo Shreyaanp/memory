@@ -37,6 +37,7 @@ private:
     int last_face_w_ = 0;
     int last_face_h_ = 0;
     float last_face_confidence_ = 0.0f;
+    FrameBoxMetadata::FacialLandmarks last_landmarks_;
     
 public:
     SimpleLivenessViewer() {
@@ -74,6 +75,9 @@ public:
     void run() {
         // Create the main window
         cv::namedWindow("Liveness Viewer", cv::WINDOW_AUTOSIZE);
+        
+        // Auto-start camera
+        start_camera();
         
         while (true) {
             update_display();
@@ -165,16 +169,18 @@ private:
                 frame->metadata.face_w = last_face_w_;
                 frame->metadata.face_h = last_face_h_;
                 frame->metadata.face_detection_confidence = last_face_confidence_;
+                frame->metadata.landmarks = last_landmarks_;  // CACHE LANDMARKS TOO!
             }
         }
         
-        // Cache face detection results
+        // Cache face detection results (including landmarks!)
         last_face_detected_ = frame->metadata.face_detected;
         last_face_x_ = frame->metadata.face_x;
         last_face_y_ = frame->metadata.face_y;
         last_face_w_ = frame->metadata.face_w;
         last_face_h_ = frame->metadata.face_h;
         last_face_confidence_ = frame->metadata.face_detection_confidence;
+        last_landmarks_ = frame->metadata.landmarks;
         
         // Step 2: Quality gate analysis (lightweight)
         bool quality_ok = quality_gate_->process_frame(frame);
@@ -214,6 +220,7 @@ private:
         std::cout << "Anti-Spoofing: " << (frame->metadata.anti_spoofing.is_live ? "✅ PASSED" : "❌ FAILED") << std::endl;
         std::cout << "  Depth Analysis: " << frame->metadata.anti_spoofing.depth_analysis_score << std::endl;
         std::cout << "  IR Texture: " << frame->metadata.anti_spoofing.ir_texture_score << std::endl;
+        std::cout << "  Skin Texture: " << frame->metadata.anti_spoofing.skin_texture_score << " ⭐ KEY!" << std::endl;
         std::cout << "  Cross-Modal: " << frame->metadata.anti_spoofing.cross_modal_score << std::endl;
         std::cout << "  Overall Liveness: " << frame->metadata.anti_spoofing.overall_liveness_score << std::endl;
         std::cout << "  Confidence: " << frame->metadata.anti_spoofing.confidence << std::endl;

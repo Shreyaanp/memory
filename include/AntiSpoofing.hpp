@@ -170,8 +170,16 @@ private:
     // Core detection algorithms (now ROI-driven)
     float analyze_depth_geometry(const FrameBox* frame, const FaceROI& face);
     float analyze_ir_texture(const FrameBox* frame, const FaceROI& face);  // Now includes stereo consistency
+    float analyze_skin_texture(const FrameBox* frame, const FaceROI& face);  // NEW: Color texture analysis
     float analyze_temporal_consistency(const FaceROI& face);
     float analyze_cross_modal_consistency(const FrameBox* frame, const FaceROI& face);
+    
+    // Enhanced landmark-based analysis (68 points)
+    float validate_landmarks_depth(const FrameBox* frame, const FaceROI& face);
+    float analyze_nose_protrusion(const FrameBox* frame, const FaceROI& face);
+    float analyze_face_curvature(const FrameBox* frame, const FaceROI& face);
+    float validate_symmetry(const FrameBox* frame, const FaceROI& face);
+    float track_landmark_motion(const FaceROI& current_face);
     
     // Temporal liveness checks
     bool detect_blink(const std::vector<cv::Point2f>& landmarks);

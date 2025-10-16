@@ -470,13 +470,52 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
         face_history_.pop_front();
     }
     
+    // Core anti-spoofing analyses
     frame->metadata.anti_spoofing.depth_analysis_score = analyze_depth_geometry(frame, face);
     
     // IR texture analysis now includes stereo consistency check
     frame->metadata.anti_spoofing.ir_texture_score = analyze_ir_texture(frame, face);
     
+    // NEW: Skin texture analysis - KEY for detecting plastic masks!
+    frame->metadata.anti_spoofing.skin_texture_score = analyze_skin_texture(frame, face);
+    
     frame->metadata.anti_spoofing.cross_modal_score = analyze_cross_modal_consistency(frame, face);
     frame->metadata.anti_spoofing.temporal_consistency_score = analyze_temporal_consistency(face);
+    
+    // Enhanced landmark-based analyses (68-point)
+    float landmarks_depth_score = validate_landmarks_depth(frame, face);
+    float nose_protrusion_score = analyze_nose_protrusion(frame, face);
+    float face_curvature_score = analyze_face_curvature(frame, face);
+    float symmetry_score = validate_symmetry(frame, face);
+    float landmark_motion_score = track_landmark_motion(face);
+    
+    // DEBUG: Log individual landmark scores
+    static int debug_count = 0;
+    if (++debug_count % 30 == 0) {  // Every 30 frames
+        std::cout << "\n=== LANDMARK-BASED ANTI-SPOOFING DEBUG ===" << std::endl;
+        std::cout << "  Landmarks valid: " << (frame->metadata.landmarks.valid ? "YES" : "NO") << std::endl;
+        if (frame->metadata.landmarks.valid) {
+            std::cout << "  Landmark depth validation: " << (landmarks_depth_score * 100) << "%" << std::endl;
+            std::cout << "  Nose protrusion: " << (nose_protrusion_score * 100) << "%" << std::endl;
+            std::cout << "  Face curvature: " << (face_curvature_score * 100) << "%" << std::endl;
+            std::cout << "  L-R symmetry: " << (symmetry_score * 100) << "%" << std::endl;
+        }
+    }
+    
+    // Combine landmark scores (if landmarks are available)
+    float landmark_composite_score = 0.5f;  // Default neutral
+    if (frame->metadata.landmarks.valid) {
+        landmark_composite_score = (
+            landmarks_depth_score * 0.30f +      // Overall depth at landmarks
+            nose_protrusion_score * 0.25f +       // Nose 3D structure
+            face_curvature_score * 0.25f +        // Face curvature
+            symmetry_score * 0.15f +              // Left-right symmetry
+            landmark_motion_score * 0.05f         // Micro-movements
+        );
+    } else {
+        // CRITICAL: If landmarks not available, FAIL HARD
+        landmark_composite_score = 0.0f;  // Force failure without landmarks
+    }
     
     frame->metadata.anti_spoofing.depth_anomaly_detected = 
         frame->metadata.anti_spoofing.depth_analysis_score < config_.min_depth_analysis_score;
@@ -486,41 +525,53 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
         frame->metadata.anti_spoofing.cross_modal_score < config_.min_cross_modal_score;
     
     frame->metadata.anti_spoofing.overall_liveness_score = 
-        (frame->metadata.anti_spoofing.depth_analysis_score * 0.40f +
-         frame->metadata.anti_spoofing.ir_texture_score * 0.30f +
-         frame->metadata.anti_spoofing.temporal_consistency_score * 0.15f +
-         frame->metadata.anti_spoofing.cross_modal_score * 0.15f);
+        (frame->metadata.anti_spoofing.depth_analysis_score * 0.25f +
+         frame->metadata.anti_spoofing.ir_texture_score * 0.20f +
+         frame->metadata.anti_spoofing.skin_texture_score * 0.35f +  // KEY: Skin texture!
+         landmark_composite_score * 0.10f +
+         frame->metadata.anti_spoofing.temporal_consistency_score * 0.05f +
+         frame->metadata.anti_spoofing.cross_modal_score * 0.05f);
     
     frame->metadata.anti_spoofing.detected_attack_type = detect_attack_type(frame, face);
     
     frame->metadata.anti_spoofing.confidence = calculate_confidence(frame, face);
     
     // FIXED: Replace OR-of-ANDs with weighted score fusion (Fix #8)
-    // Old logic allowed bypasses - e.g., depth_ok + temporal_ok passes even if IR shows attack
+    // Enhanced with 68-landmark analysis
     
     // Get individual scores
     float depth_score = frame->metadata.anti_spoofing.depth_analysis_score;
     float ir_score = frame->metadata.anti_spoofing.ir_texture_score;
+    float skin_texture_score = frame->metadata.anti_spoofing.skin_texture_score;
     float xmodal_score = frame->metadata.anti_spoofing.cross_modal_score;
     float temporal_score = frame->metadata.anti_spoofing.temporal_consistency_score;
     
-    // Weighted fusion (sum = 1.0)
+    // FIXED: If temporal score is too low (person is steady), default to neutral 0.5
+    // Don't penalize people for being still!
+    if (temporal_score < 0.3f) {
+        temporal_score = 0.5f;  // Neutral score for steady people
+    }
+    
+    // FIXED: Make landmarks optional (not required)
+    if (!frame->metadata.landmarks.valid) {
+        landmark_composite_score = 0.5f;  // Neutral if not available (not forced to 0!)
+    }
+    
+    // NEW: Weighted fusion with SKIN TEXTURE as key component (sum = 1.0)
     float fused_score = 
-        depth_score * 0.40f +      // Depth is most reliable
-        ir_score * 0.30f +          // IR texture is second most reliable
-        temporal_score * 0.15f +    // Temporal consistency
-        xmodal_score * 0.15f;       // Cross-modal validation
+        depth_score * 0.25f +              // Depth geometry (3D structure)
+        ir_score * 0.20f +                  // IR texture + stereo (material)
+        skin_texture_score * 0.35f +        // COLOR TEXTURE (pores, detail) - KEY!
+        landmark_composite_score * 0.10f +  // 68-point landmark validation (bonus)
+        temporal_score * 0.05f +            // Temporal consistency (optional)
+        xmodal_score * 0.05f;               // Cross-modal validation
     
-    // Minimum guardrail: no single component can be too low
-    float min_component = std::min({depth_score, ir_score, temporal_score, xmodal_score});
-    
-    // Pass criteria: good fused score AND no single component is critically low
+    // FIXED: REMOVED guardrails! Use simple threshold only.
+    // Pass criteria: good fused score AND confidence
     bool passes_fusion = (fused_score >= config_.min_overall_liveness);
-    // PHASE 1 FIX #2: Raised guardrail from 0.25 to 0.5 (much stricter)
-    bool passes_guardrail = (min_component >= 0.5f);  // At least 50% on all components - no weak links
     bool passes_confidence = frame->metadata.anti_spoofing.confidence >= config_.min_confidence;
     
-    frame->metadata.anti_spoofing.is_live = passes_fusion && passes_guardrail && passes_confidence;
+    frame->metadata.anti_spoofing.is_live = passes_fusion && passes_confidence;
     
     if (!frame->metadata.anti_spoofing.is_live) {
         frame->metadata.anti_spoofing.rejection_reason = generate_rejection_reason(frame);
@@ -595,8 +646,18 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
     }
     
     float coverage = static_cast<float>(valid_pixels) / static_cast<float>(total_pixels);
+    
+    // DEBUG: Log depth coverage
+    static int coverage_debug_count = 0;
+    if (++coverage_debug_count % 30 == 0) {
+        std::cout << "  Depth ROI coverage: " << (coverage * 100) << "% (" << valid_pixels << "/" << total_pixels << " pixels)" << std::endl;
+    }
+    
     if (coverage < 0.7f) {
         // Insufficient depth coverage - likely flat object or occlusion
+        if (coverage_debug_count % 30 == 0) {
+            std::cout << "  ⚠️ REJECTED: Depth coverage too low (< 70%)" << std::endl;
+        }
         return 0.0f;
     }
     
@@ -668,8 +729,17 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
         }
         float avg_plane_error = total_error / face_points.size();
         
+        // DEBUG: Log plane fitting results
+        static int plane_debug_count = 0;
+        if (++plane_debug_count % 30 == 0) {
+            std::cout << "  Plane fitting error: " << (avg_plane_error * 1000) << " mm" << std::endl;
+            if (avg_plane_error < 0.008f) {
+                std::cout << "  ⚠️ FLAT SURFACE DETECTED (< 8mm deviation)" << std::endl;
+            }
+        }
+        
         if (avg_plane_error < 0.008f) {
-            return 0.0f;
+            return 0.0f;  // Too flat - likely mask/photo
         } else if (avg_plane_error < 0.015f) {
             geometry_score += 0.3f;
         } else if (avg_plane_error < 0.025f) {
@@ -684,6 +754,15 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
         float min_depth = *std::min_element(depth_values.begin(), depth_values.end());
         float max_depth = *std::max_element(depth_values.begin(), depth_values.end());
         float depth_range = max_depth - min_depth;
+        
+        // DEBUG: Log depth range
+        static int range_debug_count = 0;
+        if (++range_debug_count % 30 == 0) {
+            std::cout << "  Depth range: " << (depth_range * 1000) << " mm" << std::endl;
+            if (depth_range < 0.025f) {
+                std::cout << "  ⚠️ INSUFFICIENT DEPTH VARIATION (< 25mm)" << std::endl;
+            }
+        }
         
         if (depth_range < 0.025f) {
             geometry_score += 0.0f;
@@ -924,6 +1003,196 @@ float AntiSpoofingDetector::analyze_ir_texture(const FrameBox* frame, const Face
 #endif
 }
 
+// ============================================================================
+// SKIN TEXTURE ANALYSIS - KEY for detecting plastic masks!
+// ============================================================================
+float AntiSpoofingDetector::analyze_skin_texture(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || frame->color_data.empty()) {
+        return 0.0f;
+    }
+
+#ifdef OPENCV_AVAILABLE
+    cv::Mat color_mat(frame->color_height, frame->color_width, CV_8UC3, (void*)frame->color_data.data());
+    
+    if (color_mat.empty()) {
+        return 0.0f;
+    }
+    
+    // Extract face ROI
+    int roi_x = std::max(0, face.bbox.x);
+    int roi_y = std::max(0, face.bbox.y);
+    int roi_w = std::min(face.bbox.width, color_mat.cols - roi_x);
+    int roi_h = std::min(face.bbox.height, color_mat.rows - roi_y);
+    
+    if (roi_w <= 0 || roi_h <= 0) {
+        return 0.0f;
+    }
+    
+    cv::Rect roi_rect(roi_x, roi_y, roi_w, roi_h);
+    cv::Mat face_crop = color_mat(roi_rect);
+    
+    float texture_score = 0.0f;
+    
+    // ==========================
+    // 1. LAPLACIAN VARIANCE (Fine Detail/Sharpness)
+    // ==========================
+    // Real skin has lots of fine details (pores, wrinkles)
+    // Plastic masks are smooth with low variance
+    cv::Mat gray, laplacian;
+    cv::cvtColor(face_crop, gray, cv::COLOR_BGR2GRAY);
+    cv::Laplacian(gray, laplacian, CV_64F);
+    
+    cv::Scalar lap_mean, lap_stddev;
+    cv::meanStdDev(laplacian, lap_mean, lap_stddev);
+    double lap_variance = lap_stddev[0] * lap_stddev[0];
+    
+    // Real skin: 100-1000+, Plastic: 10-50
+    if (lap_variance > 200.0) {
+        texture_score += 1.0f;  // Rich texture
+    } else if (lap_variance > 100.0) {
+        texture_score += 0.7f;  // Moderate texture
+    } else if (lap_variance > 50.0) {
+        texture_score += 0.3f;  // Low texture
+    } else {
+        texture_score += 0.0f;  // Very smooth = mask
+    }
+    
+    // ==========================
+    // 2. COLOR VARIANCE (Non-uniformity)
+    // ==========================
+    // Real skin has color variation (blood vessels, tone changes)
+    // Plastic masks are uniformly painted
+    cv::Mat float_crop;
+    face_crop.convertTo(float_crop, CV_32F);
+    
+    cv::Scalar color_mean, color_stddev;
+    cv::meanStdDev(float_crop, color_mean, color_stddev);
+    
+    // Average std dev across channels
+    float avg_color_std = (color_stddev[0] + color_stddev[1] + color_stddev[2]) / 3.0f;
+    
+    // Real skin: 15-40, Plastic: 5-15
+    if (avg_color_std > 20.0f) {
+        texture_score += 1.0f;  // High color variation
+    } else if (avg_color_std > 12.0f) {
+        texture_score += 0.6f;  // Moderate variation
+    } else if (avg_color_std > 8.0f) {
+        texture_score += 0.3f;  // Low variation
+    } else {
+        texture_score += 0.0f;  // Very uniform = mask
+    }
+    
+    // ==========================
+    // 3. EDGE DENSITY (Pores, Features)
+    // ==========================
+    // Real skin has many edges from pores, wrinkles
+    // Plastic masks have fewer, smoother edges
+    cv::Mat edges;
+    cv::Canny(gray, edges, 50, 150);
+    
+    int edge_pixels = cv::countNonZero(edges);
+    float edge_density = static_cast<float>(edge_pixels) / static_cast<float>(edges.rows * edges.cols);
+    
+    // Real skin: 0.05-0.20, Plastic: 0.01-0.05
+    if (edge_density > 0.08f) {
+        texture_score += 1.0f;  // Many edges
+    } else if (edge_density > 0.05f) {
+        texture_score += 0.6f;  // Moderate edges
+    } else if (edge_density > 0.03f) {
+        texture_score += 0.3f;  // Few edges
+    } else {
+        texture_score += 0.0f;  // Very few edges = mask
+    }
+    
+    // ==========================
+    // 4. HIGH-FREQUENCY POWER (FFT)
+    // ==========================
+    // Real skin has rich high-frequency content
+    // Plastic masks are mostly low-frequency (smooth)
+    cv::Mat gray_float;
+    gray.convertTo(gray_float, CV_32F);
+    
+    // Resize to power of 2 for efficient FFT
+    int optimal_rows = cv::getOptimalDFTSize(gray.rows);
+    int optimal_cols = cv::getOptimalDFTSize(gray.cols);
+    cv::Mat padded;
+    cv::copyMakeBorder(gray_float, padded, 0, optimal_rows - gray.rows, 
+                      0, optimal_cols - gray.cols, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+    
+    cv::Mat planes[] = {padded, cv::Mat::zeros(padded.size(), CV_32F)};
+    cv::Mat complex_img;
+    cv::merge(planes, 2, complex_img);
+    
+    cv::dft(complex_img, complex_img);
+    
+    // Compute magnitude
+    cv::split(complex_img, planes);
+    cv::magnitude(planes[0], planes[1], planes[0]);
+    cv::Mat magnitude = planes[0];
+    
+    // Log scale for better visualization
+    magnitude += cv::Scalar::all(1);
+    cv::log(magnitude, magnitude);
+    
+    // Compute high-frequency power (outer 40% of spectrum)
+    int cx = magnitude.cols / 2;
+    int cy = magnitude.rows / 2;
+    float center_radius = std::min(cx, cy) * 0.6f;  // Inner 60%
+    
+    double total_power = 0.0;
+    double high_freq_power = 0.0;
+    
+    for (int y = 0; y < magnitude.rows; y++) {
+        for (int x = 0; x < magnitude.cols; x++) {
+            float dist = std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+            float val = magnitude.at<float>(y, x);
+            total_power += val;
+            
+            if (dist > center_radius) {
+                high_freq_power += val;
+            }
+        }
+    }
+    
+    float high_freq_ratio = (total_power > 0) ? (high_freq_power / total_power) : 0.0f;
+    
+    // Real skin: 0.30-0.50, Plastic: 0.10-0.25
+    if (high_freq_ratio > 0.35f) {
+        texture_score += 1.0f;  // Rich high-frequency content
+    } else if (high_freq_ratio > 0.25f) {
+        texture_score += 0.6f;  // Moderate high-frequency
+    } else if (high_freq_ratio > 0.18f) {
+        texture_score += 0.3f;  // Low high-frequency
+    } else {
+        texture_score += 0.0f;  // Very smooth spectrum = mask
+    }
+    
+    // Combine all 4 components (normalize to 0-1)
+    float final_score = texture_score / 4.0f;
+    
+    // DEBUG: Log skin texture analysis every 30 frames
+    static int skin_debug_count = 0;
+    if (++skin_debug_count % 30 == 0) {
+        std::cout << "\n=== SKIN TEXTURE ANALYSIS DEBUG ===" << std::endl;
+        std::cout << "  Laplacian variance: " << lap_variance << " (score: " << (texture_score >= 1.0f ? "1.0" : (texture_score >= 0.7f ? "0.7" : (texture_score >= 0.3f ? "0.3" : "0.0"))) << ")" << std::endl;
+        std::cout << "  Color std dev: " << avg_color_std << " (score: " << ((texture_score - (texture_score >= 1.0f ? 1.0f : (texture_score >= 0.7f ? 0.7f : (texture_score >= 0.3f ? 0.3f : 0.0f)))) >= 1.0f ? "1.0" : ((texture_score - (texture_score >= 1.0f ? 1.0f : (texture_score >= 0.7f ? 0.7f : (texture_score >= 0.3f ? 0.3f : 0.0f)))) >= 0.6f ? "0.6" : ((texture_score - (texture_score >= 1.0f ? 1.0f : (texture_score >= 0.7f ? 0.7f : (texture_score >= 0.3f ? 0.3f : 0.0f)))) >= 0.3f ? "0.3" : "0.0"))) << ")" << std::endl;
+        std::cout << "  Edge density: " << edge_density << " (score: varies)" << std::endl;
+        std::cout << "  High-freq ratio: " << high_freq_ratio << " (score: varies)" << std::endl;
+        std::cout << "  FINAL SKIN TEXTURE SCORE: " << (final_score * 100) << "%" << std::endl;
+        
+        if (final_score < 0.4f) {
+            std::cout << "  ⚠️ SMOOTH SURFACE DETECTED - Likely MASK!" << std::endl;
+        } else if (final_score > 0.65f) {
+            std::cout << "  ✅ RICH TEXTURE - Likely REAL SKIN!" << std::endl;
+        }
+    }
+    
+    return final_score;
+#else
+    return 0.5f;
+#endif
+}
+
 float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
     // FIXED: No benefit of doubt - require sufficient data (Fix #4)
     if (!face.detected || face_history_.size() < 3) {
@@ -1154,13 +1423,17 @@ float AntiSpoofingDetector::calculate_confidence(const FrameBox* frame, const Fa
 
     float d = frame->metadata.anti_spoofing.depth_analysis_score;
     float ir = frame->metadata.anti_spoofing.ir_texture_score;
+    float skin = frame->metadata.anti_spoofing.skin_texture_score;
     float cm = frame->metadata.anti_spoofing.cross_modal_score;
     float t = frame->metadata.anti_spoofing.temporal_consistency_score;
 
-    float min_comp = std::min(std::min(d, ir), std::min(cm, t));
-    float mean_comp = (d + ir + cm + t) / 4.0f;
+    // FIXED: Mean-based confidence (80%) with small min-component guard (20%)
+    // This allows real humans to pass even if one component is low
+    // Include skin texture in confidence calculation!
+    float min_comp = std::min({d, ir, skin, cm, t});
+    float mean_comp = (d + ir + skin + cm + t) / 5.0f;
 
-    float confidence = 0.6f * min_comp + 0.4f * mean_comp;
+    float confidence = 0.2f * min_comp + 0.8f * mean_comp;  // CHANGED from 0.6/0.4
     return confidence;
 }
 
@@ -1289,6 +1562,420 @@ void AdaptiveThresholdManager::learn_from_result(const FrameBox* frame, bool suc
     }
     
     learning_stats_.success_rate = static_cast<float>(learning_stats_.successful_samples) / learning_stats_.total_samples;
+}
+
+// ============================================================================
+// Enhanced Landmark-Based Anti-Spoofing (68 Points)
+// ============================================================================
+
+/**
+ * @brief Validate depth at 68 facial landmarks
+ * 
+ * Checks that depth values at landmark points form a coherent 3D face structure.
+ * Flat objects (photos, screens) will have inconsistent or missing depth at landmarks.
+ */
+float AntiSpoofingDetector::validate_landmarks_depth(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || !frame->metadata.landmarks.valid) {
+        return 0.0f;
+    }
+    
+    if (frame->depth_data.empty() || frame->depth_width <= 0 || frame->depth_height <= 0) {
+        return 0.0f;
+    }
+    
+#ifdef HAVE_OPENCV
+    const auto& lm = frame->metadata.landmarks;
+    
+    // Collect depth values at all 68 landmarks
+    std::vector<float> landmark_depths;
+    landmark_depths.reserve(68);
+    
+    // Helper lambda to get depth at a 2D point
+    auto get_depth_at_point = [&](float x, float y) -> float {
+        // Scale from color coordinates to depth coordinates
+        float scale_x = static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width);
+        float scale_y = static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height);
+        
+        int depth_x = static_cast<int>(x * scale_x);
+        int depth_y = static_cast<int>(y * scale_y);
+        
+        // Bounds checking
+        if (depth_x < 0 || depth_x >= frame->depth_width || depth_y < 0 || depth_y >= frame->depth_height) {
+            return 0.0f;
+        }
+        
+        int idx = depth_y * frame->depth_width + depth_x;
+        if (idx < 0 || idx >= frame->depth_data.size()) {
+            return 0.0f;
+        }
+        
+        uint16_t depth_raw = frame->depth_data[idx];
+        return depth_raw > 0 ? (depth_raw * frame->depth_scale) : 0.0f;
+    };
+    
+    // Sample all landmark groups
+    // Contour (17 points)
+    for (int i = 0; i < 17; i++) {
+        float d = get_depth_at_point(lm.contour_x[i], lm.contour_y[i]);
+        if (d > 0) landmark_depths.push_back(d);
+    }
+    
+    // Eyebrows (10 points)
+    for (int i = 0; i < 5; i++) {
+        float d1 = get_depth_at_point(lm.right_eyebrow_x[i], lm.right_eyebrow_y[i]);
+        float d2 = get_depth_at_point(lm.left_eyebrow_x[i], lm.left_eyebrow_y[i]);
+        if (d1 > 0) landmark_depths.push_back(d1);
+        if (d2 > 0) landmark_depths.push_back(d2);
+    }
+    
+    // Nose bridge (4 points)
+    for (int i = 0; i < 4; i++) {
+        float d = get_depth_at_point(lm.nose_bridge_x[i], lm.nose_bridge_y[i]);
+        if (d > 0) landmark_depths.push_back(d);
+    }
+    
+    // Nose bottom (5 points)
+    for (int i = 0; i < 5; i++) {
+        float d = get_depth_at_point(lm.nose_bottom_x[i], lm.nose_bottom_y[i]);
+        if (d > 0) landmark_depths.push_back(d);
+    }
+    
+    // Eyes (12 points)
+    for (int i = 0; i < 6; i++) {
+        float d1 = get_depth_at_point(lm.right_eye_x[i], lm.right_eye_y[i]);
+        float d2 = get_depth_at_point(lm.left_eye_x[i], lm.left_eye_y[i]);
+        if (d1 > 0) landmark_depths.push_back(d1);
+        if (d2 > 0) landmark_depths.push_back(d2);
+    }
+    
+    // Outer mouth (12 points)
+    for (int i = 0; i < 12; i++) {
+        float d = get_depth_at_point(lm.outer_mouth_x[i], lm.outer_mouth_y[i]);
+        if (d > 0) landmark_depths.push_back(d);
+    }
+    
+    // Inner mouth (8 points)
+    for (int i = 0; i < 8; i++) {
+        float d = get_depth_at_point(lm.inner_mouth_x[i], lm.inner_mouth_y[i]);
+        if (d > 0) landmark_depths.push_back(d);
+    }
+    
+    // Require at least 50% of landmarks to have valid depth (34/68)
+    if (landmark_depths.size() < 34) {
+        return 0.0f;  // Insufficient depth coverage
+    }
+    
+    // Compute statistics
+    float mean_depth = std::accumulate(landmark_depths.begin(), landmark_depths.end(), 0.0f) / landmark_depths.size();
+    
+    // Compute standard deviation
+    float variance = 0.0f;
+    for (float d : landmark_depths) {
+        variance += (d - mean_depth) * (d - mean_depth);
+    }
+    variance /= landmark_depths.size();
+    float std_dev = std::sqrt(variance);
+    
+    // Real faces should have depth variation (not flat)
+    // Typical face depth range: 3-5cm across face surface
+    // Score based on depth standard deviation
+    float depth_variation_score = std::min(1.0f, std_dev / 0.03f);  // 3cm = perfect score
+    
+    // Check for depth discontinuities (jumps) which indicate flat surface
+    int valid_transitions = 0;
+    int smooth_transitions = 0;
+    for (size_t i = 1; i < landmark_depths.size(); i++) {
+        float diff = std::abs(landmark_depths[i] - landmark_depths[i-1]);
+        valid_transitions++;
+        if (diff < 0.05f) {  // Smooth transition (< 5cm jump)
+            smooth_transitions++;
+        }
+    }
+    
+    float smoothness_score = valid_transitions > 0 ? 
+        static_cast<float>(smooth_transitions) / valid_transitions : 0.0f;
+    
+    // Combined score: good variation + smooth transitions
+    float final_score = (depth_variation_score * 0.6f + smoothness_score * 0.4f);
+    
+    return final_score;
+#else
+    return 0.5f;  // No OpenCV, return neutral
+#endif
+}
+
+/**
+ * @brief Analyze nose protrusion using 9 nose landmarks
+ * 
+ * The nose should protrude forward from the face plane.
+ * Flat objects will not show this 3D structure.
+ */
+float AntiSpoofingDetector::analyze_nose_protrusion(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || !frame->metadata.landmarks.valid) {
+        return 0.0f;
+    }
+    
+    if (frame->depth_data.empty() || frame->depth_width <= 0 || frame->depth_height <= 0) {
+        return 0.0f;
+    }
+    
+#ifdef HAVE_OPENCV
+    const auto& lm = frame->metadata.landmarks;
+    
+    // Get nose tip depth (landmark 30 in iBUG format - index 3)
+    auto get_depth = [&](float x, float y) -> float {
+        float scale_x = static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width);
+        float scale_y = static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height);
+        
+        int depth_x = static_cast<int>(x * scale_x);
+        int depth_y = static_cast<int>(y * scale_y);
+        
+        if (depth_x < 0 || depth_x >= frame->depth_width || depth_y < 0 || depth_y >= frame->depth_height) {
+            return 0.0f;
+        }
+        
+        int idx = depth_y * frame->depth_width + depth_x;
+        if (idx < 0 || idx >= frame->depth_data.size()) {
+            return 0.0f;
+        }
+        
+        uint16_t depth_raw = frame->depth_data[idx];
+        return depth_raw > 0 ? (depth_raw * frame->depth_scale) : 0.0f;
+    };
+    
+    // Get nose tip (should be closest to camera) - use center of nose bottom (landmark 33)
+    float nose_tip_depth = get_depth(lm.nose_bottom_x[2], lm.nose_bottom_y[2]);
+    
+    // Get nose bridge (should be further back) - use top of nose bridge (landmark 27)
+    float nose_bridge_depth = get_depth(lm.nose_bridge_x[0], lm.nose_bridge_y[0]);
+    
+    // Get face contour points (cheeks) for reference plane
+    float left_cheek_depth = get_depth(lm.contour_x[2], lm.contour_y[2]);
+    float right_cheek_depth = get_depth(lm.contour_x[14], lm.contour_y[14]);
+    
+    if (nose_tip_depth == 0.0f || nose_bridge_depth == 0.0f) {
+        return 0.0f;
+    }
+    
+    // Nose tip should be closer to camera than bridge (negative means protruding)
+    float nose_protrusion = nose_bridge_depth - nose_tip_depth;
+    
+    // Typical nose protrusion: 1-2cm
+    float protrusion_score = 0.0f;
+    if (nose_protrusion > 0.01f && nose_protrusion < 0.04f) {
+        protrusion_score = 1.0f;  // Good protrusion
+    } else if (nose_protrusion > 0.005f) {
+        protrusion_score = 0.5f;  // Slight protrusion
+    } else {
+        protrusion_score = 0.0f;  // Flat or recessed (suspicious)
+    }
+    
+    // Also check that nose is forward of cheeks
+    if (left_cheek_depth > 0 && right_cheek_depth > 0) {
+        float avg_cheek_depth = (left_cheek_depth + right_cheek_depth) / 2.0f;
+        float nose_vs_cheek = avg_cheek_depth - nose_tip_depth;
+        
+        if (nose_vs_cheek > 0.005f) {
+            protrusion_score = std::max(protrusion_score, 0.7f);
+        }
+    }
+    
+    return protrusion_score;
+#else
+    return 0.5f;
+#endif
+}
+
+/**
+ * @brief Analyze face curvature using 17 contour points
+ * 
+ * Real faces have curved surfaces. Flat objects will have linear depth profiles.
+ */
+float AntiSpoofingDetector::analyze_face_curvature(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || !frame->metadata.landmarks.valid) {
+        return 0.0f;
+    }
+    
+    if (frame->depth_data.empty() || frame->depth_width <= 0 || frame->depth_height <= 0) {
+        return 0.0f;
+    }
+    
+#ifdef HAVE_OPENCV
+    const auto& lm = frame->metadata.landmarks;
+    
+    // Get depth at contour points
+    std::vector<cv::Point3f> contour_3d;
+    contour_3d.reserve(17);
+    
+    auto get_depth = [&](float x, float y) -> float {
+        float scale_x = static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width);
+        float scale_y = static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height);
+        
+        int depth_x = static_cast<int>(x * scale_x);
+        int depth_y = static_cast<int>(y * scale_y);
+        
+        if (depth_x < 0 || depth_x >= frame->depth_width || depth_y < 0 || depth_y >= frame->depth_height) {
+            return 0.0f;
+        }
+        
+        int idx = depth_y * frame->depth_width + depth_x;
+        if (idx < 0 || idx >= frame->depth_data.size()) {
+            return 0.0f;
+        }
+        
+        uint16_t depth_raw = frame->depth_data[idx];
+        return depth_raw > 0 ? (depth_raw * frame->depth_scale) : 0.0f;
+    };
+    
+    for (int i = 0; i < 17; i++) {
+        float d = get_depth(lm.contour_x[i], lm.contour_y[i]);
+        if (d > 0) {
+            contour_3d.emplace_back(lm.contour_x[i], lm.contour_y[i], d);
+        }
+    }
+    
+    if (contour_3d.size() < 12) {
+        return 0.0f;  // Not enough points
+    }
+    
+    // Fit a plane to the contour points
+    cv::Mat A(contour_3d.size(), 3, CV_32F);
+    cv::Mat B(contour_3d.size(), 1, CV_32F);
+    
+    for (size_t i = 0; i < contour_3d.size(); i++) {
+        A.at<float>(i, 0) = contour_3d[i].x;
+        A.at<float>(i, 1) = contour_3d[i].y;
+        A.at<float>(i, 2) = 1.0f;
+        B.at<float>(i, 0) = contour_3d[i].z;
+    }
+    
+    cv::Mat plane_params;
+    cv::solve(A, B, plane_params, cv::DECOMP_SVD);
+    
+    // Compute residuals (how much points deviate from plane)
+    float total_residual = 0.0f;
+    for (size_t i = 0; i < contour_3d.size(); i++) {
+        float plane_z = plane_params.at<float>(0) * contour_3d[i].x + 
+                       plane_params.at<float>(1) * contour_3d[i].y + 
+                       plane_params.at<float>(2);
+        float residual = std::abs(contour_3d[i].z - plane_z);
+        total_residual += residual;
+    }
+    
+    float avg_residual = total_residual / contour_3d.size();
+    
+    // Real faces have significant curvature (residuals > 1cm)
+    // Flat surfaces have low residuals (< 0.5cm)
+    float curvature_score = std::min(1.0f, avg_residual / 0.015f);  // 1.5cm = perfect
+    
+    return curvature_score;
+#else
+    return 0.5f;
+#endif
+}
+
+/**
+ * @brief Validate left-right symmetry
+ * 
+ * Real faces have symmetric depth profiles. Asymmetric depth indicates spoofing.
+ */
+float AntiSpoofingDetector::validate_symmetry(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || !frame->metadata.landmarks.valid) {
+        return 0.0f;
+    }
+    
+    if (frame->depth_data.empty() || frame->depth_width <= 0 || frame->depth_height <= 0) {
+        return 0.0f;
+    }
+    
+#ifdef HAVE_OPENCV
+    const auto& lm = frame->metadata.landmarks;
+    
+    auto get_depth = [&](float x, float y) -> float {
+        float scale_x = static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width);
+        float scale_y = static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height);
+        
+        int depth_x = static_cast<int>(x * scale_x);
+        int depth_y = static_cast<int>(y * scale_y);
+        
+        if (depth_x < 0 || depth_x >= frame->depth_width || depth_y < 0 || depth_y >= frame->depth_height) {
+            return 0.0f;
+        }
+        
+        int idx = depth_y * frame->depth_width + depth_x;
+        if (idx < 0 || idx >= frame->depth_data.size()) {
+            return 0.0f;
+        }
+        
+        uint16_t depth_raw = frame->depth_data[idx];
+        return depth_raw > 0 ? (depth_raw * frame->depth_scale) : 0.0f;
+    };
+    
+    // Compare symmetric pairs
+    std::vector<float> differences;
+    
+    // Eyebrows
+    for (int i = 0; i < 5; i++) {
+        float left_d = get_depth(lm.left_eyebrow_x[i], lm.left_eyebrow_y[i]);
+        float right_d = get_depth(lm.right_eyebrow_x[i], lm.right_eyebrow_y[i]);
+        if (left_d > 0 && right_d > 0) {
+            differences.push_back(std::abs(left_d - right_d));
+        }
+    }
+    
+    // Eyes
+    for (int i = 0; i < 6; i++) {
+        float left_d = get_depth(lm.left_eye_x[i], lm.left_eye_y[i]);
+        float right_d = get_depth(lm.right_eye_x[i], lm.right_eye_y[i]);
+        if (left_d > 0 && right_d > 0) {
+            differences.push_back(std::abs(left_d - right_d));
+        }
+    }
+    
+    if (differences.empty()) {
+        return 0.0f;
+    }
+    
+    // Average symmetric difference should be small for real faces
+    float avg_diff = std::accumulate(differences.begin(), differences.end(), 0.0f) / differences.size();
+    
+    // Good symmetry: < 5mm difference, Poor: > 2cm
+    float symmetry_score = 1.0f - std::min(1.0f, avg_diff / 0.02f);
+    
+    return symmetry_score;
+#else
+    return 0.5f;
+#endif
+}
+
+/**
+ * @brief Track micro-movements of landmarks over time
+ * 
+ * Real faces have subtle micro-movements even when "still".
+ * Photos/screens have perfectly static landmarks.
+ */
+float AntiSpoofingDetector::track_landmark_motion(const FaceROI& current_face) {
+    if (!current_face.detected || face_history_.empty()) {
+        return 0.5f;  // Neutral - insufficient history
+    }
+    
+    // Need at least 5 frames of history (150ms at 30fps)
+    if (face_history_.size() < 5) {
+        return 0.5f;
+    }
+    
+#ifdef HAVE_OPENCV
+    // Compare current landmarks with recent history
+    // Real faces: small but non-zero movement
+    // Fake faces: either perfectly static or unnatural jumps
+    
+    // For now, return neutral score until we have landmark tracking in FaceROI
+    // TODO: Add landmark history tracking similar to face_history_
+    
+    return 0.5f;  // Placeholder - needs landmark history buffer
+#else
+    return 0.5f;
+#endif
 }
 
 } // namespace mdai

@@ -65,11 +65,154 @@ struct FrameBoxMetadata {
     int face_h = 0;
     float face_detection_confidence = 0.0f;
     
+    // 68 Facial Landmarks (iBUG format)
+    struct FacialLandmarks {
+        bool valid = false;
+        
+        // Face contour (0-16): 17 points - jawline
+        float contour_x[17] = {0};
+        float contour_y[17] = {0};
+        
+        // Right eyebrow (17-21): 5 points
+        float right_eyebrow_x[5] = {0};
+        float right_eyebrow_y[5] = {0};
+        
+        // Left eyebrow (22-26): 5 points
+        float left_eyebrow_x[5] = {0};
+        float left_eyebrow_y[5] = {0};
+        
+        // Nose bridge (27-30): 4 points
+        float nose_bridge_x[4] = {0};
+        float nose_bridge_y[4] = {0};
+        
+        // Nose bottom (31-35): 5 points
+        float nose_bottom_x[5] = {0};
+        float nose_bottom_y[5] = {0};
+        
+        // Right eye (36-41): 6 points
+        float right_eye_x[6] = {0};
+        float right_eye_y[6] = {0};
+        
+        // Left eye (42-47): 6 points
+        float left_eye_x[6] = {0};
+        float left_eye_y[6] = {0};
+        
+        // Outer mouth (48-59): 12 points
+        float outer_mouth_x[12] = {0};
+        float outer_mouth_y[12] = {0};
+        
+        // Inner mouth (60-67): 8 points
+        float inner_mouth_x[8] = {0};
+        float inner_mouth_y[8] = {0};
+        
+        // Helper: Get all 68 landmarks as pairs (x, y)
+        void get_all_landmarks(float* x_coords, float* y_coords) const {
+            int idx = 0;
+            // Contour (0-16)
+            for (int i = 0; i < 17; i++, idx++) {
+                x_coords[idx] = contour_x[i];
+                y_coords[idx] = contour_y[i];
+            }
+            // Right eyebrow (17-21)
+            for (int i = 0; i < 5; i++, idx++) {
+                x_coords[idx] = right_eyebrow_x[i];
+                y_coords[idx] = right_eyebrow_y[i];
+            }
+            // Left eyebrow (22-26)
+            for (int i = 0; i < 5; i++, idx++) {
+                x_coords[idx] = left_eyebrow_x[i];
+                y_coords[idx] = left_eyebrow_y[i];
+            }
+            // Nose bridge (27-30)
+            for (int i = 0; i < 4; i++, idx++) {
+                x_coords[idx] = nose_bridge_x[i];
+                y_coords[idx] = nose_bridge_y[i];
+            }
+            // Nose bottom (31-35)
+            for (int i = 0; i < 5; i++, idx++) {
+                x_coords[idx] = nose_bottom_x[i];
+                y_coords[idx] = nose_bottom_y[i];
+            }
+            // Right eye (36-41)
+            for (int i = 0; i < 6; i++, idx++) {
+                x_coords[idx] = right_eye_x[i];
+                y_coords[idx] = right_eye_y[i];
+            }
+            // Left eye (42-47)
+            for (int i = 0; i < 6; i++, idx++) {
+                x_coords[idx] = left_eye_x[i];
+                y_coords[idx] = left_eye_y[i];
+            }
+            // Outer mouth (48-59)
+            for (int i = 0; i < 12; i++, idx++) {
+                x_coords[idx] = outer_mouth_x[i];
+                y_coords[idx] = outer_mouth_y[i];
+            }
+            // Inner mouth (60-67)
+            for (int i = 0; i < 8; i++, idx++) {
+                x_coords[idx] = inner_mouth_x[i];
+                y_coords[idx] = inner_mouth_y[i];
+            }
+        }
+        
+        // Helper: Set all 68 landmarks from arrays
+        void set_all_landmarks(const float* x_coords, const float* y_coords) {
+            int idx = 0;
+            // Contour (0-16)
+            for (int i = 0; i < 17; i++, idx++) {
+                contour_x[i] = x_coords[idx];
+                contour_y[i] = y_coords[idx];
+            }
+            // Right eyebrow (17-21)
+            for (int i = 0; i < 5; i++, idx++) {
+                right_eyebrow_x[i] = x_coords[idx];
+                right_eyebrow_y[i] = y_coords[idx];
+            }
+            // Left eyebrow (22-26)
+            for (int i = 0; i < 5; i++, idx++) {
+                left_eyebrow_x[i] = x_coords[idx];
+                left_eyebrow_y[i] = y_coords[idx];
+            }
+            // Nose bridge (27-30)
+            for (int i = 0; i < 4; i++, idx++) {
+                nose_bridge_x[i] = x_coords[idx];
+                nose_bridge_y[i] = y_coords[idx];
+            }
+            // Nose bottom (31-35)
+            for (int i = 0; i < 5; i++, idx++) {
+                nose_bottom_x[i] = x_coords[idx];
+                nose_bottom_y[i] = y_coords[idx];
+            }
+            // Right eye (36-41)
+            for (int i = 0; i < 6; i++, idx++) {
+                right_eye_x[i] = x_coords[idx];
+                right_eye_y[i] = y_coords[idx];
+            }
+            // Left eye (42-47)
+            for (int i = 0; i < 6; i++, idx++) {
+                left_eye_x[i] = x_coords[idx];
+                left_eye_y[i] = y_coords[idx];
+            }
+            // Outer mouth (48-59)
+            for (int i = 0; i < 12; i++, idx++) {
+                outer_mouth_x[i] = x_coords[idx];
+                outer_mouth_y[i] = y_coords[idx];
+            }
+            // Inner mouth (60-67)
+            for (int i = 0; i < 8; i++, idx++) {
+                inner_mouth_x[i] = x_coords[idx];
+                inner_mouth_y[i] = y_coords[idx];
+            }
+            valid = true;
+        }
+    } landmarks;
+    
     // Anti-Spoofing Results
     struct AntiSpoofingResults {
         // Component scores (0.0 to 1.0)
         float depth_analysis_score = 0.0f;
         float ir_texture_score = 0.0f;
+        float skin_texture_score = 0.0f;         // NEW: Color texture analysis
         float temporal_consistency_score = 0.0f;
         float cross_modal_score = 0.0f;
         
