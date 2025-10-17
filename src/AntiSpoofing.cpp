@@ -1087,31 +1087,40 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
         return 0.5f;  // Not enough data yet
     }
     
-    // TEMPORARY: Use simple green channel instead of CHROM for debugging
-    std::vector<float> green_signal;
-    green_signal.reserve(rppg_samples_.size());
-    for (const auto& sample : rppg_samples_) {
-        green_signal.push_back(sample.green);
-    }
-    
+    // Extract CHROM signal with improved detrending
+    std::vector<float> chrom_signal;
     float estimated_fps = 30.0f;
-    if (rppg_samples_.size() >= 2) {
-        double time_span = rppg_samples_.back().timestamp - rppg_samples_.front().timestamp;
-        estimated_fps = (rppg_samples_.size() - 1) / time_span;
-        if (estimated_fps < 15.0f || estimated_fps > 60.0f) {
-            estimated_fps = 30.0f;
-        }
-    }
+    bool signal_ok = extract_rppg_signal_chrom(chrom_signal, estimated_fps);
     
-    if (green_signal.empty()) {
+    if (!signal_ok || chrom_signal.empty()) {
         return 0.3f;  // Signal extraction failed
     }
     
-    // Apply bandpass filter (0.7-2.5 Hz for heart rate 42-150 BPM)
-    apply_bandpass_filter(green_signal, estimated_fps, 0.7f, 2.5f);
+    // Apply detrending BEFORE bandpass filter to remove DC drift
+    // Use moving average detrending (removes slow trends)
+    if (chrom_signal.size() > 30) {
+        std::vector<float> detrended(chrom_signal.size());
+        int window_size = static_cast<int>(estimated_fps * 2.0f);  // 2-second window
+        window_size = std::min(window_size, static_cast<int>(chrom_signal.size()) / 3);
+        
+        for (size_t i = 0; i < chrom_signal.size(); i++) {
+            int start = std::max(0, static_cast<int>(i) - window_size / 2);
+            int end = std::min(static_cast<int>(chrom_signal.size()), static_cast<int>(i) + window_size / 2);
+            
+            float sum = 0.0f;
+            int count = 0;
+            for (int j = start; j < end; j++) {
+                sum += chrom_signal[j];
+                count++;
+            }
+            float local_mean = (count > 0) ? sum / count : 0.0f;
+            detrended[i] = chrom_signal[i] - local_mean;
+        }
+        chrom_signal = detrended;
+    }
     
-    // Use green_signal instead of chrom_signal
-    std::vector<float>& chrom_signal = green_signal;
+    // Apply bandpass filter (0.7-2.5 Hz for heart rate 42-150 BPM)
+    apply_bandpass_filter(chrom_signal, estimated_fps, 0.7f, 2.5f);
     
     // Detect pulse using improved autocorrelation
     float detected_bpm = 0.0f;
@@ -1183,39 +1192,18 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
 }
 
 float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
-    // FIXED: No benefit of doubt - require sufficient data (Fix #4)
+    // Enhanced temporal analysis with micro-motion and breathing
     if (!face.detected || face_history_.size() < 3) {
-        return 0.0f;  // Insufficient data = fail, no benefit of doubt
+        return 0.0f;  // Insufficient data
     }
     
     float temporal_score = 0.0f;
+    int components = 0;
     
-    // 1. Micro-motion detection - FIXED: Be more lenient with steady subjects
-    float total_motion = 0.0f;
-    int motion_samples = 0;
-    for (size_t i = 1; i < face_history_.size(); i++) {
-        const FaceROI& prev = face_history_[i-1];
-        const FaceROI& curr = face_history_[i];
-        
-        if (prev.detected && curr.detected) {
-            float dx = curr.bbox.x - prev.bbox.x;
-            float dy = curr.bbox.y - prev.bbox.y;
-            float motion = std::sqrt(dx*dx + dy*dy);
-            total_motion += motion;
-            motion_samples++;
-        }
-    }
-    
-    float avg_motion = (motion_samples > 0) ? total_motion / motion_samples : 0.0f;
-    
-    // FIXED: No benefit of doubt for stillness - mark as suspicious (Fix #4)
-    if (avg_motion < 0.02f) {
-        temporal_score += 0.3f;  // Very steady - suspicious, possible photo attack
-    } else if (avg_motion > 20.0f) {
-        temporal_score += 0.5f;  // Too much motion - unstable or evasion
-    } else {
-        temporal_score += 1.0f;  // Natural micro-motion range
-    }
+    // 1. Enhanced micro-motion detection (uses new calculate_micro_motion)
+    float micro_motion_score = calculate_micro_motion();
+    temporal_score += micro_motion_score;
+    components++;
     
     // 2. Face size variance (breathing/natural head movement)
     if (face_history_.size() >= 10) {
@@ -1249,16 +1237,21 @@ float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
             if (normalized_variance > 0.0001f) {
                 temporal_score += 1.0f;  // Natural variance detected
             } else {
-                temporal_score += 0.3f;  // FIXED: Very stable = suspicious (Fix #4)
+                temporal_score += 0.3f;  // Very stable = suspicious
             }
-        } else {
-            temporal_score += 0.3f;  // FIXED: No data = suspicious (Fix #4)
+            components++;
         }
-    } else {
-        temporal_score += 0.8f;  // Not enough history yet
     }
     
-    return temporal_score / 2.0f;
+    // 3. Depth-based breathing analysis (if we have recent frame)
+    if (frame_history_.size() > 0) {
+        FrameBox* recent_frame = frame_history_.back();
+        float breathing_score = analyze_depth_breathing(recent_frame, face);
+        temporal_score += breathing_score;
+        components++;
+    }
+    
+    return (components > 0) ? (temporal_score / components) : 0.5f;
 }
 
 float AntiSpoofingDetector::analyze_cross_modal_consistency(const FrameBox* frame, const FaceROI& face) {
@@ -1347,18 +1340,140 @@ float AntiSpoofingDetector::analyze_cross_modal_consistency(const FrameBox* fram
 }
 
 bool AntiSpoofingDetector::detect_blink(const std::vector<cv::Point2f>& landmarks) {
-    // Placeholder for blink detection
-    return false;
+    // EAR (Eye Aspect Ratio) based blink detection for 468-point face mesh
+    // MediaPipe eye landmarks:
+    // Left eye: 362(outer), 385(top), 387(bottom), 263(inner), 373(top), 380(bottom)
+    // Right eye: 33(inner), 160(top), 158(bottom), 133(outer), 153(top), 144(bottom)
+    
+    if (landmarks.size() < 468) {
+        return false;  // Not enough landmarks
+    }
+    
+    // Calculate EAR for left eye
+    float left_vertical_1 = cv::norm(landmarks[385] - landmarks[380]);
+    float left_vertical_2 = cv::norm(landmarks[387] - landmarks[373]);
+    float left_horizontal = cv::norm(landmarks[362] - landmarks[263]);
+    float ear_left = (left_vertical_1 + left_vertical_2) / (2.0f * left_horizontal + 1e-6f);
+    
+    // Calculate EAR for right eye
+    float right_vertical_1 = cv::norm(landmarks[160] - landmarks[144]);
+    float right_vertical_2 = cv::norm(landmarks[158] - landmarks[153]);
+    float right_horizontal = cv::norm(landmarks[33] - landmarks[133]);
+    float ear_right = (right_vertical_1 + right_vertical_2) / (2.0f * right_horizontal + 1e-6f);
+    
+    // Average EAR
+    float avg_ear = (ear_left + ear_right) / 2.0f;
+    
+    // EAR threshold for blink: typically < 0.2 indicates closed eyes
+    // For liveness: We want to see variation in EAR over time (blinking)
+    // This is a simplified check - full implementation needs temporal tracking
+    return (avg_ear < 0.25f);  // Eyes are closed or partially closed
 }
 
 float AntiSpoofingDetector::calculate_micro_motion() {
-    // Placeholder for micro-motion calculation
-    return 0.5f;
+    // Calculate micro-motion from recent face history
+    // Real faces have subtle natural movements, masks/photos are rigid
+    
+    if (face_history_.size() < 10) {
+        return 0.5f;  // Not enough history
+    }
+    
+    float total_motion = 0.0f;
+    int valid_samples = 0;
+    
+    // Calculate landmark displacement over recent frames
+    for (size_t i = face_history_.size() - 10; i < face_history_.size() - 1; i++) {
+        const FaceROI& current = face_history_[i];
+        const FaceROI& next = face_history_[i + 1];
+        
+        if (current.detected && next.detected) {
+            // Center point motion
+            float dx = (current.bbox.x + current.bbox.width / 2.0f) - 
+                       (next.bbox.x + next.bbox.width / 2.0f);
+            float dy = (current.bbox.y + current.bbox.height / 2.0f) - 
+                       (next.bbox.y + next.bbox.height / 2.0f);
+            
+            float motion = std::sqrt(dx * dx + dy * dy);
+            total_motion += motion;
+            valid_samples++;
+        }
+    }
+    
+    if (valid_samples == 0) {
+        return 0.5f;
+    }
+    
+    float avg_motion = total_motion / valid_samples;
+    
+    // Score based on natural motion range
+    // Real faces: 0.5-5 pixels/frame of micro-motion
+    // Masks/photos: < 0.5 (too rigid) or > 5 (held by shaky hand)
+    if (avg_motion < 0.3f) {
+        return 0.3f;  // Too rigid - suspicious
+    } else if (avg_motion > 8.0f) {
+        return 0.4f;  // Too much motion - suspicious
+    } else {
+        return 1.0f;  // Natural micro-motion
+    }
 }
 
 float AntiSpoofingDetector::analyze_depth_breathing(const FrameBox* frame, const FaceROI& face) {
-    // Placeholder for breathing analysis
-    return 0.5f;
+    // Analyze subtle depth changes from breathing
+    // Real faces show periodic depth variation (chest/torso breathing)
+    // Masks held in hand won't show this pattern
+    
+    if (!frame || !face.detected || frame->depth_data.empty()) {
+        return 0.5f;
+    }
+    
+    if (face_history_.size() < 30) {
+        return 0.5f;  // Need ~1 second of data
+    }
+    
+    // Calculate average depth over recent frames
+    std::vector<float> depth_sequence;
+    depth_sequence.reserve(face_history_.size());
+    
+    for (const auto& hist_face : face_history_) {
+        if (hist_face.detected) {
+            // Use center of face bbox as reference point
+            int center_x = hist_face.bbox.x + hist_face.bbox.width / 2;
+            int center_y = hist_face.bbox.y + hist_face.bbox.height / 2;
+            
+            // Scale to depth frame coordinates (simplified)
+            int depth_x = center_x * frame->depth_width / frame->color_width;
+            int depth_y = center_y * frame->depth_height / frame->color_height;
+            
+            int idx = depth_y * frame->depth_width + depth_x;
+            if (idx >= 0 && idx < (int)frame->depth_data.size() && frame->depth_data[idx] > 0) {
+                depth_sequence.push_back(frame->depth_data[idx] * frame->depth_scale);
+            }
+        }
+    }
+    
+    if (depth_sequence.size() < 20) {
+        return 0.5f;
+    }
+    
+    // Calculate depth variance (breathing causes ~1-5mm variation)
+    float mean_depth = std::accumulate(depth_sequence.begin(), depth_sequence.end(), 0.0f) / depth_sequence.size();
+    float variance = 0.0f;
+    for (float d : depth_sequence) {
+        float diff = d - mean_depth;
+        variance += diff * diff;
+    }
+    variance /= depth_sequence.size();
+    float stddev = std::sqrt(variance);
+    
+    // Real breathing: 1-10mm stddev
+    // Rigid mask: < 0.5mm stddev
+    if (stddev < 0.0005f) {  // < 0.5mm
+        return 0.2f;  // Too rigid - suspicious
+    } else if (stddev > 0.02f) {  // > 20mm
+        return 0.4f;  // Too much variation - unstable
+    } else {
+        return 1.0f;  // Natural breathing motion
+    }
 }
 
 std::string AntiSpoofingDetector::detect_attack_type(const FrameBox* frame, const FaceROI& face) {
