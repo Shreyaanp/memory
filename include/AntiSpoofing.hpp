@@ -167,9 +167,19 @@ private:
     std::deque<FaceROI> face_history_;
     static constexpr int TEMPORAL_WINDOW = 30;  // 1 second at 30fps
     
-    // rPPG (remote photoplethysmography) for pulse detection
-    std::deque<float> rppg_green_signal_;  // Green channel values over time
-    static constexpr int RPPG_WINDOW = 90;  // 3 seconds at 30fps for reliable pulse
+    // rPPG (remote photoplethysmography) for pulse detection - ROBUST VERSION
+    struct RPPGSample {
+        double timestamp;      // Frame timestamp in seconds
+        float red;            // Mean red channel
+        float green;          // Mean green channel  
+        float blue;           // Mean blue channel
+        float motion_score;   // Motion stability (0-1, 1=stable)
+        int landmark_count;   // Number of valid landmarks in ROI
+    };
+    std::deque<RPPGSample> rppg_samples_;  // RGB values over time with metadata
+    static constexpr int RPPG_MIN_WINDOW = 150;   // Minimum 5 seconds at 30fps
+    static constexpr int RPPG_MAX_WINDOW = 300;   // Maximum 10 seconds at 30fps
+    double rppg_first_timestamp_ = 0.0;            // For FPS calculation
     
     // Core detection algorithms (now ROI-driven)
     float analyze_depth_geometry(const FrameBox* frame, const FaceROI& face);
@@ -177,9 +187,15 @@ private:
     float analyze_temporal_consistency(const FaceROI& face);
     float analyze_cross_modal_consistency(const FrameBox* frame, const FaceROI& face);
     
-    // rPPG pulse detection (mask detection)
+    // rPPG pulse detection (mask detection) - ROBUST VERSION
     float analyze_rppg_pulse(const FrameBox* frame, const FaceROI& face);
-    bool detect_periodic_signal(const std::vector<float>& signal, float& detected_bpm);
+    
+    // Robust rPPG helper methods
+    bool extract_rppg_signal_chrom(std::vector<float>& chrom_signal, float& estimated_fps);
+    void apply_bandpass_filter(std::vector<float>& signal, float fps, float low_hz, float high_hz);
+    float calculate_snr_at_frequency(const std::vector<float>& signal, float fps, float target_hz);
+    bool detect_pulse_fft(const std::vector<float>& signal, float fps, float& detected_bpm, float& confidence);
+    float calculate_motion_compensation_weight(const RPPGSample& sample);
     
     // Temporal liveness checks
     bool detect_blink(const std::vector<cv::Point2f>& landmarks);

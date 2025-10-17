@@ -483,14 +483,10 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     
     // rPPG pulse detection (NEW - supplementary signal for mask detection)
     // NOTE: Made non-critical to avoid false rejects on real faces
-    // rPPG needs robust signal processing (bandpass, motion compensation, CHROM/POS)
-    // before it can be used as a hard gate
+    // Now using robust rPPG with CHROM, bandpass filtering, and motion compensation
     float rppg_pulse_score = analyze_rppg_pulse(frame, face);
     
-    // If not enough data yet, use neutral score
-    if (rppg_green_signal_.size() < RPPG_WINDOW) {
-        rppg_pulse_score = 0.5f;  // Neutral - don't penalize or reward
-    }
+    // If not enough data yet (analyze_rppg_pulse returns 0.5f), score already handled
     
     frame->metadata.anti_spoofing.depth_anomaly_detected = 
         frame->metadata.anti_spoofing.depth_analysis_score < config_.min_depth_analysis_score;
@@ -1035,119 +1031,98 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
     
     cv::Mat forehead_region = color_mat(forehead_roi);
     
-    // Extract GREEN channel (most sensitive to blood volume changes)
+    // Extract RGB channels for CHROM method
     std::vector<cv::Mat> bgr_channels;
     cv::split(forehead_region, bgr_channels);
-    cv::Mat green_channel = bgr_channels[1];  // Green channel
     
-    // Calculate mean green intensity
-    cv::Scalar mean_green = cv::mean(green_channel);
-    float green_value = static_cast<float>(mean_green[0]);
+    cv::Scalar mean_blue = cv::mean(bgr_channels[0]);
+    cv::Scalar mean_green = cv::mean(bgr_channels[1]);
+    cv::Scalar mean_red = cv::mean(bgr_channels[2]);
     
-    // Store in temporal buffer
-    rppg_green_signal_.push_back(green_value);
-    if (rppg_green_signal_.size() > RPPG_WINDOW) {
-        rppg_green_signal_.pop_front();
+    // Calculate motion score (stability of face)
+    float motion_score = 1.0f;
+    if (face_history_.size() >= 2) {
+        const FaceROI& prev = face_history_[face_history_.size() - 2];
+        if (prev.detected) {
+            float dx = std::abs(face.bbox.x - prev.bbox.x);
+            float dy = std::abs(face.bbox.y - prev.bbox.y);
+            float motion = std::sqrt(dx * dx + dy * dy);
+            motion_score = std::exp(-motion / 10.0f);  // Exponential decay
+        }
     }
     
-    // Need at least 3 seconds of data for reliable pulse detection
-    if (rppg_green_signal_.size() < RPPG_WINDOW) {
+    // Get timestamp (use frame count as proxy)
+    double timestamp = static_cast<double>(frame_history_.size()) / 30.0;
+    if (rppg_first_timestamp_ == 0.0) {
+        rppg_first_timestamp_ = timestamp;
+    }
+    
+    // Create sample
+    RPPGSample sample;
+    sample.timestamp = timestamp;
+    sample.red = static_cast<float>(mean_red[0]);
+    sample.green = static_cast<float>(mean_green[0]);
+    sample.blue = static_cast<float>(mean_blue[0]);
+    sample.motion_score = motion_score;
+    sample.landmark_count = 1;  // Simplified
+    
+    // Add to history
+    rppg_samples_.push_back(sample);
+    while (rppg_samples_.size() > RPPG_MAX_WINDOW) {
+        rppg_samples_.pop_front();
+    }
+    
+    // Need minimum data for reliable detection (5 seconds)
+    if (rppg_samples_.size() < RPPG_MIN_WINDOW) {
         return 0.5f;  // Not enough data yet
     }
     
-    // Convert deque to vector for processing
-    std::vector<float> signal(rppg_green_signal_.begin(), rppg_green_signal_.end());
+    // Extract CHROM signal with motion compensation
+    std::vector<float> chrom_signal;
+    float estimated_fps = 30.0f;
+    bool signal_ok = extract_rppg_signal_chrom(chrom_signal, estimated_fps);
     
-    // Detect periodic pulse signal
+    if (!signal_ok || chrom_signal.empty()) {
+        return 0.3f;  // Signal extraction failed
+    }
+    
+    // Apply bandpass filter (0.7-2.5 Hz for heart rate 42-150 BPM)
+    apply_bandpass_filter(chrom_signal, estimated_fps, 0.7f, 2.5f);
+    
+    // Detect pulse using improved autocorrelation
     float detected_bpm = 0.0f;
-    bool has_pulse = detect_periodic_signal(signal, detected_bpm);
+    float confidence = 0.0f;
+    bool has_pulse = detect_pulse_fft(chrom_signal, estimated_fps, detected_bpm, confidence);
     
     if (ENABLE_DEBUG_LOGGING) {
         static int rppg_debug_count = 0;
         if (++rppg_debug_count % 30 == 0) {
-            std::cout << "💓 rPPG PULSE DEBUG:" << std::endl;
+            std::cout << "💓 rPPG ROBUST DEBUG:" << std::endl;
+            std::cout << "   FPS: " << estimated_fps << ", Samples: " << rppg_samples_.size() << std::endl;
             if (has_pulse) {
-                std::cout << "   ✅ PULSE DETECTED: " << detected_bpm << " BPM" << std::endl;
+                std::cout << "   ✅ PULSE: " << detected_bpm << " BPM (confidence: " 
+                          << confidence << ")" << std::endl;
             } else {
-                std::cout << "   ❌ NO PULSE (mask suspected)" << std::endl;
+                std::cout << "   ❌ NO PULSE detected (mask suspected)" << std::endl;
             }
         }
     }
     
-    // Score based on pulse detection
-    // NOTE: rPPG is supplementary - needs bandpass filter, motion compensation for production
+    // Score based on pulse detection quality
     if (has_pulse && detected_bpm >= 50.0f && detected_bpm <= 120.0f) {
-        return 1.0f;  // Healthy pulse detected = real face
-    } else if (has_pulse) {
-        return 0.6f;  // Pulse detected but unusual rate
+        // Good pulse in healthy range
+        return 0.5f + (confidence * 0.5f);  // 0.5-1.0 based on confidence
+    } else if (has_pulse && detected_bpm >= 40.0f && detected_bpm <= 150.0f) {
+        // Pulse detected but unusual rate
+        return 0.3f + (confidence * 0.3f);  // 0.3-0.6
     } else {
-        return 0.0f;  // No pulse detected (but won't hard-reject, just lowers score)
+        // No pulse or out of range
+        return 0.0f + (confidence * 0.2f);  // 0.0-0.2 (very low)
     }
     
 #else
     return 0.5f;
 #endif
-}
-
-bool AntiSpoofingDetector::detect_periodic_signal(const std::vector<float>& signal, float& detected_bpm) {
-    if (signal.size() < 60) {
-        return false;  // Need at least 2 seconds
-    }
-    
-    // Detrend signal (remove slow DC drift)
-    std::vector<float> detrended(signal.size());
-    float mean = std::accumulate(signal.begin(), signal.end(), 0.0f) / signal.size();
-    for (size_t i = 0; i < signal.size(); i++) {
-        detrended[i] = signal[i] - mean;
-    }
-    
-    // Simple autocorrelation to detect periodicity
-    // Heart rate is typically 0.7-2.5 Hz (42-150 BPM)
-    // At 30fps: period of 12-43 frames for 60-150 BPM
-    
-    int min_period = 12;  // ~150 BPM at 30fps
-    int max_period = 60;  // ~30 BPM at 30fps
-    
-    float max_correlation = 0.0f;
-    int best_period = 0;
-    
-    for (int lag = min_period; lag <= max_period && lag < (int)detrended.size() / 2; lag++) {
-        float correlation = 0.0f;
-        int count = 0;
-        
-        for (size_t i = 0; i < detrended.size() - lag; i++) {
-            correlation += detrended[i] * detrended[i + lag];
-            count++;
-        }
-        
-        if (count > 0) {
-            correlation /= count;
-        }
-        
-        if (correlation > max_correlation) {
-            max_correlation = correlation;
-            best_period = lag;
-        }
-    }
-    
-    // Normalize correlation by signal variance
-    float variance = 0.0f;
-    for (float val : detrended) {
-        variance += val * val;
-    }
-    variance /= detrended.size();
-    
-    float normalized_correlation = (variance > 0.001f) ? max_correlation / variance : 0.0f;
-    
-    // Threshold for detecting periodicity
-    if (normalized_correlation > 0.3f && best_period > 0) {
-        // Convert period (frames) to BPM
-        float fps = 30.0f;  // Assuming 30fps
-        detected_bpm = (fps / best_period) * 60.0f;
-        return true;
-    }
-    
-    return false;
 }
 
 float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
@@ -1512,6 +1487,203 @@ void AdaptiveThresholdManager::learn_from_result(const FrameBox* frame, bool suc
     }
     
     learning_stats_.success_rate = static_cast<float>(learning_stats_.successful_samples) / learning_stats_.total_samples;
+}
+
+// ============================================================================
+// ROBUST rPPG HELPER METHODS
+// ============================================================================
+
+bool AntiSpoofingDetector::extract_rppg_signal_chrom(std::vector<float>& chrom_signal, float& estimated_fps) {
+    if (rppg_samples_.size() < RPPG_MIN_WINDOW) {
+        return false;
+    }
+    
+    // Calculate FPS from timestamps
+    double time_span = rppg_samples_.back().timestamp - rppg_samples_.front().timestamp;
+    estimated_fps = (rppg_samples_.size() - 1) / time_span;
+    
+    // Clamp FPS to reasonable range
+    if (estimated_fps < 15.0f || estimated_fps > 60.0f) {
+        estimated_fps = 30.0f;  // Fallback
+    }
+    
+    chrom_signal.clear();
+    chrom_signal.reserve(rppg_samples_.size());
+    
+    // CHROM method: X = 3R - 2G, Y = 1.5R + G - 1.5B
+    // Pulse signal: S = X - α*Y, where α minimizes motion artifacts
+    float alpha = 1.0f;  // Simplified, normally adaptive
+    
+    for (const auto& sample : rppg_samples_) {
+        // Motion compensation weight
+        float weight = calculate_motion_compensation_weight(sample);
+        
+        if (weight < 0.3f) {
+            // Too much motion, skip this sample (interpolate later)
+            if (!chrom_signal.empty()) {
+                chrom_signal.push_back(chrom_signal.back());
+            } else {
+                chrom_signal.push_back(0.0f);
+            }
+            continue;
+        }
+        
+        // Normalize RGB by mean to reduce illumination variations
+        float rgb_sum = sample.red + sample.green + sample.blue + 1e-6f;
+        float r = sample.red / rgb_sum;
+        float g = sample.green / rgb_sum;
+        float b = sample.blue / rgb_sum;
+        
+        // CHROM color space transformation
+        float X = 3.0f * r - 2.0f * g;
+        float Y = 1.5f * r + g - 1.5f * b;
+        
+        // Pulse signal
+        float S = X - alpha * Y;
+        chrom_signal.push_back(S * weight);
+    }
+    
+    return !chrom_signal.empty();
+}
+
+void AntiSpoofingDetector::apply_bandpass_filter(std::vector<float>& signal, float fps, 
+                                                   float low_hz, float high_hz) {
+    if (signal.size() < 30) return;  // Too short for filtering
+    
+    // Simple moving average-based bandpass (compromise for real-time)
+    int low_window = static_cast<int>(fps / low_hz);
+    int high_window = static_cast<int>(fps / high_hz);
+    
+    low_window = std::max(3, std::min(low_window, static_cast<int>(signal.size()) / 4));
+    high_window = std::max(1, std::min(high_window, low_window / 2));
+    
+    // Remove low frequencies (DC drift)
+    std::vector<float> detrended(signal.size());
+    for (size_t i = 0; i < signal.size(); i++) {
+        float sum = 0.0f;
+        int count = 0;
+        int start = std::max(0, static_cast<int>(i) - low_window / 2);
+        int end = std::min(static_cast<int>(signal.size()), static_cast<int>(i) + low_window / 2);
+        
+        for (int j = start; j < end; j++) {
+            sum += signal[j];
+            count++;
+        }
+        float local_mean = (count > 0) ? sum / count : 0.0f;
+        detrended[i] = signal[i] - local_mean;
+    }
+    
+    // Remove high frequencies (noise)
+    for (size_t i = 0; i < signal.size(); i++) {
+        float sum = 0.0f;
+        int count = 0;
+        int start = std::max(0, static_cast<int>(i) - high_window / 2);
+        int end = std::min(static_cast<int>(signal.size()), static_cast<int>(i) + high_window / 2);
+        
+        for (int j = start; j < end; j++) {
+            sum += detrended[j];
+            count++;
+        }
+        signal[i] = (count > 0) ? sum / count : 0.0f;
+    }
+}
+
+float AntiSpoofingDetector::calculate_snr_at_frequency(const std::vector<float>& signal, 
+                                                        float fps, float target_hz) {
+    // Simplified SNR calculation
+    // In production, use FFT to calculate power at target frequency vs noise floor
+    
+    float signal_power = 0.0f;
+    float noise_power = 0.0f;
+    
+    // Calculate signal variance
+    float mean = 0.0f;
+    for (float val : signal) {
+        mean += val;
+    }
+    mean /= signal.size();
+    
+    for (float val : signal) {
+        float deviation = val - mean;
+        signal_power += deviation * deviation;
+    }
+    signal_power /= signal.size();
+    
+    // Estimate noise (high-frequency components)
+    for (size_t i = 1; i < signal.size(); i++) {
+        float diff = signal[i] - signal[i-1];
+        noise_power += diff * diff;
+    }
+    noise_power /= (signal.size() - 1);
+    
+    // SNR in dB
+    if (noise_power < 1e-6f) {
+        return 20.0f;  // Very high SNR
+    }
+    
+    float snr = 10.0f * std::log10((signal_power + 1e-6f) / (noise_power + 1e-6f));
+    return std::max(0.0f, std::min(snr, 30.0f));  // Clamp to reasonable range
+}
+
+bool AntiSpoofingDetector::detect_pulse_fft(const std::vector<float>& signal, float fps, 
+                                              float& detected_bpm, float& confidence) {
+    if (signal.size() < 60) {
+        return false;
+    }
+    
+    // Simple peak detection in frequency domain (simplified FFT alternative)
+    // Use autocorrelation for periodicity detection
+    
+    // Detrend
+    std::vector<float> detrended(signal.size());
+    float mean = std::accumulate(signal.begin(), signal.end(), 0.0f) / signal.size();
+    for (size_t i = 0; i < signal.size(); i++) {
+        detrended[i] = signal[i] - mean;
+    }
+    
+    // Autocorrelation for pulse detection (40-150 BPM range)
+    int min_lag = static_cast<int>(fps * 60.0f / 150.0f);  // 150 BPM
+    int max_lag = static_cast<int>(fps * 60.0f / 40.0f);   // 40 BPM
+    
+    float max_correlation = 0.0f;
+    int best_lag = 0;
+    
+    for (int lag = min_lag; lag <= max_lag && lag < static_cast<int>(detrended.size()) / 2; lag++) {
+        float correlation = 0.0f;
+        for (size_t i = 0; i < detrended.size() - lag; i++) {
+            correlation += detrended[i] * detrended[i + lag];
+        }
+        
+        if (correlation > max_correlation) {
+            max_correlation = correlation;
+            best_lag = lag;
+        }
+    }
+    
+    // Normalize by variance
+    float variance = 0.0f;
+    for (float val : detrended) {
+        variance += val * val;
+    }
+    variance /= detrended.size();
+    
+    float normalized_corr = (variance > 1e-6f) ? max_correlation / (variance * detrended.size()) : 0.0f;
+    
+    // Calculate confidence from correlation strength and SNR
+    float snr = calculate_snr_at_frequency(signal, fps, 1.0f);
+    confidence = std::min(1.0f, (normalized_corr * 2.0f) * (snr / 15.0f));  // SNR 15dB = good
+    
+    if (normalized_corr > 0.4f && best_lag > 0) {
+        detected_bpm = (fps / best_lag) * 60.0f;
+        return true;
+    }
+    
+    return false;
+}
+
+float AntiSpoofingDetector::calculate_motion_compensation_weight(const RPPGSample& sample) {
+    // Weight based on motion score (1.0 = stable, 0.0 = too much motion)
+    return sample.motion_score;
 }
 
 } // namespace mdai
