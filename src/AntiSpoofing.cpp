@@ -636,6 +636,16 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
     
     cv::Rect depth_roi(min_x, min_y, max_x - min_x, max_y - min_y);
     
+    // Debug: Show projection results
+    static int proj_debug = 0;
+    if (++proj_debug % 30 == 0) {
+        std::cout << "🔍 ROI Projection Debug:" << std::endl;
+        std::cout << "   Color ROI: " << face.bbox << std::endl;
+        std::cout << "   Center depth: " << median_depth_for_roi << "m" << std::endl;
+        std::cout << "   Depth corners: TL=" << depth_corners[0] << ", BR=" << depth_corners[3] << std::endl;
+        std::cout << "   Depth ROI: " << depth_roi << std::endl;
+    }
+    
     // Bounds check
     depth_roi.x = std::max(0, std::min(depth_roi.x, frame->depth_width - 1));
     depth_roi.y = std::max(0, std::min(depth_roi.y, frame->depth_height - 1));
@@ -643,6 +653,7 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
     depth_roi.height = std::min(depth_roi.height, frame->depth_height - depth_roi.y);
     
     if (depth_roi.width <= 0 || depth_roi.height <= 0) {
+        std::cout << "⚠️  Invalid depth ROI after bounds check: " << depth_roi << std::endl;
         return 0.0f;
     }
     
@@ -662,6 +673,10 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
     float coverage = static_cast<float>(valid_pixels) / static_cast<float>(total_pixels);
     if (coverage < 0.7f) {
         // Insufficient depth coverage - likely flat object or occlusion
+        static int cov_fail = 0;
+        if (++cov_fail % 30 == 0) {
+            std::cout << "⚠️  Depth coverage too low: " << coverage << " (need 0.7)" << std::endl;
+        }
         return 0.0f;
     }
     
@@ -732,8 +747,17 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
             total_error += std::abs(face_points[i].z - predicted_z);
         }
         float avg_plane_error = total_error / face_points.size();
+        float avg_plane_error_mm = avg_plane_error * 1000.0f;
         
-        if (avg_plane_error < 0.008f) {
+        // Debug plane error
+        static int plane_debug = 0;
+        if (++plane_debug % 30 == 0) {
+            std::cout << "📐 Plane fitting: error=" << avg_plane_error_mm << "mm" << std::endl;
+        }
+        
+        // RELAXED: Was 8mm, now 5mm for hard reject (extremely flat like screen)
+        if (avg_plane_error < 0.005f) {
+            std::cout << "⚠️  HARD REJECT: Plane error " << avg_plane_error_mm << "mm < 5mm (flat surface)" << std::endl;
             return 0.0f;
         } else if (avg_plane_error < 0.015f) {
             geometry_score += 0.3f;
