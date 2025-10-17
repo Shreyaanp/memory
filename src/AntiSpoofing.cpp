@@ -486,6 +486,12 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     // Now using robust rPPG with CHROM, bandpass filtering, and motion compensation
     float rppg_pulse_score = analyze_rppg_pulse(frame, face);
     
+    // DEBUG: Print rPPG score
+    static int rppg_frame_count = 0;
+    if (++rppg_frame_count % 30 == 0) {
+        std::cout << "🩺 rPPG score: " << rppg_pulse_score << ", samples: " << rppg_samples_.size() << std::endl;
+    }
+    
     // If not enough data yet (analyze_rppg_pulse returns 0.5f), score already handled
     
     frame->metadata.anti_spoofing.depth_anomaly_detected = 
@@ -497,12 +503,13 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     
     // Integrate rPPG pulse score (reduced to 15% since it's not yet robust)
     // Prioritize depth (best for 2D attacks) and IR texture
+    // Reweighted: rPPG now 25% (working mask detection), temporal 15% (breathing/motion)
     frame->metadata.anti_spoofing.overall_liveness_score = 
-        (frame->metadata.anti_spoofing.depth_analysis_score * 0.35f +
-         frame->metadata.anti_spoofing.ir_texture_score * 0.30f +
-         rppg_pulse_score * 0.15f +
-         frame->metadata.anti_spoofing.temporal_consistency_score * 0.10f +
-         frame->metadata.anti_spoofing.cross_modal_score * 0.10f);
+        (frame->metadata.anti_spoofing.depth_analysis_score * 0.30f +
+         frame->metadata.anti_spoofing.ir_texture_score * 0.25f +
+         rppg_pulse_score * 0.25f +  // INCREASED: rPPG now detects no-pulse
+         frame->metadata.anti_spoofing.temporal_consistency_score * 0.15f +  // INCREASED: breathing/motion
+         frame->metadata.anti_spoofing.cross_modal_score * 0.05f);
     
     frame->metadata.anti_spoofing.detected_attack_type = detect_attack_type(frame, face);
     
@@ -1007,7 +1014,12 @@ float AntiSpoofingDetector::analyze_ir_texture(const FrameBox* frame, const Face
 }
 
 float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const FaceROI& face) {
+    std::cout << "🔬 analyze_rppg_pulse called, samples: " << rppg_samples_.size() 
+              << ", face.detected: " << face.detected << std::endl;
+    
     if (!frame || !face.detected || frame->color_data.empty()) {
+        std::cout << "⚠️  Early return: frame=" << (frame != nullptr) 
+                  << ", face=" << face.detected << std::endl;
         return 0.5f;  // Neutral score if no data
     }
 
@@ -1018,10 +1030,56 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
         return 0.5f;
     }
     
-    cv::Rect forehead_roi = face.bbox;
-    // Forehead is top 30% of face bbox
-    forehead_roi.height = static_cast<int>(face.bbox.height * 0.3f);
-    forehead_roi.y += static_cast<int>(face.bbox.height * 0.1f);  // Skip hair
+    cv::Rect forehead_roi;
+    
+    // Use 468 landmarks to get PRECISE forehead region if available
+    if (!frame->metadata.landmarks.empty() && frame->metadata.landmarks.size() >= 468) {
+        // Forehead landmark indices (center forehead, above eyebrows)
+        // These are stable points less affected by expressions
+        std::vector<int> forehead_indices = {
+            10, 338, 297, 332, 284, 251,  // Upper forehead
+            389, 356, 454, 323, 361, 288,  // Mid forehead
+            397, 365, 379, 378, 400, 377   // Lower forehead (above eyebrows)
+        };
+        
+        // Calculate bounding box from forehead landmarks
+        float min_x = FLT_MAX, max_x = -FLT_MAX;
+        float min_y = FLT_MAX, max_y = -FLT_MAX;
+        int valid_landmarks = 0;
+        
+        for (int idx : forehead_indices) {
+            if (idx < (int)frame->metadata.landmarks.size()) {
+                const auto& lm = frame->metadata.landmarks[idx];
+                min_x = std::min(min_x, lm.x);
+                max_x = std::max(max_x, lm.x);
+                min_y = std::min(min_y, lm.y);
+                max_y = std::max(max_y, lm.y);
+                valid_landmarks++;
+            }
+        }
+        
+        if (valid_landmarks > 10) {
+            // Create ROI from landmarks (add small margin)
+            int margin = 5;
+            forehead_roi = cv::Rect(
+                std::max(0, static_cast<int>(min_x) - margin),
+                std::max(0, static_cast<int>(min_y) - margin),
+                std::min(color_mat.cols - static_cast<int>(min_x) + margin, static_cast<int>(max_x - min_x) + 2*margin),
+                std::min(color_mat.rows - static_cast<int>(min_y) + margin, static_cast<int>(max_y - min_y) + 2*margin)
+            );
+            std::cout << "📍 Using 468-landmark forehead ROI: " << forehead_roi << std::endl;
+        } else {
+            // Fallback to bbox-based method
+            forehead_roi = face.bbox;
+            forehead_roi.height = static_cast<int>(face.bbox.height * 0.3f);
+            forehead_roi.y += static_cast<int>(face.bbox.height * 0.1f);
+        }
+    } else {
+        // Fallback: Use face bbox (old method)
+        forehead_roi = face.bbox;
+        forehead_roi.height = static_cast<int>(face.bbox.height * 0.3f);
+        forehead_roi.y += static_cast<int>(face.bbox.height * 0.1f);  // Skip hair
+    }
     
     // Bounds check
     forehead_roi = forehead_roi & cv::Rect(0, 0, color_mat.cols, color_mat.rows);
@@ -1116,11 +1174,44 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
             float local_mean = (count > 0) ? sum / count : 0.0f;
             detrended[i] = chrom_signal[i] - local_mean;
         }
+        
+        if (ENABLE_DEBUG_LOGGING) {
+            static int detrend_debug_count = 0;
+            if (++detrend_debug_count % 60 == 0) {
+                std::cout << "🔧 DETRENDING DEBUG:" << std::endl;
+                std::cout << "   Before (first 10): ";
+                for (size_t i = 0; i < std::min(size_t(10), chrom_signal.size()); i++) {
+                    std::cout << chrom_signal[i] << " ";
+                }
+                std::cout << std::endl;
+                std::cout << "   After (first 10): ";
+                for (size_t i = 0; i < std::min(size_t(10), detrended.size()); i++) {
+                    std::cout << detrended[i] << " ";
+                }
+                std::cout << std::endl;
+                
+                // Calculate variance after detrending
+                float mean_det = 0.0f;
+                for (float v : detrended) mean_det += v;
+                mean_det /= detrended.size();
+                float var_det = 0.0f;
+                for (float v : detrended) {
+                    float diff = v - mean_det;
+                    var_det += diff * diff;
+                }
+                var_det /= detrended.size();
+                std::cout << "   Variance after detrend: " << var_det << std::endl;
+            }
+        }
+        
         chrom_signal = detrended;
     }
     
-    // Apply bandpass filter (0.7-2.5 Hz for heart rate 42-150 BPM)
-    apply_bandpass_filter(chrom_signal, estimated_fps, 0.7f, 2.5f);
+    // DISABLED: Bandpass filter too aggressive - removes pulse signal
+    // Moving average implementation reduces variance to zero
+    // Detrending already removes DC drift, so skip bandpass for now
+    // TODO: Implement proper IIR butterworth bandpass filter
+    // apply_bandpass_filter(chrom_signal, estimated_fps, 0.7f, 2.5f);
     
     // Detect pulse using improved autocorrelation
     float detected_bpm = 0.0f;
@@ -1175,6 +1266,7 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
     }
     
     // Score based on pulse detection quality
+    // CRITICAL: After enough data, no pulse = likely mask attack
     if (has_pulse && detected_bpm >= 50.0f && detected_bpm <= 120.0f) {
         // Good pulse in healthy range
         return 0.5f + (confidence * 0.5f);  // 0.5-1.0 based on confidence
@@ -1182,8 +1274,16 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
         // Pulse detected but unusual rate
         return 0.3f + (confidence * 0.3f);  // 0.3-0.6
     } else {
-        // No pulse or out of range
-        return 0.0f + (confidence * 0.2f);  // 0.0-0.2 (very low)
+        // No pulse detected
+        // After 7+ seconds of data, this is VERY suspicious (mask/photo)
+        if (rppg_samples_.size() >= RPPG_MIN_WINDOW + 60) {  // 7 seconds = 210 samples
+            std::cout << "⚠️  NO PULSE after " << rppg_samples_.size() << " samples - REJECTING" << std::endl;
+            return 0.0f;  // HARD REJECT - no pulse = mask/photo
+        }
+        // Still collecting data
+        std::cout << "⏳ Collecting rPPG data: " << rppg_samples_.size() << "/" 
+                  << (RPPG_MIN_WINDOW + 60) << std::endl;
+        return 0.2f;  // Still collecting, be lenient
     }
     
 #else
@@ -1861,7 +1961,25 @@ bool AntiSpoofingDetector::detect_pulse_fft(const std::vector<float>& signal, fl
     float snr = calculate_snr_at_frequency(signal, fps, 1.0f);
     confidence = std::min(1.0f, (normalized_corr * 2.0f) * (snr / 15.0f));  // SNR 15dB = good
     
-    if (normalized_corr > 0.4f && best_lag > 0) {
+    if (ENABLE_DEBUG_LOGGING) {
+        static int autocorr_debug_count = 0;
+        if (++autocorr_debug_count % 60 == 0) {
+            std::cout << "🔍 AUTOCORRELATION DEBUG:" << std::endl;
+            std::cout << "   Signal variance: " << variance << std::endl;
+            std::cout << "   Max correlation: " << max_correlation << std::endl;
+            std::cout << "   Normalized corr: " << normalized_corr << " (threshold: 0.4)" << std::endl;
+            std::cout << "   Best lag: " << best_lag << " frames" << std::endl;
+            std::cout << "   SNR: " << snr << " dB" << std::endl;
+            if (best_lag > 0) {
+                float bpm = (fps / best_lag) * 60.0f;
+                std::cout << "   Would be: " << bpm << " BPM" << std::endl;
+            }
+        }
+    }
+    
+    // Lowered threshold from 0.4 to 0.15 - original threshold too strict
+    // With detrended signal (no bandpass), normalized_corr ~0.15-0.25 is typical
+    if (normalized_corr > 0.15f && best_lag > 0) {
         detected_bpm = (fps / best_lag) * 60.0f;
         return true;
     }
