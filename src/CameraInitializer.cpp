@@ -289,21 +289,46 @@ bool CameraInitializer::execute_exposure_stabilization() {
         }
         auto sensors = device.query_sensors();
         
+        // Wait for auto-exposure to stabilize first
+        wait_with_progress(EXPOSURE_STABILIZATION_TIME, "Exposure stabilization");
+        
+        // NOW: Lock exposure, white balance, and gain for stable rPPG
         for (auto& sensor : sensors) {
-            if (sensor.supports(RS2_OPTION_EXPOSURE)) {
-                // Set reasonable exposure values for stabilization
+            // Disable auto-exposure and lock current value
+            if (sensor.supports(RS2_OPTION_EXPOSURE) && 
+                sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE)) {
+                
                 float current_exposure = sensor.get_option(RS2_OPTION_EXPOSURE);
-                report_status("Current exposure: " + std::to_string(current_exposure) + " μs");
+                report_status("Locking exposure at: " + std::to_string(current_exposure) + " μs");
+                
+                // Disable auto-exposure
+                sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f);
+                
+                // Explicitly set exposure to current value
+                sensor.set_option(RS2_OPTION_EXPOSURE, current_exposure);
+            }
+            
+            // Disable auto-white-balance if supported
+            if (sensor.supports(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE)) {
+                sensor.set_option(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, 0.0f);
+                report_status("Auto white balance disabled for stable rPPG");
+            }
+            
+            // Lock gain if supported
+            if (sensor.supports(RS2_OPTION_GAIN)) {
+                float current_gain = sensor.get_option(RS2_OPTION_GAIN);
+                sensor.set_option(RS2_OPTION_GAIN, current_gain);
+                report_status("Gain locked at: " + std::to_string(current_gain));
             }
         }
         
-        // Wait for exposure to stabilize
-        return wait_with_progress(EXPOSURE_STABILIZATION_TIME, "Exposure stabilization");
+        report_status("Camera locked for stable rPPG capture");
+        return true;
         
     } catch (const rs2::error& e) {
         report_status("Exposure setup warning: " + std::string(e.what()));
-        // Continue with time-based stabilization
-        return wait_with_progress(EXPOSURE_STABILIZATION_TIME, "Exposure stabilization");
+        // Continue anyway - not fatal
+        return true;
     }
 }
 

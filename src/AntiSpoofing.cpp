@@ -1087,17 +1087,31 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
         return 0.5f;  // Not enough data yet
     }
     
-    // Extract CHROM signal with motion compensation
-    std::vector<float> chrom_signal;
-    float estimated_fps = 30.0f;
-    bool signal_ok = extract_rppg_signal_chrom(chrom_signal, estimated_fps);
+    // TEMPORARY: Use simple green channel instead of CHROM for debugging
+    std::vector<float> green_signal;
+    green_signal.reserve(rppg_samples_.size());
+    for (const auto& sample : rppg_samples_) {
+        green_signal.push_back(sample.green);
+    }
     
-    if (!signal_ok || chrom_signal.empty()) {
+    float estimated_fps = 30.0f;
+    if (rppg_samples_.size() >= 2) {
+        double time_span = rppg_samples_.back().timestamp - rppg_samples_.front().timestamp;
+        estimated_fps = (rppg_samples_.size() - 1) / time_span;
+        if (estimated_fps < 15.0f || estimated_fps > 60.0f) {
+            estimated_fps = 30.0f;
+        }
+    }
+    
+    if (green_signal.empty()) {
         return 0.3f;  // Signal extraction failed
     }
     
     // Apply bandpass filter (0.7-2.5 Hz for heart rate 42-150 BPM)
-    apply_bandpass_filter(chrom_signal, estimated_fps, 0.7f, 2.5f);
+    apply_bandpass_filter(green_signal, estimated_fps, 0.7f, 2.5f);
+    
+    // Use green_signal instead of chrom_signal
+    std::vector<float>& chrom_signal = green_signal;
     
     // Detect pulse using improved autocorrelation
     float detected_bpm = 0.0f;
@@ -1124,6 +1138,22 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
             chrom_variance /= chrom_signal.size();
             
             std::cout << "   CHROM variance: " << chrom_variance << std::endl;
+            
+            // Show first few CHROM values for inspection
+            std::cout << "   CHROM samples (first 10): ";
+            for (size_t i = 0; i < std::min(size_t(10), chrom_signal.size()); i++) {
+                std::cout << chrom_signal[i] << " ";
+            }
+            std::cout << std::endl;
+            
+            // Check how many samples were skipped due to motion
+            int motion_skipped = 0;
+            for (const auto& sample : rppg_samples_) {
+                if (calculate_motion_compensation_weight(sample) < 0.3f) {
+                    motion_skipped++;
+                }
+            }
+            std::cout << "   Motion-skipped samples: " << motion_skipped << "/" << rppg_samples_.size() << std::endl;
             
             if (has_pulse) {
                 std::cout << "   ✅ PULSE: " << detected_bpm << " BPM (confidence: " 
@@ -1541,6 +1571,22 @@ bool AntiSpoofingDetector::extract_rppg_signal_chrom(std::vector<float>& chrom_s
     // Pulse signal: S = X - α*Y, where α minimizes motion artifacts
     float alpha = 1.0f;  // Simplified, normally adaptive
     
+    // Calculate temporal mean for each channel (for normalization)
+    float mean_r = 0.0f, mean_g = 0.0f, mean_b = 0.0f;
+    for (const auto& sample : rppg_samples_) {
+        mean_r += sample.red;
+        mean_g += sample.green;
+        mean_b += sample.blue;
+    }
+    mean_r /= rppg_samples_.size();
+    mean_g /= rppg_samples_.size();
+    mean_b /= rppg_samples_.size();
+    
+    // Add small epsilon to avoid division by zero
+    mean_r = std::max(mean_r, 1.0f);
+    mean_g = std::max(mean_g, 1.0f);
+    mean_b = std::max(mean_b, 1.0f);
+    
     for (const auto& sample : rppg_samples_) {
         // Motion compensation weight
         float weight = calculate_motion_compensation_weight(sample);
@@ -1555,11 +1601,11 @@ bool AntiSpoofingDetector::extract_rppg_signal_chrom(std::vector<float>& chrom_s
             continue;
         }
         
-        // Normalize RGB by mean to reduce illumination variations
-        float rgb_sum = sample.red + sample.green + sample.blue + 1e-6f;
-        float r = sample.red / rgb_sum;
-        float g = sample.green / rgb_sum;
-        float b = sample.blue / rgb_sum;
+        // Normalize each channel by ITS OWN temporal mean (not by RGB sum!)
+        // This preserves intensity variations while normalizing illumination
+        float r = sample.red / mean_r;
+        float g = sample.green / mean_g;
+        float b = sample.blue / mean_b;
         
         // CHROM color space transformation
         float X = 3.0f * r - 2.0f * g;
