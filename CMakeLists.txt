@@ -15,11 +15,13 @@ find_package(realsense2 REQUIRED)
 find_package(OpenCV QUIET)  # Optional - for Utils and fallback face detection
 find_package(Threads REQUIRED)
 
-# MediaPipe C++ GPU face detection (DISABLED - using OpenCV DNN for portability)
-# MediaPipe has complex linking dependencies and is not easily portable to Jetson
-# Using OpenCV DNN with automatic CUDA/CPU backend selection instead
-set(MEDIAPIPE_AVAILABLE FALSE)
-message(STATUS "Face detection: OpenCV DNN (portable Desktop + Jetson)")
+# MediaPipe C++ GPU face detection (ENABLED - custom wrapper with 468 landmarks)
+# Custom MediaPipe wrapper built from source with static linking
+# Provides 468-point face mesh with visibility scores for robust occlusion detection
+set(MEDIAPIPE_AVAILABLE TRUE)
+set(MEDIAPIPE_WRAPPER_LIB "${CMAKE_SOURCE_DIR}/lib/mediapipe/libface_mesh_wrapper.so")
+set(MEDIAPIPE_WRAPPER_INCLUDE "${CMAKE_SOURCE_DIR}/include/mediapipe")
+message(STATUS "Face detection: MediaPipe Face Mesh (468 points with GPU acceleration)")
 
 # Check if OpenCV was found
 if(OpenCV_FOUND)
@@ -34,9 +36,10 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${realsense2_INCLUDE_DIR}
     ${OpenCV_INCLUDE_DIRS}
+    ${MEDIAPIPE_WRAPPER_INCLUDE}
 )
 
-# No additional includes needed - using OpenCV DNN
+# MediaPipe wrapper is pre-built and included as shared library
 
 # Source files
 set(SOURCES
@@ -59,6 +62,11 @@ add_library(mdai_realsense SHARED ${SOURCES})
 target_link_libraries(mdai_realsense 
     ${realsense2_LIBRARY}
     Threads::Threads
+    ${MEDIAPIPE_WRAPPER_LIB}
+    -Wl,--no-as-needed
+    dl
+    absl_status
+    absl_statusor
 )
 
 if(OpenCV_FOUND)
@@ -71,6 +79,11 @@ add_library(mdai_realsense_static STATIC ${SOURCES})
 target_link_libraries(mdai_realsense_static
     ${realsense2_LIBRARY}
     Threads::Threads
+    ${MEDIAPIPE_WRAPPER_LIB}
+    -Wl,--no-as-needed
+    dl
+    absl_status
+    absl_statusor
 )
 
 if(OpenCV_FOUND)

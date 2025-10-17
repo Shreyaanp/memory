@@ -4,6 +4,9 @@
 #include <iostream>
 #include <numeric>
 
+// Debug logging flag - set to false for production to avoid hot-path logging
+#define ENABLE_DEBUG_LOGGING false
+
 namespace mdai {
 
 // ============================================================================
@@ -478,6 +481,17 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     frame->metadata.anti_spoofing.cross_modal_score = analyze_cross_modal_consistency(frame, face);
     frame->metadata.anti_spoofing.temporal_consistency_score = analyze_temporal_consistency(face);
     
+    // rPPG pulse detection (NEW - supplementary signal for mask detection)
+    // NOTE: Made non-critical to avoid false rejects on real faces
+    // rPPG needs robust signal processing (bandpass, motion compensation, CHROM/POS)
+    // before it can be used as a hard gate
+    float rppg_pulse_score = analyze_rppg_pulse(frame, face);
+    
+    // If not enough data yet, use neutral score
+    if (rppg_green_signal_.size() < RPPG_WINDOW) {
+        rppg_pulse_score = 0.5f;  // Neutral - don't penalize or reward
+    }
+    
     frame->metadata.anti_spoofing.depth_anomaly_detected = 
         frame->metadata.anti_spoofing.depth_analysis_score < config_.min_depth_analysis_score;
     frame->metadata.anti_spoofing.ir_material_mismatch = 
@@ -485,11 +499,14 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     frame->metadata.anti_spoofing.cross_modal_disagreement = 
         frame->metadata.anti_spoofing.cross_modal_score < config_.min_cross_modal_score;
     
+    // Integrate rPPG pulse score (reduced to 15% since it's not yet robust)
+    // Prioritize depth (best for 2D attacks) and IR texture
     frame->metadata.anti_spoofing.overall_liveness_score = 
-        (frame->metadata.anti_spoofing.depth_analysis_score * 0.40f +
+        (frame->metadata.anti_spoofing.depth_analysis_score * 0.35f +
          frame->metadata.anti_spoofing.ir_texture_score * 0.30f +
-         frame->metadata.anti_spoofing.temporal_consistency_score * 0.15f +
-         frame->metadata.anti_spoofing.cross_modal_score * 0.15f);
+         rppg_pulse_score * 0.15f +
+         frame->metadata.anti_spoofing.temporal_consistency_score * 0.10f +
+         frame->metadata.anti_spoofing.cross_modal_score * 0.10f);
     
     frame->metadata.anti_spoofing.detected_attack_type = detect_attack_type(frame, face);
     
@@ -504,14 +521,16 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     float xmodal_score = frame->metadata.anti_spoofing.cross_modal_score;
     float temporal_score = frame->metadata.anti_spoofing.temporal_consistency_score;
     
-    // Weighted fusion (sum = 1.0)
+    // Weighted fusion (sum = 1.0) - includes rPPG as supplementary signal
     float fused_score = 
-        depth_score * 0.40f +      // Depth is most reliable
-        ir_score * 0.30f +          // IR texture is second most reliable
-        temporal_score * 0.15f +    // Temporal consistency
-        xmodal_score * 0.15f;       // Cross-modal validation
+        depth_score * 0.35f +       // Depth is most reliable for 2D attacks
+        ir_score * 0.30f +          // IR texture
+        rppg_pulse_score * 0.15f +  // rPPG pulse detection (supplementary, not robust yet)
+        temporal_score * 0.10f +    // Temporal consistency
+        xmodal_score * 0.10f;       // Cross-modal validation
     
     // Minimum guardrail: no single component can be too low
+    // NOTE: Exclude rPPG from guardrail since it's not robust yet
     float min_component = std::min({depth_score, ir_score, temporal_score, xmodal_score});
     
     // Pass criteria: good fused score AND no single component is critically low
@@ -909,19 +928,226 @@ float AntiSpoofingDetector::analyze_ir_texture(const FrameBox* frame, const Face
     else if (mean_ratio < 0.25f) stereo_score += 0.5f;
     else stereo_score += 0.0f;
     
-    // Combine texture and stereo scores (BOTH must pass)
-    float final_score = (texture_score / 3.0f) * 0.6f + (stereo_score / 2.0f) * 0.4f;
+    // 5. NEW: THERMAL GRADIENT ANALYSIS for mask detection
+    // Masks have uniform temperature; real faces have thermal gradients
+    float thermal_score = 0.0f;
     
-    // Hard requirement: if stereo_score is too low, fail closed
-    if (stereo_score / 2.0f < 0.4f) {
-        // Note: ir_material_mismatch will be set later in process_frame
-        return 0.0f;  // Fail closed on stereo mismatch
+    if (face_ir_left.rows > 20 && face_ir_left.cols > 20) {
+        // Define regions: forehead (top 30%), cheeks (middle 40%), chin (bottom 30%)
+        int forehead_start = 0;
+        int forehead_end = static_cast<int>(face_ir_left.rows * 0.3f);
+        int cheeks_start = static_cast<int>(face_ir_left.rows * 0.3f);
+        int cheeks_end = static_cast<int>(face_ir_left.rows * 0.7f);
+        int chin_start = static_cast<int>(face_ir_left.rows * 0.7f);
+        int chin_end = face_ir_left.rows;
+        
+        cv::Mat forehead_region = face_ir_left(cv::Rect(0, forehead_start, face_ir_left.cols, forehead_end - forehead_start));
+        cv::Mat cheeks_region = face_ir_left(cv::Rect(0, cheeks_start, face_ir_left.cols, cheeks_end - cheeks_start));
+        cv::Mat chin_region = face_ir_left(cv::Rect(0, chin_start, face_ir_left.cols, chin_end - chin_start));
+        
+        // Calculate mean intensity for each region (proxy for temperature)
+        cv::Scalar forehead_mean = cv::mean(forehead_region);
+        cv::Scalar cheeks_mean = cv::mean(cheeks_region);
+        cv::Scalar chin_mean = cv::mean(chin_region);
+        
+        float forehead_temp = static_cast<float>(forehead_mean[0]);
+        float cheeks_temp = static_cast<float>(cheeks_mean[0]);
+        float chin_temp = static_cast<float>(chin_mean[0]);
+        
+        // Real faces: forehead tends to be warmer (blood flow from brain)
+        // Masks: uniform temperature across all regions
+        float temp_variation = std::abs(forehead_temp - cheeks_temp) + std::abs(cheeks_temp - chin_temp);
+        
+        // DEBUG: Print thermal values every 30 frames
+        if (ENABLE_DEBUG_LOGGING) {
+            static int thermal_debug_count = 0;
+            if (++thermal_debug_count % 30 == 0) {
+                std::cout << "🌡️  THERMAL DEBUG:" << std::endl;
+                std::cout << "   Forehead: " << forehead_temp << " | Cheeks: " << cheeks_temp << " | Chin: " << chin_temp << std::endl;
+                std::cout << "   Variation: " << temp_variation << std::endl;
+            }
+        }
+        
+        // Check spatial IR reflectance variation
+        if (temp_variation < 3.0f) {
+            thermal_score = 0.3f;
+        } else if (temp_variation < 8.0f) {
+            thermal_score = 0.6f;
+        } else if (temp_variation < 20.0f) {
+            thermal_score = 1.0f;
+        } else {
+            thermal_score = 0.5f;
+        }
+        
+        // Calculate within-region variance
+        cv::Scalar forehead_std;
+        cv::meanStdDev(forehead_region, cv::Scalar(), forehead_std);
+        float region_variance = static_cast<float>(forehead_std[0]);
+        
+        // Real faces have some variance within regions; masks are very uniform
+        if (region_variance < 3.0f) {
+            thermal_score *= 0.5f;  // Penalize uniform regions (mask-like)
+        }
+    } else {
+        // ROI too small for reliable thermal analysis
+        thermal_score = 0.5f;  // Neutral score
     }
+    
+    // NOTE: "thermal" is a misnomer - RealSense IR is NIR reflectance, not thermal emission
+    // This measures spatial variance in reflectance, which correlates with surface texture
+    // REMOVED hard gate - too brittle for production (causes false rejects on real faces)
+    
+    // Combine texture, stereo, and IR spatial variance scores
+    // REDUCED IR variance weight since it's reflectance-based, not thermal
+    // Texture: 50%, Stereo: 30%, IR Spatial Variance: 20%
+    float final_score = (texture_score / 3.0f) * 0.50f + (stereo_score / 2.0f) * 0.30f + thermal_score * 0.20f;
+    
+    // NOTE: Removed stereo hard gate - too brittle, let it contribute via weighted fusion instead
     
     return final_score;
 #else
     return 0.5f;
 #endif
+}
+
+float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || frame->color_data.empty()) {
+        return 0.5f;  // Neutral score if no data
+    }
+
+#ifdef HAVE_OPENCV
+    // Extract forehead region (best for pulse detection - less movement, good blood flow)
+    cv::Mat color_mat = frame->get_color_mat();
+    if (color_mat.empty()) {
+        return 0.5f;
+    }
+    
+    cv::Rect forehead_roi = face.bbox;
+    // Forehead is top 30% of face bbox
+    forehead_roi.height = static_cast<int>(face.bbox.height * 0.3f);
+    forehead_roi.y += static_cast<int>(face.bbox.height * 0.1f);  // Skip hair
+    
+    // Bounds check
+    forehead_roi = forehead_roi & cv::Rect(0, 0, color_mat.cols, color_mat.rows);
+    if (forehead_roi.width < 10 || forehead_roi.height < 10) {
+        return 0.5f;
+    }
+    
+    cv::Mat forehead_region = color_mat(forehead_roi);
+    
+    // Extract GREEN channel (most sensitive to blood volume changes)
+    std::vector<cv::Mat> bgr_channels;
+    cv::split(forehead_region, bgr_channels);
+    cv::Mat green_channel = bgr_channels[1];  // Green channel
+    
+    // Calculate mean green intensity
+    cv::Scalar mean_green = cv::mean(green_channel);
+    float green_value = static_cast<float>(mean_green[0]);
+    
+    // Store in temporal buffer
+    rppg_green_signal_.push_back(green_value);
+    if (rppg_green_signal_.size() > RPPG_WINDOW) {
+        rppg_green_signal_.pop_front();
+    }
+    
+    // Need at least 3 seconds of data for reliable pulse detection
+    if (rppg_green_signal_.size() < RPPG_WINDOW) {
+        return 0.5f;  // Not enough data yet
+    }
+    
+    // Convert deque to vector for processing
+    std::vector<float> signal(rppg_green_signal_.begin(), rppg_green_signal_.end());
+    
+    // Detect periodic pulse signal
+    float detected_bpm = 0.0f;
+    bool has_pulse = detect_periodic_signal(signal, detected_bpm);
+    
+    if (ENABLE_DEBUG_LOGGING) {
+        static int rppg_debug_count = 0;
+        if (++rppg_debug_count % 30 == 0) {
+            std::cout << "💓 rPPG PULSE DEBUG:" << std::endl;
+            if (has_pulse) {
+                std::cout << "   ✅ PULSE DETECTED: " << detected_bpm << " BPM" << std::endl;
+            } else {
+                std::cout << "   ❌ NO PULSE (mask suspected)" << std::endl;
+            }
+        }
+    }
+    
+    // Score based on pulse detection
+    // NOTE: rPPG is supplementary - needs bandpass filter, motion compensation for production
+    if (has_pulse && detected_bpm >= 50.0f && detected_bpm <= 120.0f) {
+        return 1.0f;  // Healthy pulse detected = real face
+    } else if (has_pulse) {
+        return 0.6f;  // Pulse detected but unusual rate
+    } else {
+        return 0.0f;  // No pulse detected (but won't hard-reject, just lowers score)
+    }
+    
+#else
+    return 0.5f;
+#endif
+}
+
+bool AntiSpoofingDetector::detect_periodic_signal(const std::vector<float>& signal, float& detected_bpm) {
+    if (signal.size() < 60) {
+        return false;  // Need at least 2 seconds
+    }
+    
+    // Detrend signal (remove slow DC drift)
+    std::vector<float> detrended(signal.size());
+    float mean = std::accumulate(signal.begin(), signal.end(), 0.0f) / signal.size();
+    for (size_t i = 0; i < signal.size(); i++) {
+        detrended[i] = signal[i] - mean;
+    }
+    
+    // Simple autocorrelation to detect periodicity
+    // Heart rate is typically 0.7-2.5 Hz (42-150 BPM)
+    // At 30fps: period of 12-43 frames for 60-150 BPM
+    
+    int min_period = 12;  // ~150 BPM at 30fps
+    int max_period = 60;  // ~30 BPM at 30fps
+    
+    float max_correlation = 0.0f;
+    int best_period = 0;
+    
+    for (int lag = min_period; lag <= max_period && lag < (int)detrended.size() / 2; lag++) {
+        float correlation = 0.0f;
+        int count = 0;
+        
+        for (size_t i = 0; i < detrended.size() - lag; i++) {
+            correlation += detrended[i] * detrended[i + lag];
+            count++;
+        }
+        
+        if (count > 0) {
+            correlation /= count;
+        }
+        
+        if (correlation > max_correlation) {
+            max_correlation = correlation;
+            best_period = lag;
+        }
+    }
+    
+    // Normalize correlation by signal variance
+    float variance = 0.0f;
+    for (float val : detrended) {
+        variance += val * val;
+    }
+    variance /= detrended.size();
+    
+    float normalized_correlation = (variance > 0.001f) ? max_correlation / variance : 0.0f;
+    
+    // Threshold for detecting periodicity
+    if (normalized_correlation > 0.3f && best_period > 0) {
+        // Convert period (frames) to BPM
+        float fps = 30.0f;  // Assuming 30fps
+        detected_bpm = (fps / best_period) * 60.0f;
+        return true;
+    }
+    
+    return false;
 }
 
 float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
@@ -1207,20 +1433,17 @@ bool AntiSpoofingPipeline::process_frame_with_temporal_context(FrameBox* frame, 
     
     bool anti_spoofing_passed = false;
     if (quality_passed) {
+        // process_frame already computes all scores including rPPG and sets overall_liveness_score
         anti_spoofing_passed = anti_spoofing_detector_->process_frame(frame);
         
+        // Add supplementary temporal analysis
         float temporal_score = anti_spoofing_detector_->process_temporal_analysis(recent_frames, frame);
         frame->metadata.anti_spoofing.temporal_consistency_score = temporal_score;
         
-        frame->metadata.anti_spoofing.overall_liveness_score = 
-            (frame->metadata.anti_spoofing.depth_analysis_score * 0.30f +
-             frame->metadata.anti_spoofing.ir_texture_score * 0.25f +
-             frame->metadata.anti_spoofing.cross_modal_score * 0.20f +
-             frame->metadata.anti_spoofing.temporal_consistency_score * 0.25f);
-        
-        anti_spoofing_passed = 
-            frame->metadata.anti_spoofing.overall_liveness_score >= config_.min_overall_liveness &&
-            frame->metadata.anti_spoofing.confidence >= config_.min_confidence;
+        // NOTE: Don't recalculate overall_liveness_score here - it's already set by process_frame
+        // with the correct fusion including rPPG. Recalculating would create inconsistency.
+        // The overall_liveness_score from process_frame already includes:
+        // depth (35%), IR (30%), rPPG (15%), temporal (10%), cross-modal (10%)
     }
     
     bool overall_passed = quality_passed && anti_spoofing_passed;

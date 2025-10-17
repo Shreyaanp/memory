@@ -64,6 +64,16 @@ struct FrameBoxMetadata {
     int face_w = 0;
     int face_h = 0;
     float face_detection_confidence = 0.0f;
+    std::string face_rejection_reason = "";
+    
+    // Face landmarks (468 points from MediaPipe Face Mesh)
+    // Each landmark is (x, y, z) where x, y are pixel coordinates
+    // and z is relative depth
+    struct Landmark {
+        float x, y, z;
+        Landmark(float x_ = 0, float y_ = 0, float z_ = 0) : x(x_), y(y_), z(z_) {}
+    };
+    std::vector<Landmark> landmarks;
     
     // Anti-Spoofing Results
     struct AntiSpoofingResults {

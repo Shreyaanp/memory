@@ -6,52 +6,39 @@
 #include <opencv2/dnn.hpp>
 #endif
 
-#ifdef USE_MEDIAPIPE
-// Use C API from our MediaPipe wrapper library
-extern "C" {
-    void* mediapipe_face_detector_create();
-    int mediapipe_face_detector_initialize(void* detector);
-    int mediapipe_face_detector_detect(
-        void* detector,
-        const unsigned char* image_data,
-        int width,
-        int height,
-        float* out_x,
-        float* out_y,
-        float* out_w,
-        float* out_h,
-        float* out_confidence);
-    void mediapipe_face_detector_destroy(void* detector);
-}
-#endif
+// MediaPipe Face Mesh wrapper (468 points)
+#include "face_mesh_wrapper.h"
 
 namespace mdai {
 
 // ============================================================================
-// MediaPipe Face Detector Implementation
+// MediaPipe Face Mesh Detector Implementation (468 points)
 // ============================================================================
-
-#ifdef USE_MEDIAPIPE
 
 class MediaPipeFaceDetector::Impl {
 public:
-    Impl() : detector_(nullptr), initialized_(false) {
-        detector_ = mediapipe_face_detector_create();
-        if (detector_) {
-            initialized_ = mediapipe_face_detector_initialize(detector_);
-            if (initialized_) {
-                std::cout << "✓ MediaPipe GPU face detector initialized" << std::endl;
-            } else {
-                std::cerr << "Failed to initialize MediaPipe face detector" << std::endl;
-            }
+    Impl() : initialized_(false) {
+        // Configure MediaPipe Face Mesh
+        FaceMeshConfig config;
+        config.model_path = "models/face_landmarker.task";
+        config.num_faces = 1;
+        config.min_detection_confidence = 0.5f;
+        config.min_tracking_confidence = 0.5f;
+        config.min_presence_confidence = 0.5f;
+        config.use_gpu = true;  // Enable GPU acceleration
+        
+        detector_ = std::make_unique<FaceMeshDetector>(config);
+        initialized_ = detector_->IsInitialized();
+        
+        if (initialized_) {
+            std::cout << "✓ MediaPipe Face Mesh (468 points) initialized with GPU acceleration" << std::endl;
+        } else {
+            std::cerr << "❌ Failed to initialize MediaPipe Face Mesh: " 
+                      << detector_->GetLastError() << std::endl;
         }
     }
     
-    ~Impl() {
-        if (detector_) {
-            mediapipe_face_detector_destroy(detector_);
-        }
-    }
+    ~Impl() = default;
     
     bool detect_faces(FrameBox* frame) {
         if (!initialized_ || !frame) {
@@ -63,27 +50,45 @@ public:
             return false;
         }
         
-        // MediaPipe C API expects BGR data
-        float x, y, w, h, confidence;
-        int result = mediapipe_face_detector_detect(
-            detector_,
-            color_mat.data,
-            color_mat.cols,
-            color_mat.rows,
-            &x, &y, &w, &h, &confidence
-        );
+        // Detect face mesh
+        FaceMeshResult face_mesh;
+        bool success = detector_->Detect(color_mat, face_mesh);
         
         // Reset face detection metadata
         frame->metadata.face_detected = false;
         frame->metadata.face_detection_confidence = 0.0f;
+        frame->metadata.landmarks.clear();
         
-        if (result) {
-            frame->metadata.face_detected = true;
-            frame->metadata.face_x = static_cast<int>(x);
-            frame->metadata.face_y = static_cast<int>(y);
-            frame->metadata.face_w = static_cast<int>(w);
-            frame->metadata.face_h = static_cast<int>(h);
-            frame->metadata.face_detection_confidence = confidence;
+        if (!success) {
+            // Detection failed
+            return false;
+        }
+        
+        // Check if face was detected
+        if (face_mesh.landmarks.empty() || face_mesh.confidence < 0.3f) {
+            return true;  // No face, but detection succeeded
+        }
+        
+        // Check for occlusion
+        if (face_mesh.IsOccluded(0.5f, 0.3f)) {
+            // More than 30% of landmarks occluded - reject
+            frame->metadata.face_detected = false;
+            frame->metadata.face_rejection_reason = "Face partially occluded";
+            return true;
+        }
+        
+        // Valid face detected
+        frame->metadata.face_detected = true;
+        frame->metadata.face_x = face_mesh.bbox.x;
+        frame->metadata.face_y = face_mesh.bbox.y;
+        frame->metadata.face_w = face_mesh.bbox.width;
+        frame->metadata.face_h = face_mesh.bbox.height;
+        frame->metadata.face_detection_confidence = face_mesh.confidence;
+        
+        // Store all 468 landmarks
+        frame->metadata.landmarks.reserve(face_mesh.landmarks.size());
+        for (const auto& lm : face_mesh.landmarks) {
+            frame->metadata.landmarks.emplace_back(lm.x, lm.y, lm.z);
         }
         
         return true;
@@ -92,7 +97,7 @@ public:
     bool is_initialized() const { return initialized_; }
     
 private:
-    void* detector_;
+    std::unique_ptr<FaceMeshDetector> detector_;
     bool initialized_;
 };
 
@@ -106,32 +111,6 @@ MediaPipeFaceDetector::~MediaPipeFaceDetector() = default;
 bool MediaPipeFaceDetector::detect(FrameBox* frame) {
     return impl_->detect_faces(frame);
 }
-
-#else  // !USE_MEDIAPIPE
-
-// Stub implementation when MediaPipe is not available
-class MediaPipeFaceDetector::Impl {
-public:
-    Impl() {}
-    ~Impl() {}
-    bool detect_faces(FrameBox*) { return false; }
-    bool is_initialized() const { return false; }
-};
-
-MediaPipeFaceDetector::MediaPipeFaceDetector() 
-    : impl_(std::make_unique<Impl>()) {
-    std::cerr << "MediaPipe not available - using OpenCV DNN" << std::endl;
-    initialized_ = false;
-}
-
-MediaPipeFaceDetector::~MediaPipeFaceDetector() = default;
-
-bool MediaPipeFaceDetector::detect(FrameBox* frame) {
-    (void)frame;
-    return false;
-}
-
-#endif  // USE_MEDIAPIPE
 
 // ============================================================================
 // OpenCV DNN Face Detector Implementation
@@ -278,25 +257,25 @@ bool OpenCVDNNFaceDetector::detect(FrameBox* frame) {
 // ============================================================================
 
 std::unique_ptr<FaceDetector> create_face_detector() {
-#ifdef USE_MEDIAPIPE
+    // Always use MediaPipe Face Mesh (468 points) with GPU acceleration
     auto mp_detector = std::make_unique<MediaPipeFaceDetector>();
     if (mp_detector->is_initialized()) {
-        std::cout << "Using MediaPipe GPU face detector" << std::endl;
+        std::cout << "✓ Using MediaPipe Face Mesh (468 landmarks, GPU accelerated)" << std::endl;
         return mp_detector;
     }
-    std::cerr << "MediaPipe initialization failed, trying OpenCV DNN..." << std::endl;
-#endif
+    
+    std::cerr << "❌ MediaPipe initialization failed, trying OpenCV DNN fallback..." << std::endl;
 
 #ifdef HAVE_OPENCV
     auto cv_detector = std::make_unique<OpenCVDNNFaceDetector>();
     if (cv_detector->is_initialized()) {
-        std::cout << "Using OpenCV DNN face detector" << std::endl;
+        std::cout << "⚠ Using OpenCV DNN face detector (fallback)" << std::endl;
         return cv_detector;
     }
-    std::cerr << "OpenCV DNN initialization failed" << std::endl;
+    std::cerr << "❌ OpenCV DNN initialization failed" << std::endl;
 #endif
 
-    std::cerr << "No face detector available!" << std::endl;
+    std::cerr << "❌ No face detector available!" << std::endl;
     return nullptr;
 }
 

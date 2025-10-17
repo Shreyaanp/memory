@@ -167,11 +167,19 @@ private:
     std::deque<FaceROI> face_history_;
     static constexpr int TEMPORAL_WINDOW = 30;  // 1 second at 30fps
     
+    // rPPG (remote photoplethysmography) for pulse detection
+    std::deque<float> rppg_green_signal_;  // Green channel values over time
+    static constexpr int RPPG_WINDOW = 90;  // 3 seconds at 30fps for reliable pulse
+    
     // Core detection algorithms (now ROI-driven)
     float analyze_depth_geometry(const FrameBox* frame, const FaceROI& face);
     float analyze_ir_texture(const FrameBox* frame, const FaceROI& face);  // Now includes stereo consistency
     float analyze_temporal_consistency(const FaceROI& face);
     float analyze_cross_modal_consistency(const FrameBox* frame, const FaceROI& face);
+    
+    // rPPG pulse detection (mask detection)
+    float analyze_rppg_pulse(const FrameBox* frame, const FaceROI& face);
+    bool detect_periodic_signal(const std::vector<float>& signal, float& detected_bpm);
     
     // Temporal liveness checks
     bool detect_blink(const std::vector<cv::Point2f>& landmarks);

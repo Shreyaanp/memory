@@ -214,6 +214,7 @@ private:
         std::cout << "Anti-Spoofing: " << (frame->metadata.anti_spoofing.is_live ? "✅ PASSED" : "❌ FAILED") << std::endl;
         std::cout << "  Depth Analysis: " << frame->metadata.anti_spoofing.depth_analysis_score << std::endl;
         std::cout << "  IR Texture: " << frame->metadata.anti_spoofing.ir_texture_score << std::endl;
+        std::cout << "  💓 Pulse (rPPG): " << "(embedded in overall score)" << std::endl;
         std::cout << "  Cross-Modal: " << frame->metadata.anti_spoofing.cross_modal_score << std::endl;
         std::cout << "  Overall Liveness: " << frame->metadata.anti_spoofing.overall_liveness_score << std::endl;
         std::cout << "  Confidence: " << frame->metadata.anti_spoofing.confidence << std::endl;
