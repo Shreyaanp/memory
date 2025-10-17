@@ -1039,6 +1039,16 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
     cv::Scalar mean_green = cv::mean(bgr_channels[1]);
     cv::Scalar mean_red = cv::mean(bgr_channels[2]);
     
+    if (ENABLE_DEBUG_LOGGING) {
+        static int rgb_debug_count = 0;
+        if (++rgb_debug_count % 60 == 0) {
+            std::cout << "📊 RGB RAW VALUES:" << std::endl;
+            std::cout << "   R: " << mean_red[0] << ", G: " << mean_green[0] 
+                      << ", B: " << mean_blue[0] << std::endl;
+            std::cout << "   Forehead ROI: " << forehead_roi << std::endl;
+        }
+    }
+    
     // Calculate motion score (stability of face)
     float motion_score = 1.0f;
     if (face_history_.size() >= 2) {
@@ -1099,11 +1109,28 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
         if (++rppg_debug_count % 30 == 0) {
             std::cout << "💓 rPPG ROBUST DEBUG:" << std::endl;
             std::cout << "   FPS: " << estimated_fps << ", Samples: " << rppg_samples_.size() << std::endl;
+            std::cout << "   CHROM signal size: " << chrom_signal.size() << std::endl;
+            
+            // Calculate signal statistics
+            float chrom_mean = 0.0f, chrom_variance = 0.0f;
+            for (float val : chrom_signal) {
+                chrom_mean += val;
+            }
+            chrom_mean /= chrom_signal.size();
+            for (float val : chrom_signal) {
+                float diff = val - chrom_mean;
+                chrom_variance += diff * diff;
+            }
+            chrom_variance /= chrom_signal.size();
+            
+            std::cout << "   CHROM variance: " << chrom_variance << std::endl;
+            
             if (has_pulse) {
                 std::cout << "   ✅ PULSE: " << detected_bpm << " BPM (confidence: " 
                           << confidence << ")" << std::endl;
             } else {
                 std::cout << "   ❌ NO PULSE detected (mask suspected)" << std::endl;
+                std::cout << "   Detected BPM: " << detected_bpm << ", Confidence: " << confidence << std::endl;
             }
         }
     }
