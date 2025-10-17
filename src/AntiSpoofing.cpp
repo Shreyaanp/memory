@@ -484,6 +484,9 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     // Material analysis for mask detection (edge sharpness, texture, specular, depth discontinuities)
     float material_score = analyze_material_properties(frame, face);
     
+    // Occlusion/obstacle detection (eyes visible, landmarks visible, depth holes)
+    float occlusion_score = analyze_occlusion(frame, face);
+    
     // rPPG pulse detection (NEW - supplementary signal for mask detection)
     // NOTE: Made non-critical to avoid false rejects on real faces
     // Now using robust rPPG with CHROM, bandpass filtering, and motion compensation
@@ -505,14 +508,14 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
         frame->metadata.anti_spoofing.cross_modal_score < config_.min_cross_modal_score;
     
     // Integrate all detection methods (weights sum to 1.0)
-    // Prioritize: depth (2D attacks), material (masks), IR texture, rPPG, temporal, cross-modal
+    // Prioritize: depth (2D attacks), occlusion (masks/obstacles), material (masks), IR texture, rPPG, temporal
     frame->metadata.anti_spoofing.overall_liveness_score = 
         (frame->metadata.anti_spoofing.depth_analysis_score * 0.25f +  // 2D attack detection
-         material_score * 0.25f +  // NEW: Mask detection (edge/texture/specular/depth)
-         frame->metadata.anti_spoofing.ir_texture_score * 0.20f +  // NIR reflectance patterns
-         rppg_pulse_score * 0.15f +  // Pulse detection (soft signal)
-         frame->metadata.anti_spoofing.temporal_consistency_score * 0.10f +  // Breathing/micro-motion/blinks
-         frame->metadata.anti_spoofing.cross_modal_score * 0.05f);  // Consistency checks
+         occlusion_score * 0.20f +  // NEW: Eyes/face visibility (critical for masks)
+         material_score * 0.20f +  // Mask detection (edge/texture/specular/depth)
+         frame->metadata.anti_spoofing.ir_texture_score * 0.15f +  // NIR reflectance patterns
+         rppg_pulse_score * 0.10f +  // Pulse detection (soft signal)
+         frame->metadata.anti_spoofing.temporal_consistency_score * 0.10f);  // Breathing/micro-motion/blinks
     
     frame->metadata.anti_spoofing.detected_attack_type = detect_attack_type(frame, face);
     
@@ -524,21 +527,21 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     // Get individual scores
     float depth_score = frame->metadata.anti_spoofing.depth_analysis_score;
     float ir_score = frame->metadata.anti_spoofing.ir_texture_score;
-    float xmodal_score = frame->metadata.anti_spoofing.cross_modal_score;
     float temporal_score = frame->metadata.anti_spoofing.temporal_consistency_score;
     
-    // Weighted fusion (sum = 1.0) - includes material and rPPG
+    // Weighted fusion (sum = 1.0) - includes occlusion, material and rPPG
     float fused_score = 
         depth_score * 0.25f +       // Depth for 2D attacks
-        material_score * 0.25f +    // NEW: Material properties for mask detection
-        ir_score * 0.20f +          // IR texture
-        rppg_pulse_score * 0.15f +  // rPPG pulse (supplementary)
-        temporal_score * 0.10f +    // Temporal consistency
-        xmodal_score * 0.05f;       // Cross-modal validation
+        occlusion_score * 0.20f +   // NEW: Eyes/face visibility
+        material_score * 0.20f +    // Material properties for mask detection
+        ir_score * 0.15f +          // IR texture
+        rppg_pulse_score * 0.10f +  // rPPG pulse (supplementary)
+        temporal_score * 0.10f;     // Temporal consistency
     
     // Minimum guardrail: no single critical component can be too low
     // NOTE: Exclude rPPG from guardrail since it's not robust yet
-    float min_component = std::min({depth_score, material_score, ir_score, temporal_score});
+    // Include occlusion in guardrail - eyes MUST be visible
+    float min_component = std::min({depth_score, occlusion_score, material_score, ir_score, temporal_score});
     
     // Pass criteria: good fused score AND no single component is critically low
     bool passes_fusion = (fused_score >= config_.min_overall_liveness);
@@ -755,32 +758,54 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
             std::cout << "📐 Plane fitting: error=" << avg_plane_error_mm << "mm" << std::endl;
         }
         
-        // RELAXED: Was 8mm, now 5mm for hard reject (extremely flat like screen)
-        if (avg_plane_error < 0.005f) {
-            std::cout << "⚠️  HARD REJECT: Plane error " << avg_plane_error_mm << "mm < 5mm (flat surface)" << std::endl;
-            return 0.0f;
+        // STRICT 2D ATTACK DETECTION:
+        // Screens/photos are extremely flat (<3mm)
+        // Real faces have curvature (>6mm typically)
+        // Masks in between (4-6mm)
+        if (avg_plane_error < 0.003f) {
+            // Extremely flat - definitely 2D attack (screen/photo/paper)
+            std::cout << "🚫 2D ATTACK: Plane error " << avg_plane_error_mm << "mm < 3mm (flat surface)" << std::endl;
+            return 0.0f;  // HARD REJECT
+        } else if (avg_plane_error < 0.006f) {
+            // Very flat - likely 2D or rigid mask
+            geometry_score += 0.1f;  // Very suspicious
+            std::cout << "⚠️  Very flat surface: " << avg_plane_error_mm << "mm" << std::endl;
         } else if (avg_plane_error < 0.015f) {
-            geometry_score += 0.3f;
+            // Somewhat flat - borderline
+            geometry_score += 0.4f;
         } else if (avg_plane_error < 0.025f) {
-            geometry_score += 0.7f;
+            // Good curvature - natural face
+            geometry_score += 0.8f;
         } else {
+            // Excellent curvature - definitely not flat
             geometry_score += 1.0f;
         }
     }
     
-    // 2. Depth range
+    // 2. Depth range (TIGHTENED for 2D attack detection)
     if (depth_values.size() >= 5) {
         float min_depth = *std::min_element(depth_values.begin(), depth_values.end());
         float max_depth = *std::max_element(depth_values.begin(), depth_values.end());
         float depth_range = max_depth - min_depth;
+        float depth_range_mm = depth_range * 1000.0f;
         
-        if (depth_range < 0.025f) {
+        // 2D attacks have very little depth variation (<20mm)
+        // Real faces have nose-to-cheek depth variation (>30mm typically)
+        if (depth_range < 0.020f) {
+            // Extremely flat depth - 2D attack
             geometry_score += 0.0f;
-        } else if (depth_range < 0.035f) {
-            geometry_score += 0.4f;
-        } else if (depth_range > 0.15f) {
+            std::cout << "🚫 Flat depth range: " << depth_range_mm << "mm (2D attack)" << std::endl;
+        } else if (depth_range < 0.030f) {
+            // Very small range - suspicious
             geometry_score += 0.2f;
+        } else if (depth_range < 0.040f) {
+            // Small but acceptable
+            geometry_score += 0.6f;
+        } else if (depth_range > 0.15f) {
+            // Too much range - noise or multiple objects
+            geometry_score += 0.3f;
         } else {
+            // Good depth variation - natural face
             geometry_score += 1.0f;
         }
     }
@@ -1323,7 +1348,7 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
             if (has_pulse) {
                 std::cout << "   ✅ PULSE: " << detected_bpm << " BPM (confidence: " 
                           << confidence << ")" << std::endl;
-            } else {
+    } else {
                 std::cout << "   ❌ NO PULSE detected (mask suspected)" << std::endl;
                 std::cout << "   Detected BPM: " << detected_bpm << ", Confidence: " << confidence << std::endl;
             }
@@ -1567,7 +1592,7 @@ float AntiSpoofingDetector::calculate_micro_motion() {
     }
     
     if (valid_samples == 0) {
-        return 0.5f;
+    return 0.5f;
     }
     
     float avg_motion = total_motion / valid_samples;
@@ -1590,7 +1615,7 @@ float AntiSpoofingDetector::analyze_depth_breathing(const FrameBox* frame, const
     // Masks held in hand won't show this pattern
     
     if (!frame || !face.detected || frame->depth_data.empty()) {
-        return 0.5f;
+    return 0.5f;
     }
     
     if (face_history_.size() < 30) {
@@ -2065,7 +2090,7 @@ float AntiSpoofingDetector::calculate_motion_compensation_weight(const RPPGSampl
 
 float AntiSpoofingDetector::analyze_material_properties(const FrameBox* frame, const FaceROI& face) {
     if (!frame || !face.detected) {
-        return 0.5f;
+    return 0.5f;
     }
     
 #ifdef HAVE_OPENCV
@@ -2200,6 +2225,165 @@ float AntiSpoofingDetector::analyze_material_properties(const FrameBox* frame, c
 #else
     return 0.5f;
 #endif
+}
+
+// ============================================================================
+// OCCLUSION AND OBSTACLE DETECTION
+// ============================================================================
+
+bool AntiSpoofingDetector::check_eyes_visible(const std::vector<FrameBoxMetadata::Landmark>& landmarks) {
+    if (landmarks.size() < 468) {
+        return true;  // Can't check with 468 mesh, assume OK (will fail other checks)
+    }
+    
+    // Key eye landmarks from MediaPipe 468-point mesh
+    // Left eye: 33, 133, 159, 145
+    // Right eye: 362, 263, 386, 374
+    std::vector<int> left_eye_indices = {33, 133, 159, 145};
+    std::vector<int> right_eye_indices = {362, 263, 386, 374};
+    
+    // Check if eye landmarks are present and have reasonable coordinates
+    // If a landmark is at (0,0,0), it's likely not tracked (occluded)
+    int left_valid = 0, right_valid = 0;
+    
+    // Check left eye
+    for (int idx : left_eye_indices) {
+        if (idx < (int)landmarks.size()) {
+            const auto& lm = landmarks[idx];
+            // Check if landmark has non-zero coordinates (tracked)
+            if (lm.x > 1.0f && lm.y > 1.0f) {
+                left_valid++;
+            }
+        }
+    }
+    
+    // Check right eye
+    for (int idx : right_eye_indices) {
+        if (idx < (int)landmarks.size()) {
+            const auto& lm = landmarks[idx];
+            if (lm.x > 1.0f && lm.y > 1.0f) {
+                right_valid++;
+            }
+        }
+    }
+    
+    // Need at least 3/4 landmarks valid per eye
+    bool left_ok = (left_valid >= 3);
+    bool right_ok = (right_valid >= 3);
+    
+    if (!left_ok || !right_ok) {
+        std::cout << "👁️  Eyes not fully visible: L=" << left_valid << "/4, R=" 
+                  << right_valid << "/4" << std::endl;
+    }
+    
+    return left_ok && right_ok;
+}
+
+float AntiSpoofingDetector::analyze_occlusion(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected) {
+        return 0.5f;
+    }
+    
+    float occlusion_score = 1.0f;  // Start with no occlusion
+    
+    // 1. Check eye visibility using 468 landmarks
+    if (!frame->metadata.landmarks.empty()) {
+        bool eyes_visible = check_eyes_visible(frame->metadata.landmarks);
+        if (!eyes_visible) {
+            occlusion_score *= 0.2f;  // Heavy penalty - eyes critical for liveness
+            std::cout << "⚠️  EYES OCCLUDED - possible mask or obstruction" << std::endl;
+        }
+    }
+    
+    // 2. Check overall landmark presence (geometric check)
+    if (frame->metadata.landmarks.size() >= 468) {
+        int total_landmarks = 0;
+        int valid_landmarks = 0;
+        
+        // Sample key landmarks across the face
+        std::vector<int> key_indices = {
+            // Forehead: 10, 338, 297, 332
+            10, 338, 297, 332,
+            // Eyes: 33, 133, 362, 263
+            33, 133, 362, 263,
+            // Nose: 1, 4, 5, 6
+            1, 4, 5, 6,
+            // Mouth: 61, 291, 0, 17
+            61, 291, 0, 17,
+            // Cheeks: 234, 454
+            234, 454,
+            // Chin: 152
+            152
+        };
+        
+        for (int idx : key_indices) {
+            if (idx < (int)frame->metadata.landmarks.size()) {
+                total_landmarks++;
+                const auto& lm = frame->metadata.landmarks[idx];
+                // Check if landmark has valid coordinates (not (0,0))
+                if (lm.x > 1.0f && lm.y > 1.0f) {
+                    valid_landmarks++;
+                }
+            }
+        }
+        
+        float validity_ratio = (total_landmarks > 0) ? 
+            (float)valid_landmarks / total_landmarks : 1.0f;
+        
+        // Need at least 80% of key landmarks valid
+        if (validity_ratio < 0.8f) {
+            occlusion_score *= (0.5f + validity_ratio * 0.5f);
+            std::cout << "⚠️  Face partially occluded: " << (int)(validity_ratio * 100) 
+                      << "% valid landmarks" << std::endl;
+        }
+    }
+    
+    // 3. Check for depth holes (missing depth data in face region)
+    // This can indicate obstacles or partial faces
+    if (!frame->depth_data.empty()) {
+        int face_center_x = face.bbox.x + face.bbox.width / 2;
+        int face_center_y = face.bbox.y + face.bbox.height / 2;
+        
+        // Map to depth coordinates
+        int depth_x = face_center_x * frame->depth_width / std::max(1, frame->color_width);
+        int depth_y = face_center_y * frame->depth_height / std::max(1, frame->color_height);
+        
+        // Check 3x3 region around face center
+        int valid_center_pixels = 0;
+        int total_center_pixels = 0;
+        
+        for (int dy = -5; dy <= 5; dy++) {
+            for (int dx = -5; dx <= 5; dx++) {
+                int px = depth_x + dx;
+                int py = depth_y + dy;
+                if (px >= 0 && px < frame->depth_width && py >= 0 && py < frame->depth_height) {
+                    int idx = py * frame->depth_width + px;
+                    if (idx < (int)frame->depth_data.size()) {
+                        total_center_pixels++;
+                        if (frame->depth_data[idx] > 0) {
+                            valid_center_pixels++;
+                        }
+                    }
+                }
+            }
+        }
+        
+        float center_coverage = (total_center_pixels > 0) ?
+            (float)valid_center_pixels / total_center_pixels : 1.0f;
+        
+        if (center_coverage < 0.7f) {
+            occlusion_score *= 0.4f;
+            std::cout << "⚠️  Depth holes in face center: " << (int)(center_coverage * 100) 
+                      << "% coverage" << std::endl;
+        }
+    }
+    
+    static int occ_debug = 0;
+    if (++occ_debug % 30 == 0) {
+        std::cout << "🔍 Occlusion score: " << occlusion_score << std::endl;
+    }
+    
+    return occlusion_score;
 }
 
 } // namespace mdai

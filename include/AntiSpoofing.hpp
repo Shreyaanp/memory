@@ -205,6 +205,10 @@ private:
     // Material analysis for mask detection
     float analyze_material_properties(const FrameBox* frame, const FaceROI& face);
     
+    // Occlusion and obstacle detection
+    float analyze_occlusion(const FrameBox* frame, const FaceROI& face);
+    bool check_eyes_visible(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
     // Attack type detection
     std::string detect_attack_type(const FrameBox* frame, const FaceROI& face);
     

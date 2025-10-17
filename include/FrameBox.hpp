@@ -71,7 +71,10 @@ struct FrameBoxMetadata {
     // and z is relative depth
     struct Landmark {
         float x, y, z;
-        Landmark(float x_ = 0, float y_ = 0, float z_ = 0) : x(x_), y(y_), z(z_) {}
+        float visibility;  // MediaPipe visibility score (0-1, >0.5 = visible)
+        float presence;    // MediaPipe presence score (0-1)
+        Landmark(float x_ = 0, float y_ = 0, float z_ = 0, float v = 1.0f, float p = 1.0f) 
+            : x(x_), y(y_), z(z_), visibility(v), presence(p) {}
     };
     std::vector<Landmark> landmarks;
     
