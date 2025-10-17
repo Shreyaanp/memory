@@ -202,6 +202,9 @@ private:
     float calculate_micro_motion();
     float analyze_depth_breathing(const FrameBox* frame, const FaceROI& face);
     
+    // Material analysis for mask detection
+    float analyze_material_properties(const FrameBox* frame, const FaceROI& face);
+    
     // Attack type detection
     std::string detect_attack_type(const FrameBox* frame, const FaceROI& face);
     

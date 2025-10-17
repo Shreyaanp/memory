@@ -481,6 +481,9 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     frame->metadata.anti_spoofing.cross_modal_score = analyze_cross_modal_consistency(frame, face);
     frame->metadata.anti_spoofing.temporal_consistency_score = analyze_temporal_consistency(face);
     
+    // Material analysis for mask detection (edge sharpness, texture, specular, depth discontinuities)
+    float material_score = analyze_material_properties(frame, face);
+    
     // rPPG pulse detection (NEW - supplementary signal for mask detection)
     // NOTE: Made non-critical to avoid false rejects on real faces
     // Now using robust rPPG with CHROM, bandpass filtering, and motion compensation
@@ -501,15 +504,15 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     frame->metadata.anti_spoofing.cross_modal_disagreement = 
         frame->metadata.anti_spoofing.cross_modal_score < config_.min_cross_modal_score;
     
-    // Integrate rPPG pulse score (reduced to 15% since it's not yet robust)
-    // Prioritize depth (best for 2D attacks) and IR texture
-    // Reweighted: rPPG now 25% (working mask detection), temporal 15% (breathing/motion)
+    // Integrate all detection methods (weights sum to 1.0)
+    // Prioritize: depth (2D attacks), material (masks), IR texture, rPPG, temporal, cross-modal
     frame->metadata.anti_spoofing.overall_liveness_score = 
-        (frame->metadata.anti_spoofing.depth_analysis_score * 0.30f +
-         frame->metadata.anti_spoofing.ir_texture_score * 0.25f +
-         rppg_pulse_score * 0.25f +  // INCREASED: rPPG now detects no-pulse
-         frame->metadata.anti_spoofing.temporal_consistency_score * 0.15f +  // INCREASED: breathing/motion
-         frame->metadata.anti_spoofing.cross_modal_score * 0.05f);
+        (frame->metadata.anti_spoofing.depth_analysis_score * 0.25f +  // 2D attack detection
+         material_score * 0.25f +  // NEW: Mask detection (edge/texture/specular/depth)
+         frame->metadata.anti_spoofing.ir_texture_score * 0.20f +  // NIR reflectance patterns
+         rppg_pulse_score * 0.15f +  // Pulse detection (soft signal)
+         frame->metadata.anti_spoofing.temporal_consistency_score * 0.10f +  // Breathing/micro-motion/blinks
+         frame->metadata.anti_spoofing.cross_modal_score * 0.05f);  // Consistency checks
     
     frame->metadata.anti_spoofing.detected_attack_type = detect_attack_type(frame, face);
     
@@ -524,22 +527,23 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
     float xmodal_score = frame->metadata.anti_spoofing.cross_modal_score;
     float temporal_score = frame->metadata.anti_spoofing.temporal_consistency_score;
     
-    // Weighted fusion (sum = 1.0) - includes rPPG as supplementary signal
+    // Weighted fusion (sum = 1.0) - includes material and rPPG
     float fused_score = 
-        depth_score * 0.35f +       // Depth is most reliable for 2D attacks
-        ir_score * 0.30f +          // IR texture
-        rppg_pulse_score * 0.15f +  // rPPG pulse detection (supplementary, not robust yet)
+        depth_score * 0.25f +       // Depth for 2D attacks
+        material_score * 0.25f +    // NEW: Material properties for mask detection
+        ir_score * 0.20f +          // IR texture
+        rppg_pulse_score * 0.15f +  // rPPG pulse (supplementary)
         temporal_score * 0.10f +    // Temporal consistency
-        xmodal_score * 0.10f;       // Cross-modal validation
+        xmodal_score * 0.05f;       // Cross-modal validation
     
-    // Minimum guardrail: no single component can be too low
+    // Minimum guardrail: no single critical component can be too low
     // NOTE: Exclude rPPG from guardrail since it's not robust yet
-    float min_component = std::min({depth_score, ir_score, temporal_score, xmodal_score});
+    float min_component = std::min({depth_score, material_score, ir_score, temporal_score});
     
     // Pass criteria: good fused score AND no single component is critically low
     bool passes_fusion = (fused_score >= config_.min_overall_liveness);
-    // PHASE 1 FIX #2: Raised guardrail from 0.25 to 0.5 (much stricter)
-    bool passes_guardrail = (min_component >= 0.5f);  // At least 50% on all components - no weak links
+    // Guardrail: Lowered to 0.4 to accommodate new material analysis (can be strict)
+    bool passes_guardrail = (min_component >= 0.4f);  // At least 40% on all critical components
     bool passes_confidence = frame->metadata.anti_spoofing.confidence >= config_.min_confidence;
     
     frame->metadata.anti_spoofing.is_live = passes_fusion && passes_guardrail && passes_confidence;
@@ -578,22 +582,61 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
     }
 
 #ifdef HAVE_OPENCV
-    // FIXED: Use proper projection instead of simple scaling (Fix #3)
-    // TODO: In Producer.cpp, use rs2::align to get depth aligned to color
-    // For now, improved scaling with bounds checking
-    cv::Rect depth_roi;
-    if (frame->color_width > 0 && frame->color_height > 0) {
-        float scale_x = static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width);
-        float scale_y = static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height);
-        
-        depth_roi.x = static_cast<int>(face.bbox.x * scale_x);
-        depth_roi.y = static_cast<int>(face.bbox.y * scale_y);
-        depth_roi.width = static_cast<int>(face.bbox.width * scale_x);
-        depth_roi.height = static_cast<int>(face.bbox.height * scale_y);
-    } else {
-        depth_roi = face.bbox;
+    // FIXED: Use proper projection from color to depth using intrinsics
+    // Sample depth at median Z to get reference depth
+    float median_depth_for_roi = 0.5f;  // Default 50cm if can't determine
+    
+    // Quick sample center pixel to get approximate depth
+    int center_x = face.bbox.x + face.bbox.width / 2;
+    int center_y = face.bbox.y + face.bbox.height / 2;
+    
+    // Use scale-based approximation for initial center sampling
+    int approx_depth_x = center_x * frame->depth_width / std::max(1, frame->color_width);
+    int approx_depth_y = center_y * frame->depth_height / std::max(1, frame->color_height);
+    int center_idx = approx_depth_y * frame->depth_width + approx_depth_x;
+    if (center_idx >= 0 && center_idx < (int)frame->depth_data.size() && frame->depth_data[center_idx] > 0) {
+        median_depth_for_roi = frame->depth_data[center_idx] * frame->depth_scale;
     }
     
+    // Project color ROI corners to depth space using proper projection
+    // Corners: TL, TR, BL, BR
+    std::vector<cv::Point2i> color_corners = {
+        {face.bbox.x, face.bbox.y},
+        {face.bbox.x + face.bbox.width, face.bbox.y},
+        {face.bbox.x, face.bbox.y + face.bbox.height},
+        {face.bbox.x + face.bbox.width, face.bbox.y + face.bbox.height}
+    };
+    
+    std::vector<cv::Point2i> depth_corners;
+    for (const auto& color_pt : color_corners) {
+        // Deproject from color to 3D point
+        float color_pixel[2] = {static_cast<float>(color_pt.x), static_cast<float>(color_pt.y)};
+        float point3d[3];
+        rs2_deproject_pixel_to_point(point3d, &frame->color_intrinsics, color_pixel, median_depth_for_roi);
+        
+        // Transform from color space to depth space if needed
+        // (For D435i, they're typically close but may have slight offset)
+        // For now, assume aligned sensors (can add extrinsics later)
+        
+        // Project back to depth pixel
+        float depth_pixel[2];
+        rs2_project_point_to_pixel(depth_pixel, &frame->depth_intrinsics, point3d);
+        
+        depth_corners.push_back(cv::Point2i(
+            static_cast<int>(depth_pixel[0]),
+            static_cast<int>(depth_pixel[1])
+        ));
+    }
+    
+    // Calculate bounding box from projected corners
+    int min_x = std::min({depth_corners[0].x, depth_corners[1].x, depth_corners[2].x, depth_corners[3].x});
+    int max_x = std::max({depth_corners[0].x, depth_corners[1].x, depth_corners[2].x, depth_corners[3].x});
+    int min_y = std::min({depth_corners[0].y, depth_corners[1].y, depth_corners[2].y, depth_corners[3].y});
+    int max_y = std::max({depth_corners[0].y, depth_corners[1].y, depth_corners[2].y, depth_corners[3].y});
+    
+    cv::Rect depth_roi(min_x, min_y, max_x - min_x, max_y - min_y);
+    
+    // Bounds check
     depth_roi.x = std::max(0, std::min(depth_roi.x, frame->depth_width - 1));
     depth_roi.y = std::max(0, std::min(depth_roi.y, frame->depth_height - 1));
     depth_roi.width = std::min(depth_roi.width, frame->depth_width - depth_roi.x);
@@ -1210,8 +1253,6 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
     // DISABLED: Bandpass filter too aggressive - removes pulse signal
     // Moving average implementation reduces variance to zero
     // Detrending already removes DC drift, so skip bandpass for now
-    // TODO: Implement proper IIR butterworth bandpass filter
-    // apply_bandpass_filter(chrom_signal, estimated_fps, 0.7f, 2.5f);
     
     // Detect pulse using improved autocorrelation
     float detected_bpm = 0.0f;
@@ -1275,15 +1316,17 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
         return 0.3f + (confidence * 0.3f);  // 0.3-0.6
     } else {
         // No pulse detected
-        // After 7+ seconds of data, this is VERY suspicious (mask/photo)
+        // DISABLED: Hard gate too aggressive - rejects real faces
+        // rPPG needs more tuning before it can be used as hard rejection criterion
+        // For now, use as soft signal only
         if (rppg_samples_.size() >= RPPG_MIN_WINDOW + 60) {  // 7 seconds = 210 samples
-            std::cout << "⚠️  NO PULSE after " << rppg_samples_.size() << " samples - REJECTING" << std::endl;
-            return 0.0f;  // HARD REJECT - no pulse = mask/photo
+            std::cout << "⚠️  NO PULSE after " << rppg_samples_.size() << " samples (soft penalty)" << std::endl;
+            return 0.1f;  // Low score but not hard reject
         }
         // Still collecting data
         std::cout << "⏳ Collecting rPPG data: " << rppg_samples_.size() << "/" 
                   << (RPPG_MIN_WINDOW + 60) << std::endl;
-        return 0.2f;  // Still collecting, be lenient
+        return 0.3f;  // Still collecting, neutral
     }
     
 #else
@@ -1990,6 +2033,149 @@ bool AntiSpoofingDetector::detect_pulse_fft(const std::vector<float>& signal, fl
 float AntiSpoofingDetector::calculate_motion_compensation_weight(const RPPGSample& sample) {
     // Weight based on motion score (1.0 = stable, 0.0 = too much motion)
     return sample.motion_score;
+}
+
+// ============================================================================
+// MATERIAL ANALYSIS FOR MASK DETECTION
+// ============================================================================
+
+float AntiSpoofingDetector::analyze_material_properties(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected) {
+        return 0.5f;
+    }
+    
+#ifdef HAVE_OPENCV
+    cv::Mat color_mat = frame->get_color_mat();
+    if (color_mat.empty() || frame->depth_data.empty()) {
+        return 0.5f;
+    }
+    
+    cv::Rect roi = face.bbox & cv::Rect(0, 0, color_mat.cols, color_mat.rows);
+    if (roi.width < 20 || roi.height < 20) {
+        return 0.5f;
+    }
+    
+    float material_score = 0.0f;
+    int checks = 0;
+    
+    // 1. Edge sharpness analysis - Plastic masks have unnaturally sharp edges
+    cv::Mat gray, edges;
+    cv::cvtColor(color_mat(roi), gray, cv::COLOR_BGR2GRAY);
+    cv::Canny(gray, edges, 100, 200);
+    
+    int strong_edges = cv::countNonZero(edges);
+    float edge_density = strong_edges / (float)(roi.width * roi.height);
+    
+    // Real skin: moderate edges (wrinkles, features) ~0.05-0.15
+    // Plastic: too sharp or too smooth <0.03 or >0.20
+    if (edge_density > 0.05f && edge_density < 0.18f) {
+        material_score += 1.0f;  // Natural edge density
+    } else {
+        material_score += 0.3f;  // Suspicious
+    }
+    checks++;
+    
+    // 2. Texture uniformity - Skin has pores/texture, plastic is uniform
+    cv::Mat laplacian;
+    cv::Laplacian(gray, laplacian, CV_64F);
+    cv::Scalar lap_mean, lap_std;
+    cv::meanStdDev(laplacian, lap_mean, lap_std);
+    
+    float texture_variance = lap_std[0];
+    
+    // Real skin: moderate variance (pores at distance) > 4
+    // Plastic: low variance (too smooth) < 2
+    // Note: Values much lower than expected due to camera distance/resolution
+    if (texture_variance > 4.0f) {
+        material_score += 1.0f;  // Good texture (natural)
+    } else if (texture_variance < 2.0f) {
+        material_score += 0.2f;  // Too uniform - suspicious (mask)
+    } else {
+        material_score += 0.7f;  // Borderline
+    }
+    checks++;
+    
+    // 3. Specular highlights - Plastic is more reflective/glossy
+    cv::Mat hsv;
+    cv::cvtColor(color_mat(roi), hsv, cv::COLOR_BGR2HSV);
+    std::vector<cv::Mat> hsv_channels;
+    cv::split(hsv, hsv_channels);
+    cv::Mat value_channel = hsv_channels[2];  // V channel
+    
+    // Count very bright pixels (specular highlights)
+    int highlight_pixels = cv::countNonZero(value_channel > 240);
+    float highlight_ratio = highlight_pixels / (float)(roi.width * roi.height);
+    
+    // Real skin: few highlights <0.02
+    // Plastic: more highlights >0.05
+    if (highlight_ratio < 0.03f) {
+        material_score += 1.0f;  // Matte surface (skin)
+    } else if (highlight_ratio > 0.08f) {
+        material_score += 0.2f;  // Too glossy (plastic)
+    } else {
+        material_score += 0.6f;  // Borderline
+    }
+    checks++;
+    
+    // 4. Depth edge discontinuities - Mask edges show sudden depth jumps
+    // Sample depth around face perimeter
+    std::vector<uint16_t> perimeter_depths;
+    int depth_w = frame->depth_width;
+    int depth_h = frame->depth_height;
+    
+    // Scale ROI to depth coordinates
+    int dx = roi.x * depth_w / color_mat.cols;
+    int dy = roi.y * depth_h / color_mat.rows;
+    int dw = roi.width * depth_w / color_mat.cols;
+    int dh = roi.height * depth_h / color_mat.rows;
+    
+    // Sample top, bottom, left, right edges
+    for (int i = 0; i < dw; i += 5) {
+        // Top edge
+        int idx_top = (dy) * depth_w + (dx + i);
+        if (idx_top < (int)frame->depth_data.size() && frame->depth_data[idx_top] > 0) {
+            perimeter_depths.push_back(frame->depth_data[idx_top]);
+        }
+        // Bottom edge
+        int idx_bot = (dy + dh - 1) * depth_w + (dx + i);
+        if (idx_bot < (int)frame->depth_data.size() && frame->depth_data[idx_bot] > 0) {
+            perimeter_depths.push_back(frame->depth_data[idx_bot]);
+        }
+    }
+    
+    if (perimeter_depths.size() > 10) {
+        // Calculate variance of perimeter depths
+        float mean_depth = std::accumulate(perimeter_depths.begin(), perimeter_depths.end(), 0.0f) / perimeter_depths.size();
+        float variance = 0.0f;
+        for (uint16_t d : perimeter_depths) {
+            float diff = d - mean_depth;
+            variance += diff * diff;
+        }
+        variance /= perimeter_depths.size();
+        float stddev_mm = std::sqrt(variance) * frame->depth_scale * 1000.0f;
+        
+        // Real face: smooth depth transitions <20mm
+        // Mask edge: sharp discontinuities >30mm
+        if (stddev_mm < 25.0f) {
+            material_score += 1.0f;  // Smooth (natural)
+        } else {
+            material_score += 0.3f;  // Sharp edges (mask)
+        }
+        checks++;
+    }
+    
+    float final_score = (checks > 0) ? (material_score / checks) : 0.5f;
+    
+    std::cout << "🎭 Material analysis: edge=" << edge_density 
+              << ", texture=" << texture_variance 
+              << ", specular=" << highlight_ratio 
+              << ", score=" << final_score << std::endl;
+    
+    return final_score;
+    
+#else
+    return 0.5f;
+#endif
 }
 
 } // namespace mdai
