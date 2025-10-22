@@ -473,6 +473,12 @@ bool AntiSpoofingDetector::process_frame(FrameBox* frame) {
         face_history_.pop_front();
     }
     
+    // CRITICAL FIX: Populate frame_history_ for rPPG and depth-breathing analysis
+    frame_history_.push_back(frame);
+    if (frame_history_.size() > TEMPORAL_WINDOW) {
+        frame_history_.pop_front();
+    }
+    
     frame->metadata.anti_spoofing.depth_analysis_score = analyze_depth_geometry(frame, face);
     
     // IR texture analysis now includes stereo consistency check
@@ -667,7 +673,7 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
     for (int y = depth_roi.y; y < depth_roi.y + depth_roi.height; y++) {
         for (int x = depth_roi.x; x < depth_roi.x + depth_roi.width; x++) {
             int idx = y * frame->depth_width + x;
-            if (idx < frame->depth_data.size() && frame->depth_data[idx] > 0) {
+            if (idx < static_cast<int>(frame->depth_data.size()) && frame->depth_data[idx] > 0) {
                 valid_pixels++;
             }
         }
@@ -821,9 +827,9 @@ float AntiSpoofingDetector::analyze_depth_geometry(const FrameBox* frame, const 
                 int right_idx = center_idx + 1;
                 int down_idx = center_idx + frame->depth_width;
                 
-                if (center_idx < frame->depth_data.size() && 
-                    right_idx < frame->depth_data.size() && 
-                    down_idx < frame->depth_data.size()) {
+                if (center_idx < static_cast<int>(frame->depth_data.size()) && 
+                    right_idx < static_cast<int>(frame->depth_data.size()) && 
+                    down_idx < static_cast<int>(frame->depth_data.size())) {
                     
                     uint16_t center_depth = frame->depth_data[center_idx];
                     uint16_t right_depth = frame->depth_data[right_idx];
@@ -1386,7 +1392,7 @@ float AntiSpoofingDetector::analyze_rppg_pulse(const FrameBox* frame, const Face
 float AntiSpoofingDetector::analyze_temporal_consistency(const FaceROI& face) {
     // Enhanced temporal analysis with micro-motion and breathing
     if (!face.detected || face_history_.size() < 3) {
-        return 0.0f;  // Insufficient data
+        return 0.5f;  // FIXED: Return neutral score during warmup to avoid false rejects
     }
     
     float temporal_score = 0.0f;
@@ -1668,7 +1674,7 @@ float AntiSpoofingDetector::analyze_depth_breathing(const FrameBox* frame, const
     }
 }
 
-std::string AntiSpoofingDetector::detect_attack_type(const FrameBox* frame, const FaceROI& face) {
+std::string AntiSpoofingDetector::detect_attack_type(const FrameBox* frame, [[maybe_unused]] const FaceROI& face) {
     if (!frame) {
         return "unknown";
     }
@@ -1712,7 +1718,7 @@ std::string AntiSpoofingDetector::generate_rejection_reason(const FrameBox* fram
     return result;
 }
 
-float AntiSpoofingDetector::calculate_confidence(const FrameBox* frame, const FaceROI& face) {
+float AntiSpoofingDetector::calculate_confidence(const FrameBox* frame, [[maybe_unused]] const FaceROI& face) {
     if (!frame) {
         return 0.0f;
     }
@@ -1838,13 +1844,13 @@ AdaptiveThresholdManager::AdaptiveThresholdManager() {
 
 AntiSpoofingConfig AdaptiveThresholdManager::get_adaptive_config(
     const AntiSpoofingConfig& base_config,
-    const std::map<std::string, float>& environmental_factors) {
+    [[maybe_unused]] const std::map<std::string, float>& environmental_factors) {
     
     AntiSpoofingConfig adapted_config = base_config;
     return adapted_config;
 }
 
-void AdaptiveThresholdManager::learn_from_result(const FrameBox* frame, bool success) {
+void AdaptiveThresholdManager::learn_from_result([[maybe_unused]] const FrameBox* frame, bool success) {
     learning_stats_.total_samples++;
     if (success) {
         learning_stats_.successful_samples++;
@@ -1969,7 +1975,7 @@ void AntiSpoofingDetector::apply_bandpass_filter(std::vector<float>& signal, flo
 }
 
 float AntiSpoofingDetector::calculate_snr_at_frequency(const std::vector<float>& signal, 
-                                                        float fps, float target_hz) {
+                                                        [[maybe_unused]] float fps, [[maybe_unused]] float target_hz) {
     // Simplified SNR calculation
     // In production, use FFT to calculate power at target frequency vs noise floor
     
