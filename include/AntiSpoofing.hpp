@@ -215,6 +215,103 @@ private:
     // Helper methods
     std::string generate_rejection_reason(const FrameBox* frame);
     float calculate_confidence(const FrameBox* frame, const FaceROI& face);
+    
+    // IMPROVED: Real blink detection using Eye Aspect Ratio
+    float detect_blink_ear(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
+    // IMPROVED: Comprehensive facial landmark analysis
+    float analyze_facial_landmarks(const FrameBox* frame, const FaceROI& face);
+    float analyze_3d_facial_structure(const FrameBox* frame, const FaceROI& face);
+    
+    // Detailed landmark analysis functions
+    float analyze_eye_region(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_single_eye(const std::vector<FrameBoxMetadata::Landmark>& landmarks, const std::vector<int>& eye_indices);
+    float calculate_eye_aspect_ratio(const std::vector<FrameBoxMetadata::Landmark>& landmarks, const std::vector<int>& eye_indices);
+    float analyze_mouth_region(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_nose_region(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_facial_symmetry(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_landmark_consistency(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
+    // 3D structure validation functions
+    float validate_landmark_depth_consistency(const FrameBox* frame);
+    float analyze_facial_curvature(const FrameBox* frame);
+    float validate_eye_socket_depth(const FrameBox* frame);
+    float validate_nose_bridge_structure(const FrameBox* frame);
+    
+    // Helper functions
+    float get_depth_at_landmark(const FrameBox* frame, const FrameBoxMetadata::Landmark& landmark);
+    float get_surrounding_depth(const FrameBox* frame, const FrameBoxMetadata::Landmark& landmark);
+    
+    // Symmetry analysis functions
+    float check_eye_symmetry(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float check_mouth_symmetry(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float check_overall_symmetry(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
+    // IMPROVED: Enhanced eye analysis functions
+    float analyze_iris_detection(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_eye_openness(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_eye_symmetry(const std::vector<FrameBoxMetadata::Landmark>& landmarks,
+                              const std::vector<int>& left_indices,
+                              const std::vector<int>& right_indices);
+    float analyze_eye_iris_region(const std::vector<FrameBoxMetadata::Landmark>& landmarks,
+                                 const std::vector<int>& eye_center_indices);
+    float calculate_eye_aspect_ratio_detailed(const std::vector<FrameBoxMetadata::Landmark>& landmarks,
+                                             const std::vector<int>& eye_indices);
+    
+    // CRITICAL: Depth-landmark fusion validation functions
+    float validate_depth_landmark_fusion(const FrameBox* frame, const FaceROI& face);
+    float validate_landmark_depth_correspondence(const FrameBox* frame, 
+                                               const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float validate_depth_landmark_consistency(const FrameBox* frame,
+                                             const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float detect_template_landmark_failures(const FrameBox* frame,
+                                          const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float validate_3d_landmark_structure(const FrameBox* frame,
+                                       const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
+    // Helper functions for depth-landmark fusion
+    float analyze_landmark_distribution(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_depth_landmark_mismatch(const FrameBox* frame,
+                                         const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float analyze_template_symmetry(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float validate_eye_socket_3d_structure(const FrameBox* frame,
+                                          const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float validate_nose_bridge_3d_structure(const FrameBox* frame,
+                                           const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float validate_facial_curvature_3d(const FrameBox* frame,
+                                       const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
+    // CRITICAL: Comprehensive temporal analysis functions
+    float analyze_micro_motion_temporal(const std::vector<FrameBox*>& frames);
+    float analyze_depth_breathing_temporal(const std::vector<FrameBox*>& frames);
+    float analyze_blink_patterns_temporal(const std::vector<FrameBox*>& frames);
+    float analyze_landmark_temporal_consistency(const std::vector<FrameBox*>& frames);
+    float validate_realsense_data_quality(const FrameBox* frame);
+    float analyze_depth_temporal_consistency(const std::vector<FrameBox*>& frames);
+    
+    // Helper functions for temporal analysis
+    float analyze_breathing_pattern_fft(const std::vector<float>& depth_values);
+    float analyze_blink_frequency(const std::vector<float>& ear_values);
+    
+    // CRITICAL: Enhanced face obstacle detection functions
+    float detect_eye_occlusion(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float detect_face_blocking_objects(const FrameBox* frame, const FaceROI& face);
+    float analyze_landmark_occlusion(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    float detect_depth_obstacles(const FrameBox* frame, const FaceROI& face);
+    float analyze_face_shape_anomalies(const FrameBox* frame, const FaceROI& face);
+    
+    // Helper functions for comprehensive obstacle detection
+    float analyze_eye_region_occlusion(const std::vector<FrameBoxMetadata::Landmark>& landmarks, 
+                                      const std::vector<int>& eye_indices);
+    float analyze_face_depth_consistency(const FrameBox* frame, const FaceROI& face);
+    float detect_color_anomalies(const FrameBox* frame, const FaceROI& face);
+    float detect_ir_texture_anomalies(const FrameBox* frame, const FaceROI& face);
+    float analyze_facial_region_occlusion(const std::vector<FrameBoxMetadata::Landmark>& landmarks, 
+                                         const std::vector<int>& region_indices);
+    float analyze_depth_discontinuities(const FrameBox* frame, const FaceROI& face);
+    float analyze_depth_patterns(const FrameBox* frame, const FaceROI& face);
+    float detect_closer_objects(const FrameBox* frame, const FaceROI& face);
+    float analyze_landmark_distribution_anomalies(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
 };
 
 /**

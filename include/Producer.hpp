@@ -29,29 +29,29 @@ struct CameraConfig {
     int ir_height = 480;
     int ir_fps = 30;
     
-    // Sensor options
-    int internal_queue_size = 2;       // Small queue for low latency
-    int emitter_enabled = 1;           // 0=off, 1=on, 2=auto, 3=LED
-    float laser_power = 150.0f;        // mW
+    // Sensor options - OPTIMIZED for spoof detection
+    int internal_queue_size = 1;       // Lower latency for real-time analysis
+    int emitter_enabled = 1;           // Always on for consistent IR material analysis
+    float laser_power = 200.0f;        // Higher power for better depth and IR quality
     
-    // Color sensor options
-    bool auto_exposure = true;
-    float manual_exposure = 16000.0f;  // microseconds (if auto_exposure=false)
-    float manual_gain = 64.0f;         // Gain value (if auto_exposure=false)
+    // Color sensor options - FIXED for consistent spoof detection
+    bool auto_exposure = false;           // Fixed exposure for consistent IR analysis
+    float manual_exposure = 8000.0f;      // Shorter exposure for better IR material analysis
+    float manual_gain = 32.0f;            // Lower gain for better quality and less noise
     
-    // Post-processing filters
-    bool enable_spatial_filter = false;
+    // Post-processing filters - ENABLED for spoof detection
+    bool enable_spatial_filter = true;     // Smooth depth surfaces for material analysis
     float spatial_alpha = 0.5f;
     float spatial_delta = 20.0f;
     
-    bool enable_temporal_filter = false;
+    bool enable_temporal_filter = true;    // Consistent depth over time for liveness
     float temporal_alpha = 0.4f;
     float temporal_delta = 20.0f;
     
-    bool enable_hole_filling = false;
+    bool enable_hole_filling = true;       // Fill missing depth data for complete analysis
     
-    // Alignment
-    bool align_to_color = false;  // Align depth frames to color
+    // Alignment - ENABLED for accurate multi-modal fusion
+    bool align_to_color = true;   // Align depth frames to color for accurate face analysis
     
     // Device selection
     std::string device_serial = "";  // Empty = use any device

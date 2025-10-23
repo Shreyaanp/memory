@@ -25,7 +25,7 @@ public:
         config.min_detection_confidence = 0.5f;
         config.min_tracking_confidence = 0.5f;
         config.min_presence_confidence = 0.5f;
-        config.use_gpu = true;  // Enable GPU acceleration
+        config.use_gpu = false;  // Disable GPU to avoid EGL issues
         
         detector_ = std::make_unique<FaceMeshDetector>(config);
         initialized_ = detector_->IsInitialized();

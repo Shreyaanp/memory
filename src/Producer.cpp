@@ -81,11 +81,29 @@ bool Producer::start() {
         auto callback = [this](const rs2::frame& frame) {
             try {
                 if (rs2::frameset fs = frame.as<rs2::frameset>()) {
-                    // Align/process frames if configured (ensure depth/color share same space)
+                    // Apply post-processing filters for better data quality
                     rs2::frameset processed = fs;
-                    if (config_.align_to_color && aligner_) {
-                        processed = aligner_->process(fs);
+                    
+                    // Apply spatial filter for smooth depth surfaces
+                    if (config_.enable_spatial_filter) {
+                        processed = spatial_filter_.process(processed);
                     }
+                    
+                    // Apply temporal filter for consistent depth over time
+                    if (config_.enable_temporal_filter) {
+                        processed = temporal_filter_.process(processed);
+                    }
+                    
+                    // Apply hole filling for complete depth data
+                    if (config_.enable_hole_filling) {
+                        processed = hole_filling_filter_.process(processed);
+                    }
+                    
+                    // Align/process frames if configured (ensure depth/color share same space)
+                    if (config_.align_to_color && aligner_) {
+                        processed = aligner_->process(processed);
+                    }
+                    
                     // Process frameset and extract raw data (no rs2::frame references!)
                     FrameBox framebox = process_frameset(processed);
                     
