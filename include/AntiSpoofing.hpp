@@ -312,6 +312,23 @@ private:
     float analyze_depth_patterns(const FrameBox* frame, const FaceROI& face);
     float detect_closer_objects(const FrameBox* frame, const FaceROI& face);
     float analyze_landmark_distribution_anomalies(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
+    // MATERIAL-BASED SPOOF DETECTION (NEW APPROACH)
+    // Core material analysis functions
+    float analyze_ir_material_properties(const FrameBox* frame, const FaceROI& face);
+    float analyze_depth_material_properties(const FrameBox* frame, const FaceROI& face);
+    float analyze_thermal_patterns(const FrameBox* frame, const FaceROI& face);
+    float analyze_stereo_ir_material(const FrameBox* frame, const FaceROI& face);
+    float analyze_depth_ir_correlation(const FrameBox* frame, const FaceROI& face);
+    float analyze_temporal_material_properties(const FrameBox* frame, const FaceROI& face);
+    
+    // Material analysis helper functions
+    float analyze_ir_reflectance_patterns(const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& face_roi);
+    float analyze_depth_behavior_patterns(const cv::Mat& depth, const cv::Rect& face_roi);
+    float analyze_thermal_gradients(const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& face_roi);
+    float analyze_material_consistency(const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& face_roi);
+    float analyze_material_correlation(const cv::Mat& depth, const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& face_roi);
+    float analyze_material_temporal_consistency(const std::vector<FrameBox*>& recent_frames, const FrameBox* current_frame, const FaceROI& face);
 };
 
 /**

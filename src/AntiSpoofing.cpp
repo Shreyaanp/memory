@@ -2479,12 +2479,22 @@ float AntiSpoofingDetector::analyze_material_properties(const FrameBox* frame, c
         checks++;
     }
     
-    float final_score = (checks > 0) ? (material_score / checks) : 0.5f;
+    // 5. NEW: IR material analysis for 3D masks and silicone masks
+    float ir_material_score = analyze_ir_material_properties(frame, face);
+    
+    // Combine RGB material analysis with IR material analysis
+    float rgb_material_score = (checks > 0) ? (material_score / checks) : 0.5f;
+    
+    // Weighted combination: RGB analysis (60%) + IR analysis (40%)
+    // IR analysis is critical for 3D masks and silicone masks that fool RGB analysis
+    float final_score = (rgb_material_score * 0.6f + ir_material_score * 0.4f);
     
     std::cout << "🎭 Material analysis: edge=" << edge_density 
               << ", texture=" << texture_variance 
               << ", specular=" << highlight_ratio 
-              << ", score=" << final_score << std::endl;
+              << ", rgb_score=" << rgb_material_score
+              << ", ir_score=" << ir_material_score
+              << ", final=" << final_score << std::endl;
     
     return final_score;
     
@@ -4699,6 +4709,277 @@ float AntiSpoofingDetector::analyze_landmark_distribution_anomalies(const std::v
     }
     
     return distribution_score;
+}
+
+// ============================================================================
+// MATERIAL-BASED SPOOF DETECTION (NEW APPROACH)
+// ============================================================================
+
+// Core material analysis function - IR material properties
+float AntiSpoofingDetector::analyze_ir_material_properties(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || frame->ir_left_data.empty() || frame->ir_right_data.empty()) {
+        return 0.5f;  // Can't analyze without IR data
+    }
+    
+    // Convert IR data to OpenCV matrices
+    cv::Mat ir_left = cv::Mat(frame->ir_height, frame->ir_width, CV_8UC1, 
+                              const_cast<uint8_t*>(frame->ir_left_data.data()));
+    cv::Mat ir_right = cv::Mat(frame->ir_height, frame->ir_width, CV_8UC1, 
+                               const_cast<uint8_t*>(frame->ir_right_data.data()));
+    
+    // Map face ROI to IR coordinates
+    cv::Rect ir_roi;
+    if (frame->color_width > 0 && frame->color_height > 0) {
+        float scale_x = static_cast<float>(frame->ir_width) / static_cast<float>(frame->color_width);
+        float scale_y = static_cast<float>(frame->ir_height) / static_cast<float>(frame->color_height);
+        
+        ir_roi.x = static_cast<int>(face.bbox.x * scale_x);
+        ir_roi.y = static_cast<int>(face.bbox.y * scale_y);
+        ir_roi.width = static_cast<int>(face.bbox.width * scale_x);
+        ir_roi.height = static_cast<int>(face.bbox.height * scale_y);
+        
+        // Ensure ROI is within bounds
+        ir_roi &= cv::Rect(0, 0, frame->ir_width, frame->ir_height);
+    } else {
+        return 0.5f;  // Can't map coordinates
+    }
+    
+    if (ir_roi.width < 20 || ir_roi.height < 20) {
+        return 0.5f;  // ROI too small
+    }
+    
+    // Extract face regions
+    cv::Mat face_ir_left = ir_left(ir_roi);
+    cv::Mat face_ir_right = ir_right(ir_roi);
+    
+    // Analyze IR reflectance patterns
+    float reflectance_score = analyze_ir_reflectance_patterns(face_ir_left, face_ir_right, ir_roi);
+    
+    // Analyze thermal gradients
+    float thermal_score = analyze_thermal_gradients(face_ir_left, face_ir_right, ir_roi);
+    
+    // Analyze material consistency between stereo IR
+    float consistency_score = analyze_material_consistency(face_ir_left, face_ir_right, ir_roi);
+    
+    // Combine scores (material analysis is critical)
+    float material_score = (reflectance_score * 0.4f + thermal_score * 0.3f + consistency_score * 0.3f);
+    
+    // Debug output
+    static int material_debug = 0;
+    if (++material_debug % 30 == 0) {
+        std::cout << "🔍 IR Material Analysis: reflectance=" << reflectance_score 
+                  << ", thermal=" << thermal_score 
+                  << ", consistency=" << consistency_score 
+                  << ", overall=" << material_score << std::endl;
+    }
+    
+    return material_score;
+}
+
+// IR reflectance patterns analysis
+float AntiSpoofingDetector::analyze_ir_reflectance_patterns(const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& /* face_roi */) {
+    if (ir_left.empty() || ir_right.empty()) {
+        return 0.5f;
+    }
+    
+    float reflectance_score = 0.0f;
+    int checks = 0;
+    
+    // 1. Analyze IR standard deviation (material texture)
+    cv::Scalar mean_left, std_left, mean_right, std_right;
+    cv::meanStdDev(ir_left, mean_left, std_left);
+    cv::meanStdDev(ir_right, mean_right, std_right);
+    
+    float std_left_val = static_cast<float>(std_left[0]);
+    float std_right_val = static_cast<float>(std_right[0]);
+    float mean_left_val = static_cast<float>(mean_left[0]);
+    float mean_right_val = static_cast<float>(mean_right[0]);
+    
+    // Real skin: moderate IR variation (15-40 std)
+    // Masks: either too uniform (<10) or too noisy (>60)
+    if (std_left_val >= 15.0f && std_left_val <= 40.0f && 
+        std_right_val >= 15.0f && std_right_val <= 40.0f) {
+        reflectance_score += 1.0f;  // Good skin texture
+    } else if (std_left_val < 10.0f || std_right_val < 10.0f) {
+        reflectance_score += 0.2f;  // Too uniform (possible mask)
+    } else if (std_left_val > 60.0f || std_right_val > 60.0f) {
+        reflectance_score += 0.3f;  // Too noisy (possible textured mask)
+    } else {
+        reflectance_score += 0.6f;  // Borderline
+    }
+    checks++;
+    
+    // 2. Analyze IR intensity patterns (material reflectance)
+    // Real skin: moderate IR intensity (40-120)
+    // Masks: different intensity patterns
+    if (mean_left_val >= 40.0f && mean_left_val <= 120.0f && 
+        mean_right_val >= 40.0f && mean_right_val <= 120.0f) {
+        reflectance_score += 1.0f;  // Normal skin reflectance
+    } else if (mean_left_val < 20.0f || mean_right_val < 20.0f) {
+        reflectance_score += 0.2f;  // Too dark (possible mask)
+    } else if (mean_left_val > 180.0f || mean_right_val > 180.0f) {
+        reflectance_score += 0.3f;  // Too bright (possible screen)
+    } else {
+        reflectance_score += 0.6f;  // Borderline
+    }
+    checks++;
+    
+    // 3. Analyze stereo IR correlation (material consistency)
+    cv::Mat hist_left, hist_right;
+    int histSize = 256;
+    float range[] = {0, 256};
+    const float* histRange[] = {range};
+    int channels[] = {0};
+    
+    cv::calcHist(&ir_left, 1, channels, cv::Mat(), hist_left, 1, &histSize, histRange);
+    cv::calcHist(&ir_right, 1, channels, cv::Mat(), hist_right, 1, &histSize, histRange);
+    cv::normalize(hist_left, hist_left, 0, 1, cv::NORM_MINMAX);
+    cv::normalize(hist_right, hist_right, 0, 1, cv::NORM_MINMAX);
+    
+    double hist_corr = cv::compareHist(hist_left, hist_right, cv::HISTCMP_CORREL);
+    
+    // Real skin: high stereo correlation (>0.8)
+    // Masks: lower correlation due to material differences
+    if (hist_corr > 0.8f) {
+        reflectance_score += 1.0f;  // High correlation (real skin)
+    } else if (hist_corr > 0.6f) {
+        reflectance_score += 0.6f;  // Moderate correlation
+    } else {
+        reflectance_score += 0.2f;  // Low correlation (possible mask)
+    }
+    checks++;
+    
+    return (checks > 0) ? reflectance_score / checks : 0.5f;
+}
+
+// Thermal gradients analysis
+float AntiSpoofingDetector::analyze_thermal_gradients(const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& /* face_roi */) {
+    if (ir_left.empty() || ir_right.empty()) {
+        return 0.5f;
+    }
+    
+    float thermal_score = 0.0f;
+    int checks = 0;
+    
+    // 1. Analyze thermal gradients using Sobel operators
+    cv::Mat grad_x_left, grad_y_left, grad_x_right, grad_y_right;
+    cv::Sobel(ir_left, grad_x_left, CV_32F, 1, 0, 3);
+    cv::Sobel(ir_left, grad_y_left, CV_32F, 0, 1, 3);
+    cv::Sobel(ir_right, grad_x_right, CV_32F, 1, 0, 3);
+    cv::Sobel(ir_right, grad_y_right, CV_32F, 0, 1, 3);
+    
+    // Calculate gradient magnitudes
+    cv::Mat mag_left, mag_right;
+    cv::magnitude(grad_x_left, grad_y_left, mag_left);
+    cv::magnitude(grad_x_right, grad_y_right, mag_right);
+    
+    cv::Scalar mean_mag_left, std_mag_left, mean_mag_right, std_mag_right;
+    cv::meanStdDev(mag_left, mean_mag_left, std_mag_left);
+    cv::meanStdDev(mag_right, mean_mag_right, std_mag_right);
+    
+    float mean_mag_left_val = static_cast<float>(mean_mag_left[0]);
+    float mean_mag_right_val = static_cast<float>(mean_mag_right[0]);
+    
+    // Real skin: moderate thermal gradients (5-25)
+    // Masks: different thermal patterns
+    if (mean_mag_left_val >= 5.0f && mean_mag_left_val <= 25.0f && 
+        mean_mag_right_val >= 5.0f && mean_mag_right_val <= 25.0f) {
+        thermal_score += 1.0f;  // Good thermal gradients
+    } else if (mean_mag_left_val < 2.0f || mean_mag_right_val < 2.0f) {
+        thermal_score += 0.2f;  // Too flat (possible mask)
+    } else if (mean_mag_left_val > 40.0f || mean_mag_right_val > 40.0f) {
+        thermal_score += 0.3f;  // Too noisy (possible textured mask)
+    } else {
+        thermal_score += 0.6f;  // Borderline
+    }
+    checks++;
+    
+    // 2. Analyze thermal symmetry between left and right
+    float thermal_symmetry = 1.0f - std::abs(mean_mag_left_val - mean_mag_right_val) / 
+                             (mean_mag_left_val + mean_mag_right_val + 1e-6f);
+    
+    if (thermal_symmetry > 0.8f) {
+        thermal_score += 1.0f;  // High symmetry (real face)
+    } else if (thermal_symmetry > 0.6f) {
+        thermal_score += 0.6f;  // Moderate symmetry
+    } else {
+        thermal_score += 0.2f;  // Low symmetry (possible mask)
+    }
+    checks++;
+    
+    return (checks > 0) ? thermal_score / checks : 0.5f;
+}
+
+// Material consistency analysis
+float AntiSpoofingDetector::analyze_material_consistency(const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& /* face_roi */) {
+    if (ir_left.empty() || ir_right.empty()) {
+        return 0.5f;
+    }
+    
+    float consistency_score = 0.0f;
+    int checks = 0;
+    
+    // 1. Analyze local binary patterns (LBP) for material texture
+    cv::Mat lbp_left = cv::Mat::zeros(ir_left.size(), CV_8UC1);
+    cv::Mat lbp_right = cv::Mat::zeros(ir_right.size(), CV_8UC1);
+    
+    // Calculate LBP for both images
+    for (int y = 1; y < ir_left.rows - 1; y++) {
+        for (int x = 1; x < ir_left.cols - 1; x++) {
+            uint8_t center_left = ir_left.at<uint8_t>(y, x);
+            uint8_t center_right = ir_right.at<uint8_t>(y, x);
+            uint8_t pattern_left = 0, pattern_right = 0;
+            
+            // 8-neighborhood LBP
+            if (ir_left.at<uint8_t>(y-1, x-1) >= center_left) pattern_left |= 1;
+            if (ir_left.at<uint8_t>(y-1, x) >= center_left) pattern_left |= 2;
+            if (ir_left.at<uint8_t>(y-1, x+1) >= center_left) pattern_left |= 4;
+            if (ir_left.at<uint8_t>(y, x+1) >= center_left) pattern_left |= 8;
+            if (ir_left.at<uint8_t>(y+1, x+1) >= center_left) pattern_left |= 16;
+            if (ir_left.at<uint8_t>(y+1, x) >= center_left) pattern_left |= 32;
+            if (ir_left.at<uint8_t>(y+1, x-1) >= center_left) pattern_left |= 64;
+            if (ir_left.at<uint8_t>(y, x-1) >= center_left) pattern_left |= 128;
+            
+            if (ir_right.at<uint8_t>(y-1, x-1) >= center_right) pattern_right |= 1;
+            if (ir_right.at<uint8_t>(y-1, x) >= center_right) pattern_right |= 2;
+            if (ir_right.at<uint8_t>(y-1, x+1) >= center_right) pattern_right |= 4;
+            if (ir_right.at<uint8_t>(y, x+1) >= center_right) pattern_right |= 8;
+            if (ir_right.at<uint8_t>(y+1, x+1) >= center_right) pattern_right |= 16;
+            if (ir_right.at<uint8_t>(y+1, x) >= center_right) pattern_right |= 32;
+            if (ir_right.at<uint8_t>(y+1, x-1) >= center_right) pattern_right |= 64;
+            if (ir_right.at<uint8_t>(y, x-1) >= center_right) pattern_right |= 128;
+            
+            lbp_left.at<uint8_t>(y, x) = pattern_left;
+            lbp_right.at<uint8_t>(y, x) = pattern_right;
+        }
+    }
+    
+    // Calculate LBP histograms
+    cv::Mat hist_lbp_left, hist_lbp_right;
+    int histSize = 256;
+    float range[] = {0, 256};
+    const float* histRange[] = {range};
+    int channels[] = {0};
+    
+    cv::calcHist(&lbp_left, 1, channels, cv::Mat(), hist_lbp_left, 1, &histSize, histRange);
+    cv::calcHist(&lbp_right, 1, channels, cv::Mat(), hist_lbp_right, 1, &histSize, histRange);
+    cv::normalize(hist_lbp_left, hist_lbp_left, 0, 1, cv::NORM_MINMAX);
+    cv::normalize(hist_lbp_right, hist_lbp_right, 0, 1, cv::NORM_MINMAX);
+    
+    double lbp_corr = cv::compareHist(hist_lbp_left, hist_lbp_right, cv::HISTCMP_CORREL);
+    
+    // Real skin: high LBP correlation (>0.7)
+    // Masks: lower correlation due to material differences
+    if (lbp_corr > 0.7f) {
+        consistency_score += 1.0f;  // High consistency (real skin)
+    } else if (lbp_corr > 0.5f) {
+        consistency_score += 0.6f;  // Moderate consistency
+    } else {
+        consistency_score += 0.2f;  // Low consistency (possible mask)
+    }
+    checks++;
+    
+    return (checks > 0) ? consistency_score / checks : 0.5f;
 }
 
 } // namespace mdai
