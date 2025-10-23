@@ -2482,18 +2482,22 @@ float AntiSpoofingDetector::analyze_material_properties(const FrameBox* frame, c
     // 5. NEW: IR material analysis for 3D masks and silicone masks
     float ir_material_score = analyze_ir_material_properties(frame, face);
     
-    // Combine RGB material analysis with IR material analysis
+    // 6. NEW: Depth material analysis for material behavior patterns
+    float depth_material_score = analyze_depth_material_properties(frame, face);
+    
+    // Combine RGB, IR, and depth material analysis
     float rgb_material_score = (checks > 0) ? (material_score / checks) : 0.5f;
     
-    // Weighted combination: RGB analysis (60%) + IR analysis (40%)
-    // IR analysis is critical for 3D masks and silicone masks that fool RGB analysis
-    float final_score = (rgb_material_score * 0.6f + ir_material_score * 0.4f);
+    // Weighted combination: RGB analysis (40%) + IR analysis (35%) + Depth analysis (25%)
+    // Multi-modal material analysis is critical for 3D masks and silicone masks
+    float final_score = (rgb_material_score * 0.4f + ir_material_score * 0.35f + depth_material_score * 0.25f);
     
     std::cout << "🎭 Material analysis: edge=" << edge_density 
               << ", texture=" << texture_variance 
               << ", specular=" << highlight_ratio 
               << ", rgb_score=" << rgb_material_score
               << ", ir_score=" << ir_material_score
+              << ", depth_score=" << depth_material_score
               << ", final=" << final_score << std::endl;
     
     return final_score;
@@ -4980,6 +4984,141 @@ float AntiSpoofingDetector::analyze_material_consistency(const cv::Mat& ir_left,
     checks++;
     
     return (checks > 0) ? consistency_score / checks : 0.5f;
+}
+
+// Depth material analysis for material behavior patterns
+float AntiSpoofingDetector::analyze_depth_material_properties(const FrameBox* frame, const FaceROI& face) {
+    if (!frame || !face.detected || frame->depth_data.empty()) {
+        return 0.5f;  // Can't analyze without depth data
+    }
+    
+    // Convert depth data to OpenCV matrix
+    cv::Mat depth = cv::Mat(frame->depth_height, frame->depth_width, CV_16UC1, 
+                           const_cast<uint16_t*>(frame->depth_data.data()));
+    
+    // Map face ROI to depth coordinates
+    cv::Rect depth_roi;
+    if (frame->color_width > 0 && frame->color_height > 0) {
+        float scale_x = static_cast<float>(frame->depth_width) / static_cast<float>(frame->color_width);
+        float scale_y = static_cast<float>(frame->depth_height) / static_cast<float>(frame->color_height);
+        
+        depth_roi.x = static_cast<int>(face.bbox.x * scale_x);
+        depth_roi.y = static_cast<int>(face.bbox.y * scale_y);
+        depth_roi.width = static_cast<int>(face.bbox.width * scale_x);
+        depth_roi.height = static_cast<int>(face.bbox.height * scale_y);
+        
+        // Ensure ROI is within bounds
+        depth_roi &= cv::Rect(0, 0, frame->depth_width, frame->depth_height);
+    } else {
+        return 0.5f;  // Can't map coordinates
+    }
+    
+    if (depth_roi.width < 20 || depth_roi.height < 20) {
+        return 0.5f;  // ROI too small
+    }
+    
+    // Extract face region
+    cv::Mat face_depth = depth(depth_roi);
+    
+    // Analyze depth behavior patterns
+    float behavior_score = analyze_depth_behavior_patterns(face_depth, depth_roi);
+    
+    // Debug output
+    static int depth_material_debug = 0;
+    if (++depth_material_debug % 30 == 0) {
+        std::cout << "🔍 Depth Material Analysis: behavior=" << behavior_score << std::endl;
+    }
+    
+    return behavior_score;
+}
+
+// Depth behavior patterns analysis
+float AntiSpoofingDetector::analyze_depth_behavior_patterns(const cv::Mat& depth, const cv::Rect& /* face_roi */) {
+    if (depth.empty()) {
+        return 0.5f;
+    }
+    
+    float behavior_score = 0.0f;
+    int checks = 0;
+    
+    // 1. Analyze depth variance (material surface roughness)
+    cv::Scalar mean_depth, std_depth;
+    cv::meanStdDev(depth, mean_depth, std_depth);
+    
+    float std_depth_val = static_cast<float>(std_depth[0]);
+    
+    // Real skin: moderate depth variation (2-8mm std)
+    // Masks: either too smooth (<1mm) or too rough (>12mm)
+    if (std_depth_val >= 2.0f && std_depth_val <= 8.0f) {
+        behavior_score += 1.0f;  // Good skin surface roughness
+    } else if (std_depth_val < 1.0f) {
+        behavior_score += 0.2f;  // Too smooth (possible mask)
+    } else if (std_depth_val > 12.0f) {
+        behavior_score += 0.3f;  // Too rough (possible textured mask)
+    } else {
+        behavior_score += 0.6f;  // Borderline
+    }
+    checks++;
+    
+    // 2. Analyze depth gradients (material surface curvature)
+    cv::Mat grad_x, grad_y;
+    cv::Sobel(depth, grad_x, CV_32F, 1, 0, 3);
+    cv::Sobel(depth, grad_y, CV_32F, 0, 1, 3);
+    
+    cv::Mat grad_magnitude;
+    cv::magnitude(grad_x, grad_y, grad_magnitude);
+    
+    cv::Scalar mean_grad, std_grad;
+    cv::meanStdDev(grad_magnitude, mean_grad, std_grad);
+    
+    float mean_grad_val = static_cast<float>(mean_grad[0]);
+    
+    // Real skin: moderate depth gradients (1-5)
+    // Masks: different gradient patterns
+    if (mean_grad_val >= 1.0f && mean_grad_val <= 5.0f) {
+        behavior_score += 1.0f;  // Good skin curvature
+    } else if (mean_grad_val < 0.5f) {
+        behavior_score += 0.2f;  // Too flat (possible mask)
+    } else if (mean_grad_val > 8.0f) {
+        behavior_score += 0.3f;  // Too sharp (possible mask edges)
+    } else {
+        behavior_score += 0.6f;  // Borderline
+    }
+    checks++;
+    
+    // 3. Analyze depth histogram (material depth distribution)
+    cv::Mat hist;
+    int histSize = 256;
+    float range[] = {0, 256};
+    const float* histRange[] = {range};
+    int channels[] = {0};
+    
+    cv::calcHist(&depth, 1, channels, cv::Mat(), hist, 1, &histSize, histRange);
+    cv::normalize(hist, hist, 0, 1, cv::NORM_MINMAX);
+    
+    // Calculate histogram entropy (material complexity)
+    float entropy = 0.0f;
+    for (int i = 0; i < histSize; i++) {
+        float prob = hist.at<float>(i);
+        if (prob > 0.0f) {
+            entropy -= prob * std::log2(prob);
+        }
+    }
+    
+    // Real skin: moderate entropy (3-6)
+    // Masks: different entropy patterns
+    if (entropy >= 3.0f && entropy <= 6.0f) {
+        behavior_score += 1.0f;  // Good material complexity
+    } else if (entropy < 2.0f) {
+        behavior_score += 0.2f;  // Too uniform (possible mask)
+    } else if (entropy > 7.0f) {
+        behavior_score += 0.3f;  // Too complex (possible textured mask)
+    } else {
+        behavior_score += 0.6f;  // Borderline
+    }
+    checks++;
+    
+    return (checks > 0) ? behavior_score / checks : 0.5f;
 }
 
 } // namespace mdai
