@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDAI Admin Portal - Secure Device Provisioning</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 0.85em;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        
+        .status-badge.connected {
+            background: #10b981;
+            color: white;
+        }
+        
+        .status-badge.disconnected {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .tab {
+            flex: 1;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            cursor: pointer;
+            border-radius: 10px;
+            font-size: 1em;
+            transition: all 0.3s;
+        }
+        
+        .tab:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .tab.active {
+            background: white;
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            margin-bottom: 20px;
+        }
+        
+        .devices-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .device-card {
+            background: #f8fafc;
+            border: 2px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 20px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .device-card:hover {
+            border-color: #667eea;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
+        }
+        
+        .device-card.selected {
+            border-color: #667eea;
+            background: #ede9fe;
+        }
+        
+        .device-card h3 {
+            color: #1e293b;
+            margin-bottom: 10px;
+            font-size: 1.2em;
+        }
+        
+        .device-card .device-info {
+            font-size: 0.9em;
+            color: #64748b;
+            margin: 5px 0;
+        }
+        
+        .device-card .device-status {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        
+        .device-status.online {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        
+        .device-status.offline {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+        }
+        
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+        
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+        }
+        
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+        }
+        
+        .btn-primary:disabled {
+            background: #cbd5e1;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .qr-container {
+            display: none;
+            text-align: center;
+            padding: 30px;
+            background: #f8fafc;
+            border-radius: 12px;
+            margin-top: 20px;
+        }
+        
+        .qr-container.show {
+            display: block;
+        }
+        
+        #qrcode {
+            display: inline-block;
+            padding: 20px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        
+        .qr-info {
+            margin-top: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            text-align: left;
+        }
+        
+        .qr-info h4 {
+            margin-bottom: 10px;
+            color: #1e293b;
+        }
+        
+        .qr-info p {
+            margin: 5px 0;
+            color: #64748b;
+            font-size: 0.95em;
+        }
+        
+        .alert {
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+        
+        .alert-success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 1px solid #10b981;
+        }
+        
+        .alert-error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #ef4444;
+        }
+        
+        .alert-info {
+            background: #dbeafe;
+            color: #1e40af;
+            border: 1px solid #3b82f6;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #64748b;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f4f6;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        
+        .stat-card h3 {
+            font-size: 2.5em;
+            margin-bottom: 5px;
+        }
+        
+        .stat-card p {
+            opacity: 0.9;
+            font-size: 0.95em;
+        }
+        
+        .refresh-btn {
+            float: right;
+            background: #f1f5f9;
+            color: #475569;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 0.9em;
+        }
+        
+        .refresh-btn:hover {
+            background: #e2e8f0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 MDAI Admin Portal</h1>
+            <p>Secure Device Provisioning with Challenge-Response Authentication</p>
+            <div id="connectionStatus" class="status-badge disconnected">Connecting...</div>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('devices')">📱 Devices</button>
+            <button class="tab" onclick="switchTab('wifi')">📡 WiFi Provisioning</button>
+            <button class="tab" onclick="switchTab('websocket')">🔌 WebSocket Sessions</button>
+        </div>
+        
+        <!-- Devices Tab -->
+        <div id="devicesTab" class="tab-content active">
+            <div class="card">
+                <h2 style="margin-bottom: 20px;">
+                    Registered Devices
+                    <button class="refresh-btn" onclick="loadDevices()">🔄 Refresh</button>
+                </h2>
+                
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <h3 id="totalDevices">0</h3>
+                        <p>Total Devices</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 id="onlineDevices">0</h3>
+                        <p>Online Now</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 id="offlineDevices">0</h3>
+                        <p>Offline</p>
+                    </div>
+                </div>
+                
+                <div id="devicesLoading" class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading devices...</p>
+                </div>
+                
+                <div id="devicesGrid" class="devices-grid" style="display: none;"></div>
+                
+                <div id="devicesError" style="display: none;" class="alert alert-error"></div>
+            </div>
+        </div>
+        
+        <!-- WiFi Provisioning Tab -->
+        <div id="wifiTab" class="tab-content">
+            <div class="card">
+                <h2 style="margin-bottom: 20px;">Generate WiFi Provisioning QR</h2>
+                
+                <div id="wifiAlert" style="display: none;"></div>
+                
+                <div class="form-group">
+                    <label for="deviceSelect">Select Device</label>
+                    <select id="deviceSelect" onchange="updateDeviceSelection()">
+                        <option value="">-- Select a device --</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="wifiSsid">WiFi SSID</label>
+                    <input type="text" id="wifiSsid" placeholder="Enter WiFi network name">
+                </div>
+                
+                <div class="form-group">
+                    <label for="wifiPassword">WiFi Password</label>
+                    <input type="password" id="wifiPassword" placeholder="Enter WiFi password">
+                </div>
+                
+                <button id="generateWifiBtn" class="btn btn-primary" onclick="generateWiFiQR()" disabled>
+                    🔐 Generate Secure QR Code
+                </button>
+                
+                <div id="wifiQrContainer" class="qr-container">
+                    <h3 style="margin-bottom: 20px; color: #1e293b;">Scan with RDK Device</h3>
+                    <div id="qrcode"></div>
+                    <div class="qr-info">
+                        <h4>🔐 Security Information</h4>
+                        <p><strong>Session ID:</strong> <span id="sessionId">-</span></p>
+                        <p><strong>Device:</strong> <span id="qrDevice">-</span></p>
+                        <p><strong>Expires in:</strong> <span id="expiresIn">5 minutes</span></p>
+                        <p><strong>Encryption:</strong> RSA-2048 Challenge-Response</p>
+                        <p><strong>Status:</strong> Only the selected device can decrypt this QR code</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- WebSocket Sessions Tab -->
+        <div id="websocketTab" class="tab-content">
+            <div class="card">
+                <h2 style="margin-bottom: 20px;">Generate WebSocket Session QR</h2>
+                
+                <div id="wsAlert" style="display: none;"></div>
+                
+                <div class="form-group">
+                    <label for="wsDeviceSelect">Select Device</label>
+                    <select id="wsDeviceSelect">
+                        <option value="">-- Select a device --</option>
+                    </select>
+                </div>
+                
+                <button id="generateWsBtn" class="btn btn-primary" onclick="generateWebSocketQR()" disabled>
+                    🔌 Generate Session QR Code
+                </button>
+                
+                <div id="wsQrContainer" class="qr-container">
+                    <h3 style="margin-bottom: 20px; color: #1e293b;">Scan to Establish WebSocket Connection</h3>
+                    <div id="wsQrcode"></div>
+                    <div class="qr-info">
+                        <h4>🔐 Session Information</h4>
+                        <p><strong>Session ID:</strong> <span id="wsSessionId">-</span></p>
+                        <p><strong>Device:</strong> <span id="wsQrDevice">-</span></p>
+                        <p><strong>Expires in:</strong> <span id="wsExpiresIn">24 hours</span></p>
+                        <p><strong>Encryption:</strong> RSA-2048 Challenge-Response</p>
+                        <p><strong>Status:</strong> Valid for persistent communication</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_BASE = window.location.origin;
+        let devicesCache = [];
+        let selectedDevice = null;
+
+        // Tab switching
+        function switchTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName + 'Tab').classList.add('active');
+            event.target.classList.add('active');
+            
+            // Load data if needed
+            if (tabName === 'devices') {
+                loadDevices();
+            }
+        }
+
+        // Check server connection
+        async function checkConnection() {
+            try {
+                const response = await fetch(`${API_BASE}/api/health`);
+                if (response.ok) {
+                    document.getElementById('connectionStatus').textContent = 'Connected';
+                    document.getElementById('connectionStatus').className = 'status-badge connected';
+                    return true;
+                }
+            } catch (error) {
+                document.getElementById('connectionStatus').textContent = 'Disconnected';
+                document.getElementById('connectionStatus').className = 'status-badge disconnected';
+            }
+            return false;
+        }
+
+        // Load devices
+        async function loadDevices() {
+            const loading = document.getElementById('devicesLoading');
+            const grid = document.getElementById('devicesGrid');
+            const error = document.getElementById('devicesError');
+            
+            loading.style.display = 'block';
+            grid.style.display = 'none';
+            error.style.display = 'none';
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/devices`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    devicesCache = data.devices;
+                    renderDevices(data.devices);
+                    updateStats(data.devices);
+                    updateDeviceSelectors(data.devices);
+                    
+                    loading.style.display = 'none';
+                    grid.style.display = 'grid';
+                } else {
+                    throw new Error(data.error || 'Failed to load devices');
+                }
+            } catch (err) {
+                loading.style.display = 'none';
+                error.style.display = 'block';
+                error.textContent = `Error: ${err.message}`;
+            }
+        }
+
+        // Render devices grid
+        function renderDevices(devices) {
+            const grid = document.getElementById('devicesGrid');
+            
+            if (devices.length === 0) {
+                grid.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: #64748b;">No devices registered yet</p>';
+                return;
+            }
+            
+            grid.innerHTML = devices.map(device => `
+                <div class="device-card" onclick="selectDevice('${device.device_id}')">
+                    <h3>${device.device_id}</h3>
+                    <div class="device-info">
+                        <strong>Hardware ID:</strong> ${device.hardware_id}
+                    </div>
+                    <div class="device-info">
+                        <strong>Hostname:</strong> ${device.hostname || 'unknown'}
+                    </div>
+                    <div class="device-info">
+                        <strong>Registered:</strong> ${new Date(device.registered_at).toLocaleDateString()}
+                    </div>
+                    <div class="device-info">
+                        <strong>Last Seen:</strong> ${device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Never'}
+                    </div>
+                    <span class="device-status ${device.status}">${device.status.toUpperCase()}</span>
+                </div>
+            `).join('');
+        }
+
+        // Update stats
+        function updateStats(devices) {
+            const total = devices.length;
+            const online = devices.filter(d => d.status === 'online').length;
+            const offline = total - online;
+            
+            document.getElementById('totalDevices').textContent = total;
+            document.getElementById('onlineDevices').textContent = online;
+            document.getElementById('offlineDevices').textContent = offline;
+        }
+
+        // Update device selectors
+        function updateDeviceSelectors(devices) {
+            const wifiSelect = document.getElementById('deviceSelect');
+            const wsSelect = document.getElementById('wsDeviceSelect');
+            
+            const options = devices.map(device => 
+                `<option value="${device.device_id}">${device.device_id} (${device.hostname || 'unknown'})</option>`
+            ).join('');
+            
+            wifiSelect.innerHTML = '<option value="">-- Select a device --</option>' + options;
+            wsSelect.innerHTML = '<option value="">-- Select a device --</option>' + options;
+        }
+
+        // Select device from grid
+        function selectDevice(deviceId) {
+            document.querySelectorAll('.device-card').forEach(card => {
+                card.classList.remove('selected');
+            });
+            event.currentTarget.classList.add('selected');
+            selectedDevice = deviceId;
+        }
+
+        // Update device selection for WiFi
+        function updateDeviceSelection() {
+            const deviceSelect = document.getElementById('deviceSelect');
+            const generateBtn = document.getElementById('generateWifiBtn');
+            const wifiSsid = document.getElementById('wifiSsid');
+            const wifiPassword = document.getElementById('wifiPassword');
+            
+            if (deviceSelect.value && wifiSsid.value && wifiPassword.value) {
+                generateBtn.disabled = false;
+            } else {
+                generateBtn.disabled = true;
+            }
+        }
+
+        // Enable generate button when form is filled
+        document.getElementById('wifiSsid').addEventListener('input', updateDeviceSelection);
+        document.getElementById('wifiPassword').addEventListener('input', updateDeviceSelection);
+        document.getElementById('wsDeviceSelect').addEventListener('change', function() {
+            document.getElementById('generateWsBtn').disabled = !this.value;
+        });
+
+        // Generate WiFi QR
+        async function generateWiFiQR() {
+            const deviceId = document.getElementById('deviceSelect').value;
+            const ssid = document.getElementById('wifiSsid').value;
+            const password = document.getElementById('wifiPassword').value;
+            const alert = document.getElementById('wifiAlert');
+            const qrContainer = document.getElementById('wifiQrContainer');
+            const generateBtn = document.getElementById('generateWifiBtn');
+            
+            alert.style.display = 'none';
+            qrContainer.classList.remove('show');
+            generateBtn.disabled = true;
+            generateBtn.textContent = '🔄 Generating...';
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/generate-challenge`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        device_id: deviceId,
+                        wifi_ssid: ssid,
+                        wifi_password: password,
+                        session_type: 'wifi'
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Clear previous QR
+                    document.getElementById('qrcode').innerHTML = '';
+                    
+                    // Generate QR code with encrypted payload
+                    const qrData = JSON.stringify(data.qr_payload);
+                    new QRCode(document.getElementById('qrcode'), {
+                        text: qrData,
+                        width: 256,
+                        height: 256
+                    });
+                    
+                    // Update info
+                    document.getElementById('sessionId').textContent = data.bson_id;
+                    document.getElementById('qrDevice').textContent = deviceId;
+                    
+                    // Show QR
+                    qrContainer.classList.add('show');
+                    
+                    // Show success alert
+                    alert.className = 'alert alert-success';
+                    alert.textContent = '✅ Secure QR code generated successfully! Only the selected device can decrypt it.';
+                    alert.style.display = 'block';
+                } else {
+                    throw new Error(data.error || 'Failed to generate QR');
+                }
+            } catch (err) {
+                alert.className = 'alert alert-error';
+                alert.textContent = `❌ Error: ${err.message}`;
+                alert.style.display = 'block';
+            } finally {
+                generateBtn.disabled = false;
+                generateBtn.textContent = '🔐 Generate Secure QR Code';
+            }
+        }
+
+        // Generate WebSocket QR
+        async function generateWebSocketQR() {
+            const deviceId = document.getElementById('wsDeviceSelect').value;
+            const alert = document.getElementById('wsAlert');
+            const qrContainer = document.getElementById('wsQrContainer');
+            const generateBtn = document.getElementById('generateWsBtn');
+            
+            alert.style.display = 'none';
+            qrContainer.classList.remove('show');
+            generateBtn.disabled = true;
+            generateBtn.textContent = '🔄 Generating...';
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/generate-challenge`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        device_id: deviceId,
+                        session_type: 'websocket'
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Clear previous QR
+                    document.getElementById('wsQrcode').innerHTML = '';
+                    
+                    // Generate QR code
+                    const qrData = JSON.stringify(data.qr_payload);
+                    new QRCode(document.getElementById('wsQrcode'), {
+                        text: qrData,
+                        width: 256,
+                        height: 256
+                    });
+                    
+                    // Update info
+                    document.getElementById('wsSessionId').textContent = data.bson_id;
+                    document.getElementById('wsQrDevice').textContent = deviceId;
+                    
+                    // Show QR
+                    qrContainer.classList.add('show');
+                    
+                    // Show success alert
+                    alert.className = 'alert alert-success';
+                    alert.textContent = '✅ WebSocket session QR generated! Valid for 24 hours.';
+                    alert.style.display = 'block';
+                } else {
+                    throw new Error(data.error || 'Failed to generate QR');
+                }
+            } catch (err) {
+                alert.className = 'alert alert-error';
+                alert.textContent = `❌ Error: ${err.message}`;
+                alert.style.display = 'block';
+            } finally {
+                generateBtn.disabled = false;
+                generateBtn.textContent = '🔌 Generate Session QR Code';
+            }
+        }
+
+        // Initialize on load
+        window.addEventListener('load', async () => {
+            await checkConnection();
+            await loadDevices();
+            
+            // Refresh connection status every 30 seconds
+            setInterval(checkConnection, 30000);
+        });
+    </script>
+</body>
+</html>
+
+

@@ -1,0 +1,125 @@
+# OS/filesystem noise
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+.Spotlight-V100
+.Trashes
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-*
+.history/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.tox/
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.so
+*.a
+*.la
+*.lo
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+*.d
+*.pch
+
+# CMake build dirs and files
+/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Logs and temp
+*.log
+logs/
+log/
+tmp/
+temp/
+
+# RealSense recordings and large generated assets
+*.bag
+*.bag.zip
+*.ply
+*.pcd
+
+# Local data/output folders (generated artifacts)
+data/
+datasets/
+recordings/
+output/
+outputs/
+out/
+
+# Secrets and credentials (do not commit)
+.env
+.env.*
+*.env
+secrets/
+secret*/
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+*.crt
+*.der
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+credentials.json
+client_secret.json
+service-account.json
+google-credentials.json
+
+# Coverage
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+# Misc backups/swap
+*~
+*.swp
+*.swo
+.#*
+
+# Repo-specific stray binaries
+/analyze_bag
+
+# Security - Never commit these!
+.env
+.env.*
+*.pem
+*.key
+device_config.json
+**/qr_keys.conf
+**/.env
+**/.env.*
+
+# Secrets
+*secret*
+*password*
+*credentials*
+

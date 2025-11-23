@@ -1,0 +1,8 @@
+MDAI Device Label
+==================
+
+Hardware ID: b4:2f:03:31:9a:35
+Device Name: RDK-X5-001
+Device Key:  884e2100fb431a51784663ead6f6b08da9728149513e82027831a0c39b7b8552
+
+Keep this secure!

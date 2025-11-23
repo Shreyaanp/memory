@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDAI Mobile Session - QR Generator</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .container {
+            max-width: 600px;
+            width: 100%;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1em;
+            opacity: 0.9;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        .form-group {
+            margin-bottom: 25px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+            font-size: 0.95em;
+        }
+        
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 14px;
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            font-size: 1em;
+            transition: all 0.3s;
+            font-family: monospace;
+        }
+        
+        .form-group input:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .form-group textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+        
+        .form-group small {
+            display: block;
+            margin-top: 6px;
+            color: #64748b;
+            font-size: 0.85em;
+        }
+        
+        .btn {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-primary:disabled {
+            background: #cbd5e1;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .qr-container {
+            display: none;
+            text-align: center;
+            margin-top: 30px;
+            padding: 30px;
+            background: #f8fafc;
+            border-radius: 15px;
+        }
+        
+        .qr-container.show {
+            display: block;
+        }
+        
+        .qr-container h3 {
+            color: #1e293b;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+        }
+        
+        #qrcode {
+            display: inline-block;
+            padding: 20px;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+        }
+        
+        .qr-info {
+            margin-top: 25px;
+            padding: 20px;
+            background: white;
+            border-radius: 12px;
+            text-align: left;
+        }
+        
+        .qr-info h4 {
+            margin-bottom: 15px;
+            color: #1e293b;
+            font-size: 1.1em;
+        }
+        
+        .qr-info p {
+            margin: 10px 0;
+            color: #475569;
+            font-size: 0.95em;
+        }
+        
+        .qr-info strong {
+            color: #1e293b;
+        }
+        
+        .qr-info code {
+            background: #f1f5f9;
+            padding: 3px 8px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            word-break: break-all;
+        }
+        
+        .alert {
+            padding: 15px 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            font-weight: 500;
+            display: none;
+        }
+        
+        .alert.show {
+            display: block;
+        }
+        
+        .alert-success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 1px solid #10b981;
+        }
+        
+        .alert-error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #ef4444;
+        }
+        
+        .alert-info {
+            background: #dbeafe;
+            color: #1e40af;
+            border: 1px solid #3b82f6;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f4f6;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 600;
+            margin-top: 10px;
+        }
+        
+        .status-badge.connected {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        
+        .status-badge.disconnected {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        
+        .btn-secondary {
+            background: #f1f5f9;
+            color: #475569;
+            margin-top: 10px;
+        }
+        
+        .btn-secondary:hover {
+            background: #e2e8f0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📱 MDAI Mobile Session</h1>
+            <p>Generate QR code for face verification</p>
+            <div id="serverStatus" class="status-badge disconnected">Checking server...</div>
+        </div>
+        
+        <div class="card">
+            <div id="alert" class="alert"></div>
+            
+            <form id="sessionForm" onsubmit="generateSessionQR(event)">
+                <div class="form-group">
+                    <label for="bearerToken">Bearer Token *</label>
+                    <textarea 
+                        id="bearerToken" 
+                        required 
+                        placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5YjcxOTRkNmU2NzczZmUzMDgyNGI4MzI4YjQ4ZWUxNzRjNjA4M2VhNWZlNDhmODdlNzc0NGI4Y2MxMzljMDI1IiwiaWF0IjoxNzYzNzAxODI2LCJleHAiOjE3NjQzMDY2MjZ9.aokFLvVASxpWh7D45mFOEHemBhxECy-yJRSfuaCS_A0"
+                        rows="3"
+                    ></textarea>
+                    <small>Paste your authentication token from the mobile app</small>
+                </div>
+                
+                <button type="submit" class="btn btn-primary" id="generateBtn">
+                    🔐 Generate QR Code
+                </button>
+            </form>
+            
+            <div id="qrContainer" class="qr-container">
+                <h3>✅ Scan with RDK Device</h3>
+                <div id="qrcode"></div>
+                
+                <div class="qr-info">
+                    <h4>📋 Session Information</h4>
+                    <p><strong>Session ID:</strong> <code id="sessionId">-</code></p>
+                    <p><strong>WebSocket Token:</strong> <code id="wsToken">-</code></p>
+                    <p><strong>Expires in:</strong> <span id="expiresIn">3 minutes</span></p>
+                    <p><strong>WebSocket URL:</strong> <code id="wsUrl">wss://mdai.mercle.ai/ws/mobile</code></p>
+                    <p><strong>Encryption:</strong> AES-256-CBC</p>
+                </div>
+                
+                <button class="btn btn-secondary" onclick="resetForm()">
+                    🔄 Generate New QR
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let currentSessionId = null;
+
+        // Check server connection on load
+        async function checkServerConnection() {
+            try {
+                const response = await fetch(`${API_BASE}/api/health`);
+                if (response.ok) {
+                    document.getElementById('serverStatus').textContent = '✓ Server Connected';
+                    document.getElementById('serverStatus').className = 'status-badge connected';
+                    return true;
+                }
+            } catch (error) {
+                document.getElementById('serverStatus').textContent = '✗ Server Offline';
+                document.getElementById('serverStatus').className = 'status-badge disconnected';
+            }
+            return false;
+        }
+
+        // Show alert message
+        function showAlert(message, type = 'info') {
+            const alert = document.getElementById('alert');
+            alert.textContent = message;
+            alert.className = `alert alert-${type} show`;
+        }
+
+        // Hide alert
+        function hideAlert() {
+            const alert = document.getElementById('alert');
+            alert.classList.remove('show');
+        }
+
+        // Generate session QR code
+        async function generateSessionQR(event) {
+            event.preventDefault();
+            hideAlert();
+            
+            const bearerToken = document.getElementById('bearerToken').value.trim();
+            const generateBtn = document.getElementById('generateBtn');
+            const qrContainer = document.getElementById('qrContainer');
+            
+            // Validate token format (basic JWT check)
+            if (!bearerToken.startsWith('eyJ')) {
+                showAlert('Invalid token format. Token should start with "eyJ"', 'error');
+                return;
+            }
+            
+            // Show loading
+            generateBtn.disabled = true;
+            generateBtn.textContent = '🔄 Creating session...';
+            qrContainer.classList.remove('show');
+            
+            try {
+                // Call server API to create session
+                const response = await fetch(`${API_BASE}/api/mobile/create-session`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${bearerToken}`
+                    }
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Session creation failed');
+                }
+                
+                const data = await response.json();
+                
+                if (!data.success) {
+                    throw new Error(data.error || 'Session creation failed');
+                }
+                
+                // Store session ID
+                currentSessionId = data.session_id;
+                
+                // Generate QR code with encrypted payload
+                document.getElementById('qrcode').innerHTML = '';
+                
+                const qrData = JSON.stringify({
+                    qr_encrypted: data.qr_encrypted
+                });
+                
+                new QRCode(document.getElementById('qrcode'), {
+                    text: qrData,
+                    width: 280,
+                    height: 280,
+                    colorDark: "#000000",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.H
+                });
+                
+                // Update session info
+                document.getElementById('sessionId').textContent = data.session_id;
+                document.getElementById('wsToken').textContent = data.ws_token.substring(0, 30) + '...';
+                document.getElementById('expiresIn').textContent = `${data.expires_in} seconds (${Math.floor(data.expires_in / 60)} minutes)`;
+                document.getElementById('wsUrl').textContent = data.ws_url;
+                
+                // Show QR container
+                qrContainer.classList.add('show');
+                
+                // Show success message
+                showAlert('✅ QR code generated successfully! Scan with your RDK device.', 'success');
+                
+                // Scroll to QR
+                qrContainer.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                
+            } catch (error) {
+                showAlert(`❌ Error: ${error.message}`, 'error');
+                console.error('Session creation error:', error);
+            } finally {
+                generateBtn.disabled = false;
+                generateBtn.textContent = '🔐 Generate QR Code';
+            }
+        }
+
+        // Reset form
+        function resetForm() {
+            document.getElementById('sessionForm').reset();
+            document.getElementById('qrContainer').classList.remove('show');
+            hideAlert();
+            document.getElementById('bearerToken').focus();
+        }
+
+        // Initialize on load
+        window.addEventListener('load', async () => {
+            await checkServerConnection();
+            
+            // Refresh connection status every 30 seconds
+            setInterval(checkServerConnection, 30000);
+            
+            // Focus token input
+            document.getElementById('bearerToken').focus();
+        });
+    </script>
+</body>
+</html>
+

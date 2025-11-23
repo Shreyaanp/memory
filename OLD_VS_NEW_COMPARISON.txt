@@ -1,0 +1,699 @@
+# 🔄 OLD vs NEW SYSTEM - SIDE-BY-SIDE COMPARISON
+
+## ARCHITECTURE COMPARISON
+
+### OLD SYSTEM (mDaiBackend - FastAPI)
+```
+┌─────────────┐
+│   HARDWARE  │──┐
+│   (RDK X5)  │  │  1. Hardware calls /auth → JWT
+└─────────────┘  │  2. Hardware generates QR with JWT
+                 │  3. Mobile scans QR
+┌─────────────┐  │  
+│  MOBILE APP │──┤  Both connect with SAME token:
+│  (Flutter)  │  │  - ws://server/ws/hardware?token=JWT
+└─────────────┘  │  - ws://server/ws/app?token=JWT
+                 │
+       ├─────────┴─────────┐
+       │   FastAPI Server  │
+       │  Pairs by JWT.JTI │
+       └─────────┬─────────┘
+                 │
+                 ▼
+         Backend API Call
+    https://newapi.mercle.ai
+```
+
+**Data Flow:**
+1. Mobile → Server: `{"type": "to_hardware", "data": {"platform_id": "PLT_xxx"}}`
+2. Server → Hardware: `{"type": "from_app", "data": {"platform_id": "PLT_xxx"}}`
+3. Hardware processes, sends: `{"type": "to_backend", "data": {"platform_id": "PLT_xxx", "image": "..."}}`
+4. Server calls API with platform_id + image
+5. Server → Both: `{"type": "backend_response", ...}`
+
+---
+
+### NEW SYSTEM (MDAI - aiohttp)
+```
+┌─────────────┐
+│   HARDWARE  │──┐
+│   (RDK X5)  │  │  1. Admin generates WiFi QR (RSA challenge)
+└─────────────┘  │  2. Device scans, validates, connects
+                 │  3. Device gets session somehow??? ❌
+┌─────────────┐  │  
+│  MOBILE APP │──┤  ??? How does mobile connect? ❌
+│  (Flutter)  │  │  ??? Where does session come from? ❌
+└─────────────┘  │
+                 │
+       ├─────────┴─────────┐
+       │   aiohttp Server  │
+       │  Sessions in DB   │
+       └─────────┬─────────┘
+                 │
+                 ▼
+       Backend API (TODO)
+```
+
+**Current Implementation:**
+- ✅ Device registration (TrustZone + public key)
+- ✅ WiFi provisioning (challenge-response QR)
+- ✅ Device WebSocket (partial)
+- ❌ Mobile authentication
+- ❌ Session creation
+- ❌ Message routing
+- ❌ platform_id handling
+
+---
+
+## MESSAGE FLOW COMPARISON
+
+### OLD SYSTEM - Complete Flow ✅
+
+```
+STEP 1: Authentication
+Mobile: N/A (uses same token as hardware)
+Hardware: POST /auth → {"token": "eyJ..."}
+
+STEP 2: QR Generation
+Hardware generates QR:
+{
+  "token": "eyJ...",
+  "ws_app_url": "wss://host/ws/app",
+  "ws_hardware_url": "wss://host/ws/hardware"
+}
+
+STEP 3: Both Connect
+Hardware: ws://host/ws/hardware?token=eyJ...
+  → Server: {"type": "joined", "role": "hardware"}
+Mobile: ws://host/ws/app?token=eyJ...
+  → Server: {"type": "joined", "role": "app"}
+
+Server pairs them via token.jti
+
+STEP 4: Handshake
+Mobile → Server: {"type": "to_hardware", "data": {"message": "hello"}}
+Server → Hardware: {"type": "from_app", "data": {"message": "hello"}}
+
+Hardware → Server: {"type": "to_app", "data": {"message": "hello"}}
+Server → Mobile: {"type": "from_hardware", "data": {"message": "hello"}}
+
+STEP 5: Platform ID
+Mobile → Server: {"type": "to_hardware", "data": {"platform_id": "PLT_jjbmYWeq3o1W"}}
+Server → Hardware: {"type": "from_app", "data": {"platform_id": "PLT_jjbmYWeq3o1W"}}
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                  ⚠️ Platform ID exposed to hardware!
+
+STEP 6: Image Submission
+Hardware → Server: {"type": "to_backend", "data": {"platform_id": "PLT_...", "image_base64": "..."}}
+Server calls: POST https://newapi.mercle.ai/api/admin/hardware/next
+  Headers: {"x-api-key": "mercle"}
+  Body: {"platform_id": "PLT_...", "image_base64": "..."}
+
+STEP 7: Result
+Backend → Server: {"status": "success", ...}
+Server → Hardware: {"type": "backend_response", "status_code": 200, "data": {...}}
+Server → Mobile: {"type": "backend_response", "status_code": 200, "data": {...}}
+```
+
+---
+
+### NEW SYSTEM - Current Implementation ⚠️
+
+```
+STEP 1: Device Registration ✅
+Device: POST /api/register-device
+  Body: {"device_id": "TEE-...", "public_key": "-----BEGIN..."}
+  Response: {"success": true}
+
+STEP 2: WiFi Provisioning ✅
+Admin: POST /api/generate-challenge
+  Body: {"device_id": "TEE-...", "wifi_ssid": "...", "wifi_password": "..."}
+  Response: {"qr_payload": {"bson_id": "...", "challenge": "encrypted..."}}
+
+Device scans QR → decrypts challenge → validates:
+Device: POST /api/validate-challenge
+  Body: {"bson_id": "...", "challenge_response": "..."}
+  Response: {"success": true, "wifi_credentials": {...}}
+
+Device connects to WiFi ✅
+
+STEP 3: Session Creation ❌ MISSING
+Mobile: ??? 
+  → How does mobile create session?
+  → How does mobile get QR data?
+  → What does the session QR contain?
+
+STEP 4: Both Connect ❌ MISSING
+Mobile: ???
+  → wss://mdai.mercle.ai/ws/???
+  → What token/auth?
+
+Device: wss://mdai.mercle.ai/ws/?
+  → Connects after scanning session QR
+  → Sends: {"type": "auth", "session_id": "...", "device_id": "..."}
+
+STEP 5: Message Routing ❌ MISSING
+Mobile → Device: ???
+Device → Mobile: ???
+  → No routing logic implemented!
+
+STEP 6: Platform ID ❌ CRITICAL ISSUE
+Current code (server.py line 594):
+  platform_id = data.get('platform_id')  # From device message!
+  
+This means device RECEIVES platform_id from somewhere, which is wrong!
+
+Should be:
+  - Mobile sends platform_id ONLY to server
+  - Server stores in session
+  - Device NEVER sees platform_id
+  - Server uses stored platform_id for API call
+
+STEP 7: Backend API ⚠️ TODO
+Current code (server.py line 600):
+  # TODO: Call external API with platform_id and image
+  # For now, simulate success after validation
+
+Needs implementation!
+```
+
+---
+
+## KEY INSIGHTS FROM OLD SYSTEM
+
+### 1. **Simple Token-Based Pairing** ✅
+- Hardware generates ONE token
+- Both hardware and mobile use SAME token
+- Server pairs them by `token.jti` (JWT ID)
+- No complex session management needed
+
+**Advantage**: Simple, works well!
+
+### 2. **QR Contains Everything** ✅
+```json
+{
+  "token": "eyJ...",
+  "ws_app_url": "wss://mdai.mercle.ai/ws/app",
+  "ws_hardware_url": "wss://mdai.mercle.ai/ws/hardware",
+  "server_host": "mdai.mercle.ai"
+}
+```
+Mobile app just needs to:
+1. Scan QR
+2. Extract token + ws_app_url
+3. Connect to WebSocket with token
+4. Done!
+
+### 3. **Message Types Are Clear** ✅
+- `to_hardware` / `to_app` - explicit routing
+- `from_hardware` / `from_app` - clear source
+- `backend_response` - API result to both
+- `ping` / `pong` - keepalive
+- `status` - connection status
+- `error` - error messages
+
+### 4. **Platform ID Flow** ⚠️ (Has Privacy Issue)
+Old system: Mobile → Server → **Hardware** → Server → API
+                                 ^^^^^^^^
+                                 Hardware sees platform_id!
+
+Should be: Mobile → Server → API (hardware never sees it)
+
+### 5. **Hard Timeout** ✅
+JWT expires after 3 minutes → both connections close
+Clean, predictable lifecycle
+
+---
+
+## PROPOSED NEW SYSTEM (Best of Both)
+
+```
+┌─────────────┐
+│  MOBILE APP │
+└──────┬──────┘
+       │
+       │ 1. POST /api/auth/mobile
+       │    Body: {"user_id": "...", "platform_id": "PLT_xxx"}
+       │    Response: {"token": "JWT", "session_id": "bson_id", "qr_payload": {...}}
+       │
+       │ 2. Display QR:
+       │    {
+       │      "session_id": "bson_id",
+       │      "token": "JWT",
+       │      "ws_device_url": "wss://mdai.mercle.ai/ws/device",
+       │      "type": "session"
+       │    }
+       │
+       │ 3. Connect WebSocket:
+       │    wss://mdai.mercle.ai/ws/mobile?token=JWT
+       │
+       ▼
+┌─────────────────────────────────────┐
+│     aiohttp Server (EC2)            │
+│                                     │
+│  Session Storage:                   │
+│  {                                  │
+│    "session_id": "bson_id",         │
+│    "token": "JWT",                  │
+│    "platform_id": "PLT_xxx", ◄──────┼── Stored, never sent to device
+│    "mobile_ws": <connection>,       │
+│    "device_ws": None,               │
+│    "created_at": "...",             │
+│    "expires_at": "..."              │
+│  }                                  │
+│                                     │
+│  Message Routing:                   │
+│  • Strip platform_id before → device│
+│  • Keep platform_id for API calls   │
+│  • Full messages to → mobile        │
+└─────────────────┬───────────────────┘
+                  │
+                  │ 4. Device scans QR
+                  │    Extracts: session_id + token
+                  │
+                  │ 5. Device connects:
+                  │    wss://mdai.mercle.ai/ws/device?token=JWT
+                  │    Send: {"type": "auth", "session_id": "bson_id"}
+                  │
+                  ▼
+          ┌─────────────┐
+          │   HARDWARE  │
+          │   (RDK X5)  │
+          └─────────────┘
+                  │
+                  │ 6. Face tracking complete
+                  │    Send: {"type": "submit_result", "image": "...", "passes": 5}
+                  │         (NO platform_id!)
+                  │
+                  ▼
+┌─────────────────────────────────────┐
+│     Server calls Backend API:       │
+│  POST https://newapi.mercle.ai/...  │
+│  Body: {                            │
+│    "platform_id": "PLT_xxx", ◄──────┼── From stored session
+│    "image_base64": "..."            │
+│  }                                  │
+└─────────────────┬───────────────────┘
+                  │
+                  │ 7. Send result to BOTH:
+                  │
+                  ├─→ Mobile: {"type": "result", "status": "success", "platform_id": "PLT_xxx"}
+                  │
+                  └─→ Device: {"type": "result", "status": "success"}
+                              (NO platform_id!)
+```
+
+**Benefits:**
+- ✅ Simple token-based pairing (like old system)
+- ✅ Platform ID privacy protected (NEW)
+- ✅ TrustZone hardware identity (NEW)
+- ✅ Clear separation of concerns
+- ✅ Mobile-initiated sessions
+- ✅ Backend API properly integrated
+
+---
+
+## 📋 WHAT TO IMPLEMENT
+
+### To match OLD system's functionality + NEW security:
+
+1. **Mobile Auth Endpoint** (from old system)
+2. **Mobile WebSocket Handler** (from old system)
+3. **Token-based Pairing** (from old system)
+4. **Message Routing** (from old system + NEW privacy)
+5. **Backend API Integration** (complete the TODO)
+6. **Session Management** (NEW - already have DB tables)
+
+**Estimated Time**: 3-4 hours
+**Complexity**: Medium (combining two proven approaches)
+
+---
+
+## 🎯 RECOMMENDATION
+
+**Implement: Hybrid Approach**
+- Use old system's simple token pairing ✅
+- Keep new system's TrustZone security ✅
+- Add platform_id privacy protection ✅
+- Complete backend API integration ✅
+
+This gives you:
+- Best security (TrustZone + privacy)
+- Best usability (simple QR + pairing)
+- Best compatibility (works like old app expected)
+- Best maintainability (clear, proven patterns)
+
+**Ready to implement?**
+
+
+
+## ARCHITECTURE COMPARISON
+
+### OLD SYSTEM (mDaiBackend - FastAPI)
+```
+┌─────────────┐
+│   HARDWARE  │──┐
+│   (RDK X5)  │  │  1. Hardware calls /auth → JWT
+└─────────────┘  │  2. Hardware generates QR with JWT
+                 │  3. Mobile scans QR
+┌─────────────┐  │  
+│  MOBILE APP │──┤  Both connect with SAME token:
+│  (Flutter)  │  │  - ws://server/ws/hardware?token=JWT
+└─────────────┘  │  - ws://server/ws/app?token=JWT
+                 │
+       ├─────────┴─────────┐
+       │   FastAPI Server  │
+       │  Pairs by JWT.JTI │
+       └─────────┬─────────┘
+                 │
+                 ▼
+         Backend API Call
+    https://newapi.mercle.ai
+```
+
+**Data Flow:**
+1. Mobile → Server: `{"type": "to_hardware", "data": {"platform_id": "PLT_xxx"}}`
+2. Server → Hardware: `{"type": "from_app", "data": {"platform_id": "PLT_xxx"}}`
+3. Hardware processes, sends: `{"type": "to_backend", "data": {"platform_id": "PLT_xxx", "image": "..."}}`
+4. Server calls API with platform_id + image
+5. Server → Both: `{"type": "backend_response", ...}`
+
+---
+
+### NEW SYSTEM (MDAI - aiohttp)
+```
+┌─────────────┐
+│   HARDWARE  │──┐
+│   (RDK X5)  │  │  1. Admin generates WiFi QR (RSA challenge)
+└─────────────┘  │  2. Device scans, validates, connects
+                 │  3. Device gets session somehow??? ❌
+┌─────────────┐  │  
+│  MOBILE APP │──┤  ??? How does mobile connect? ❌
+│  (Flutter)  │  │  ??? Where does session come from? ❌
+└─────────────┘  │
+                 │
+       ├─────────┴─────────┐
+       │   aiohttp Server  │
+       │  Sessions in DB   │
+       └─────────┬─────────┘
+                 │
+                 ▼
+       Backend API (TODO)
+```
+
+**Current Implementation:**
+- ✅ Device registration (TrustZone + public key)
+- ✅ WiFi provisioning (challenge-response QR)
+- ✅ Device WebSocket (partial)
+- ❌ Mobile authentication
+- ❌ Session creation
+- ❌ Message routing
+- ❌ platform_id handling
+
+---
+
+## MESSAGE FLOW COMPARISON
+
+### OLD SYSTEM - Complete Flow ✅
+
+```
+STEP 1: Authentication
+Mobile: N/A (uses same token as hardware)
+Hardware: POST /auth → {"token": "eyJ..."}
+
+STEP 2: QR Generation
+Hardware generates QR:
+{
+  "token": "eyJ...",
+  "ws_app_url": "wss://host/ws/app",
+  "ws_hardware_url": "wss://host/ws/hardware"
+}
+
+STEP 3: Both Connect
+Hardware: ws://host/ws/hardware?token=eyJ...
+  → Server: {"type": "joined", "role": "hardware"}
+Mobile: ws://host/ws/app?token=eyJ...
+  → Server: {"type": "joined", "role": "app"}
+
+Server pairs them via token.jti
+
+STEP 4: Handshake
+Mobile → Server: {"type": "to_hardware", "data": {"message": "hello"}}
+Server → Hardware: {"type": "from_app", "data": {"message": "hello"}}
+
+Hardware → Server: {"type": "to_app", "data": {"message": "hello"}}
+Server → Mobile: {"type": "from_hardware", "data": {"message": "hello"}}
+
+STEP 5: Platform ID
+Mobile → Server: {"type": "to_hardware", "data": {"platform_id": "PLT_jjbmYWeq3o1W"}}
+Server → Hardware: {"type": "from_app", "data": {"platform_id": "PLT_jjbmYWeq3o1W"}}
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                  ⚠️ Platform ID exposed to hardware!
+
+STEP 6: Image Submission
+Hardware → Server: {"type": "to_backend", "data": {"platform_id": "PLT_...", "image_base64": "..."}}
+Server calls: POST https://newapi.mercle.ai/api/admin/hardware/next
+  Headers: {"x-api-key": "mercle"}
+  Body: {"platform_id": "PLT_...", "image_base64": "..."}
+
+STEP 7: Result
+Backend → Server: {"status": "success", ...}
+Server → Hardware: {"type": "backend_response", "status_code": 200, "data": {...}}
+Server → Mobile: {"type": "backend_response", "status_code": 200, "data": {...}}
+```
+
+---
+
+### NEW SYSTEM - Current Implementation ⚠️
+
+```
+STEP 1: Device Registration ✅
+Device: POST /api/register-device
+  Body: {"device_id": "TEE-...", "public_key": "-----BEGIN..."}
+  Response: {"success": true}
+
+STEP 2: WiFi Provisioning ✅
+Admin: POST /api/generate-challenge
+  Body: {"device_id": "TEE-...", "wifi_ssid": "...", "wifi_password": "..."}
+  Response: {"qr_payload": {"bson_id": "...", "challenge": "encrypted..."}}
+
+Device scans QR → decrypts challenge → validates:
+Device: POST /api/validate-challenge
+  Body: {"bson_id": "...", "challenge_response": "..."}
+  Response: {"success": true, "wifi_credentials": {...}}
+
+Device connects to WiFi ✅
+
+STEP 3: Session Creation ❌ MISSING
+Mobile: ??? 
+  → How does mobile create session?
+  → How does mobile get QR data?
+  → What does the session QR contain?
+
+STEP 4: Both Connect ❌ MISSING
+Mobile: ???
+  → wss://mdai.mercle.ai/ws/???
+  → What token/auth?
+
+Device: wss://mdai.mercle.ai/ws/?
+  → Connects after scanning session QR
+  → Sends: {"type": "auth", "session_id": "...", "device_id": "..."}
+
+STEP 5: Message Routing ❌ MISSING
+Mobile → Device: ???
+Device → Mobile: ???
+  → No routing logic implemented!
+
+STEP 6: Platform ID ❌ CRITICAL ISSUE
+Current code (server.py line 594):
+  platform_id = data.get('platform_id')  # From device message!
+  
+This means device RECEIVES platform_id from somewhere, which is wrong!
+
+Should be:
+  - Mobile sends platform_id ONLY to server
+  - Server stores in session
+  - Device NEVER sees platform_id
+  - Server uses stored platform_id for API call
+
+STEP 7: Backend API ⚠️ TODO
+Current code (server.py line 600):
+  # TODO: Call external API with platform_id and image
+  # For now, simulate success after validation
+
+Needs implementation!
+```
+
+---
+
+## KEY INSIGHTS FROM OLD SYSTEM
+
+### 1. **Simple Token-Based Pairing** ✅
+- Hardware generates ONE token
+- Both hardware and mobile use SAME token
+- Server pairs them by `token.jti` (JWT ID)
+- No complex session management needed
+
+**Advantage**: Simple, works well!
+
+### 2. **QR Contains Everything** ✅
+```json
+{
+  "token": "eyJ...",
+  "ws_app_url": "wss://mdai.mercle.ai/ws/app",
+  "ws_hardware_url": "wss://mdai.mercle.ai/ws/hardware",
+  "server_host": "mdai.mercle.ai"
+}
+```
+Mobile app just needs to:
+1. Scan QR
+2. Extract token + ws_app_url
+3. Connect to WebSocket with token
+4. Done!
+
+### 3. **Message Types Are Clear** ✅
+- `to_hardware` / `to_app` - explicit routing
+- `from_hardware` / `from_app` - clear source
+- `backend_response` - API result to both
+- `ping` / `pong` - keepalive
+- `status` - connection status
+- `error` - error messages
+
+### 4. **Platform ID Flow** ⚠️ (Has Privacy Issue)
+Old system: Mobile → Server → **Hardware** → Server → API
+                                 ^^^^^^^^
+                                 Hardware sees platform_id!
+
+Should be: Mobile → Server → API (hardware never sees it)
+
+### 5. **Hard Timeout** ✅
+JWT expires after 3 minutes → both connections close
+Clean, predictable lifecycle
+
+---
+
+## PROPOSED NEW SYSTEM (Best of Both)
+
+```
+┌─────────────┐
+│  MOBILE APP │
+└──────┬──────┘
+       │
+       │ 1. POST /api/auth/mobile
+       │    Body: {"user_id": "...", "platform_id": "PLT_xxx"}
+       │    Response: {"token": "JWT", "session_id": "bson_id", "qr_payload": {...}}
+       │
+       │ 2. Display QR:
+       │    {
+       │      "session_id": "bson_id",
+       │      "token": "JWT",
+       │      "ws_device_url": "wss://mdai.mercle.ai/ws/device",
+       │      "type": "session"
+       │    }
+       │
+       │ 3. Connect WebSocket:
+       │    wss://mdai.mercle.ai/ws/mobile?token=JWT
+       │
+       ▼
+┌─────────────────────────────────────┐
+│     aiohttp Server (EC2)            │
+│                                     │
+│  Session Storage:                   │
+│  {                                  │
+│    "session_id": "bson_id",         │
+│    "token": "JWT",                  │
+│    "platform_id": "PLT_xxx", ◄──────┼── Stored, never sent to device
+│    "mobile_ws": <connection>,       │
+│    "device_ws": None,               │
+│    "created_at": "...",             │
+│    "expires_at": "..."              │
+│  }                                  │
+│                                     │
+│  Message Routing:                   │
+│  • Strip platform_id before → device│
+│  • Keep platform_id for API calls   │
+│  • Full messages to → mobile        │
+└─────────────────┬───────────────────┘
+                  │
+                  │ 4. Device scans QR
+                  │    Extracts: session_id + token
+                  │
+                  │ 5. Device connects:
+                  │    wss://mdai.mercle.ai/ws/device?token=JWT
+                  │    Send: {"type": "auth", "session_id": "bson_id"}
+                  │
+                  ▼
+          ┌─────────────┐
+          │   HARDWARE  │
+          │   (RDK X5)  │
+          └─────────────┘
+                  │
+                  │ 6. Face tracking complete
+                  │    Send: {"type": "submit_result", "image": "...", "passes": 5}
+                  │         (NO platform_id!)
+                  │
+                  ▼
+┌─────────────────────────────────────┐
+│     Server calls Backend API:       │
+│  POST https://newapi.mercle.ai/...  │
+│  Body: {                            │
+│    "platform_id": "PLT_xxx", ◄──────┼── From stored session
+│    "image_base64": "..."            │
+│  }                                  │
+└─────────────────┬───────────────────┘
+                  │
+                  │ 7. Send result to BOTH:
+                  │
+                  ├─→ Mobile: {"type": "result", "status": "success", "platform_id": "PLT_xxx"}
+                  │
+                  └─→ Device: {"type": "result", "status": "success"}
+                              (NO platform_id!)
+```
+
+**Benefits:**
+- ✅ Simple token-based pairing (like old system)
+- ✅ Platform ID privacy protected (NEW)
+- ✅ TrustZone hardware identity (NEW)
+- ✅ Clear separation of concerns
+- ✅ Mobile-initiated sessions
+- ✅ Backend API properly integrated
+
+---
+
+## 📋 WHAT TO IMPLEMENT
+
+### To match OLD system's functionality + NEW security:
+
+1. **Mobile Auth Endpoint** (from old system)
+2. **Mobile WebSocket Handler** (from old system)
+3. **Token-based Pairing** (from old system)
+4. **Message Routing** (from old system + NEW privacy)
+5. **Backend API Integration** (complete the TODO)
+6. **Session Management** (NEW - already have DB tables)
+
+**Estimated Time**: 3-4 hours
+**Complexity**: Medium (combining two proven approaches)
+
+---
+
+## 🎯 RECOMMENDATION
+
+**Implement: Hybrid Approach**
+- Use old system's simple token pairing ✅
+- Keep new system's TrustZone security ✅
+- Add platform_id privacy protection ✅
+- Complete backend API integration ✅
+
+This gives you:
+- Best security (TrustZone + privacy)
+- Best usability (simple QR + pairing)
+- Best compatibility (works like old app expected)
+- Best maintainability (clear, proven patterns)
+
+**Ready to implement?**
+
+
+
+
+
+

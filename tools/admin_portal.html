@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDAI Admin Portal - WiFi Provisioning</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .tab {
+            flex: 1;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            cursor: pointer;
+            border-radius: 10px;
+            font-size: 1em;
+            transition: all 0.3s;
+        }
+        
+        .tab:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .tab.active {
+            background: white;
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            margin-bottom: 20px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+        }
+        
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+        
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn {
+            padding: 15px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .qr-output {
+            display: none;
+            text-align: center;
+            margin-top: 30px;
+            padding: 30px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+        
+        .qr-output.show {
+            display: block;
+        }
+        
+        #qrcode {
+            display: inline-block;
+            padding: 20px;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        
+        .alert-warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        
+        .info-box {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+        
+        .info-box h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        
+        .info-box code {
+            background: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 MDAI Admin Portal</h1>
+            <p>Secure Device Provisioning System</p>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('wifi')">📡 WiFi Setup</button>
+            <button class="tab" onclick="showTab('session')">👤 User Session</button>
+            <button class="tab" onclick="showTab('device')">🏷️ Device Label</button>
+        </div>
+        
+        <!-- WiFi Setup Tab -->
+        <div id="wifi-tab" class="tab-content active">
+            <div class="card">
+                <h2>WiFi Provisioning QR Generator</h2>
+                <div class="alert alert-info">
+                    <strong>🔒 Security:</strong> QR codes are encrypted with device-specific keys. Each device can only decrypt QR codes generated for it.
+                </div>
+                
+                <form id="wifi-form" onsubmit="generateWiFiQR(event)">
+                    <div class="form-group">
+                        <label>Device Key (from device label) *</label>
+                        <input type="text" id="device-key" required placeholder="Scan device label QR or paste key">
+                        <small style="color: #666;">This is the device-specific key from the physical label on the device</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>WiFi SSID *</label>
+                        <input type="text" id="ssid" required placeholder="MyNetwork">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>WiFi Password *</label>
+                        <input type="password" id="password" required placeholder="••••••••">
+                        <small style="color: #666;">WPA2/WPA3 password (8-63 characters)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Security Type</label>
+                        <select id="security">
+                            <option value="WPA2">WPA2</option>
+                            <option value="WPA3">WPA3</option>
+                            <option value="WPA">WPA (Legacy)</option>
+                        </select>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">🔑 Generate WiFi QR Code</button>
+                </form>
+                
+                <div id="wifi-qr-output" class="qr-output">
+                    <h3>✅ WiFi Provisioning QR Code</h3>
+                    <div id="wifi-qrcode"></div>
+                    <div class="info-box">
+                        <h3>Instructions:</h3>
+                        <ol style="text-align: left;">
+                            <li>Show this QR code to the device camera</li>
+                            <li>Device will scan and decrypt credentials</li>
+                            <li>Device will connect to the WiFi network</li>
+                            <li>Wait for "Connected" confirmation</li>
+                        </ol>
+                        <button class="btn btn-secondary" onclick="downloadQR('wifi')">📥 Download QR</button>
+                        <button class="btn btn-secondary" onclick="printQR()">🖨️ Print</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Session QR Tab -->
+        <div id="session-tab" class="tab-content">
+            <div class="card">
+                <h2>User Session QR Generator</h2>
+                <div class="alert alert-warning">
+                    <strong>⏰ Note:</strong> Session QR codes expire after 5 minutes for security.
+                </div>
+                
+                <form id="session-form" onsubmit="generateSessionQR(event)">
+                    <div class="form-group">
+                        <label>Device Key *</label>
+                        <input type="text" id="session-device-key" required placeholder="Device-specific key">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Session ID</label>
+                        <input type="text" id="session-id" placeholder="Auto-generated">
+                        <small style="color: #666;">Leave blank to auto-generate</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Target Device ID</label>
+                        <input type="text" id="target-device" placeholder="ANY">
+                        <small style="color: #666;">Specific device ID or "ANY" for any device</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">👤 Generate Session QR Code</button>
+                </form>
+                
+                <div id="session-qr-output" class="qr-output">
+                    <h3>✅ User Session QR Code</h3>
+                    <div id="session-qrcode"></div>
+                    <div class="info-box">
+                        <p><strong>Session ID:</strong> <code id="generated-session-id"></code></p>
+                        <p><strong>Valid Until:</strong> <span id="expiry-time"></span></p>
+                        <button class="btn btn-secondary" onclick="downloadQR('session')">📥 Download QR</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Device Label Tab -->
+        <div id="device-tab" class="tab-content">
+            <div class="card">
+                <h2>Device Label Info</h2>
+                
+                <div class="alert alert-info">
+                    <strong>📋 About Device Labels:</strong><br>
+                    Each device has a physical label with a QR code containing its unique device key.
+                    This key is derived from the device's hardware ID (MAC address) and a master secret.
+                </div>
+                
+                <div class="form-group">
+                    <label>Scan Device Label QR</label>
+                    <textarea id="device-label-data" rows="5" placeholder="Scan device label QR code or paste JSON data here"></textarea>
+                    <button class="btn btn-primary" onclick="parseDeviceLabel()">🔍 Parse Label</button>
+                </div>
+                
+                <div id="device-info" class="info-box" style="display: none;">
+                    <h3>Device Information</h3>
+                    <p><strong>Hardware ID:</strong> <code id="info-hardware-id"></code></p>
+                    <p><strong>Device Name:</strong> <code id="info-device-name"></code></p>
+                    <p><strong>Device Key:</strong> <code id="info-device-key"></code></p>
+                </div>
+                
+                <div class="info-box">
+                    <h3>Generating Device Labels</h3>
+                    <p>Use the Python script to generate device labels:</p>
+                    <code>python3 tools/generate_device_label.py &lt;mac_address&gt;</code>
+                    <p style="margin-top: 10px;">Or on the device itself:</p>
+                    <code>cd tools && python3 generate_device_label.py</code>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Master secret (must match firmware)
+        const MASTER_SECRET = "mdai-master-secret-key-v1-change-in-production";
+        
+        function showTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName + '-tab').classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        function aes256Encrypt(plaintext, keyHex) {
+            // Convert hex key to WordArray
+            const key = CryptoJS.enc.Hex.parse(keyHex);
+            
+            // Generate random IV
+            const iv = CryptoJS.lib.WordArray.random(16);
+            
+            // Encrypt
+            const encrypted = CryptoJS.AES.encrypt(plaintext, key, {
+                iv: iv,
+                mode: CryptoJS.mode.CBC,
+                padding: CryptoJS.pad.Pkcs7
+            });
+            
+            // Prepend IV to ciphertext
+            const combined = iv.concat(encrypted.ciphertext);
+            
+            // Return as base64
+            return combined.toString(CryptoJS.enc.Base64);
+        }
+        
+        function generateWiFiQR(event) {
+            event.preventDefault();
+            
+            const deviceKey = document.getElementById('device-key').value.trim();
+            const ssid = document.getElementById('ssid').value.trim();
+            const password = document.getElementById('password').value;
+            const security = document.getElementById('security').value;
+            
+            // Validate password length
+            if (password.length < 8 || password.length > 63) {
+                alert('WiFi password must be 8-63 characters');
+                return;
+            }
+            
+            // Create WiFi data
+            const wifiData = {
+                type: "wifi_setup",
+                ssid: ssid,
+                password: password,
+                security: security,
+                timestamp: new Date().toISOString()
+            };
+            
+            // Encrypt with device key
+            const encrypted = aes256Encrypt(JSON.stringify(wifiData), deviceKey);
+            
+            // Generate QR code
+            document.getElementById('wifi-qrcode').innerHTML = '';
+            new QRCode(document.getElementById('wifi-qrcode'), {
+                text: encrypted,
+                width: 300,
+                height: 300,
+                colorDark: "#000000",
+                colorLight: "#ffffff",
+                correctLevel: QRCode.CorrectLevel.H
+            });
+            
+            // Show output
+            document.getElementById('wifi-qr-output').classList.add('show');
+            
+            // Scroll to QR
+            document.getElementById('wifi-qr-output').scrollIntoView({behavior: 'smooth'});
+        }
+        
+        function generateSessionQR(event) {
+            event.preventDefault();
+            
+            const deviceKey = document.getElementById('session-device-key').value.trim();
+            let sessionId = document.getElementById('session-id').value.trim();
+            const targetDevice = document.getElementById('target-device').value.trim() || "ANY";
+            
+            // Generate session ID if not provided
+            if (!sessionId) {
+                sessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            }
+            
+            // Calculate expiry (5 minutes from now)
+            const expiry = new Date(Date.now() + 5 * 60 * 1000);
+            
+            // Create session data
+            const sessionData = {
+                type: "session",
+                session_id: sessionId,
+                device_id: targetDevice,
+                timestamp: new Date().toISOString(),
+                expires_at: expiry.toISOString()
+            };
+            
+            // Encrypt with device key
+            const encrypted = aes256Encrypt(JSON.stringify(sessionData), deviceKey);
+            
+            // Generate QR code
+            document.getElementById('session-qrcode').innerHTML = '';
+            new QRCode(document.getElementById('session-qrcode'), {
+                text: encrypted,
+                width: 300,
+                height: 300,
+                colorDark: "#000000",
+                colorLight: "#ffffff",
+                correctLevel: QRCode.CorrectLevel.H
+            });
+            
+            // Show info
+            document.getElementById('generated-session-id').textContent = sessionId;
+            document.getElementById('expiry-time').textContent = expiry.toLocaleString();
+            
+            // Show output
+            document.getElementById('session-qr-output').classList.add('show');
+            
+            // Scroll to QR
+            document.getElementById('session-qr-output').scrollIntoView({behavior: 'smooth'});
+        }
+        
+        function parseDeviceLabel() {
+            const data = document.getElementById('device-label-data').value.trim();
+            
+            try {
+                const label = JSON.parse(data);
+                
+                if (label.type === 'device_label') {
+                    document.getElementById('info-hardware-id').textContent = label.hardware_id;
+                    document.getElementById('info-device-name').textContent = label.device_name || 'N/A';
+                    document.getElementById('info-device-key').textContent = label.device_key;
+                    document.getElementById('device-info').style.display = 'block';
+                    
+                    // Auto-fill device key in forms
+                    document.getElementById('device-key').value = label.device_key;
+                    document.getElementById('session-device-key').value = label.device_key;
+                } else {
+                    alert('Invalid device label format');
+                }
+            } catch (e) {
+                alert('Error parsing device label: ' + e.message);
+            }
+        }
+        
+        function downloadQR(type) {
+            const qrDiv = document.getElementById(type + '-qrcode');
+            const canvas = qrDiv.querySelector('canvas');
+            
+            if (canvas) {
+                const link = document.createElement('a');
+                link.download = type + '-qr-code.png';
+                link.href = canvas.toDataURL();
+                link.click();
+            }
+        }
+        
+        function printQR() {
+            window.print();
+        }
+    </script>
+</body>
+</html>
+
+

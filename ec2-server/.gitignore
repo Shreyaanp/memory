@@ -1,0 +1,39 @@
+# Environment and secrets
+.env
+.env.local
+.env.production
+*.pem
+
+# Database
+*.db
+*.db-journal
+*.db.old
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv
+
+# Logs
+*.log
+server.log
+
+# Temporary files
+*.tmp
+*.bak
+*.backup.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

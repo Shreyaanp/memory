@@ -1,0 +1,520 @@
+# MDAI Complete System - Deployment & Testing Guide
+
+## ═══════════════════════════════════════════════════════════════════════════
+## System Architecture Overview
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Components:
+1. **RDK X5 Device** (ARM64)
+   - RealSense D435i Camera
+   - LilyGo 1.43" AMOLED Display
+   - SystemController (C++)
+   - MediaPipe Face Mesh (468 landmarks, GPU accelerated)
+   
+2. **EC2 Middleware Server** (mdai.mercle.ai)
+   - WebSocket Server (WSS on port 443)
+   - Device Registration API
+   - Challenge-Response Authentication
+   - Session Management (SQLite)
+   
+3. **Admin Web Portal** (https://mdai.mercle.ai/)
+   - Device Selection
+   - WiFi QR Generation
+   - Session Management
+
+4. **Mobile App** (Flutter)
+   - Session QR Generation
+   - Face tracking progress display
+   - Result notifications
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 1. EC2 SERVER DEPLOYMENT
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Prerequisites:
+- EC2 instance running Ubuntu 20.04+
+- Domain `mdai.mercle.ai` pointed to EC2 IP
+- Ports 80, 443 open in Security Group
+
+### Deployment Steps:
+
+```bash
+# SSH into EC2
+ssh ubuntu@mdai.mercle.ai
+
+# Clone or copy codebase
+cd /home/ubuntu
+# (copy codebase/ec2-server directory)
+
+# Run deployment
+cd ec2-server
+chmod +x full-deploy.sh
+sudo ./full-deploy.sh
+```
+
+### Verify Deployment:
+
+```bash
+# Check server status
+sudo systemctl status mdai-server
+
+# Check logs
+sudo journalctl -u mdai-server -f
+
+# Test health endpoint
+curl https://mdai.mercle.ai/api/health
+
+# Test device list
+curl https://mdai.mercle.ai/api/devices
+
+# Check SSL certificate
+sudo certbot certificates
+```
+
+### Expected Output:
+- ✅ MDAI Server: RUNNING
+- ✅ Nginx: RUNNING
+- ✅ SSL Certificate: ACTIVE
+- ✅ Admin Portal: Accessible at https://mdai.mercle.ai/
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 2. RDK DEVICE SETUP
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Prerequisites:
+- RDK X5 with Ubuntu 20.04+ (ARM64)
+- RealSense D435i connected via USB 3.0
+- LilyGo 1.43" AMOLED connected via USB (serial)
+- Internet connectivity (for initial registration)
+
+### Initial Setup:
+
+```bash
+# On your dev machine, copy codebase to RDK
+scp -r codebase/ root@<RDK_IP>:/home/mercleDev/
+
+# SSH into RDK
+ssh root@<RDK_IP>
+
+# Run complete deployment (includes registration)
+cd /home/mercleDev/codebase/deployment
+sudo ./deploy-complete-system.sh
+```
+
+### What This Does:
+1. Installs dependencies (RealSense, OpenCV, MediaPipe, etc.)
+2. Generates RSA key pair (device_private.pem, device_public.pem)
+3. Registers device with EC2 server
+4. Saves device config to `/etc/mdai/device_config.json`
+5. Sets up WiFi management scripts
+6. Builds C++ application
+
+### Verify Registration:
+
+```bash
+# Check device config
+cat /etc/mdai/device_config.json
+
+# Expected output:
+{
+  "device_id": "RDK-XX:XX:XX:XX:XX:XX",
+  "hardware_id": "xx:xx:xx:xx:xx:xx",
+  "registered_at": "2025-XX-XX..."
+}
+
+# Verify keys exist
+ls -la /etc/mdai/
+# Should see: device_private.pem, device_public.pem, device_config.json
+
+# Verify device appears on server
+curl https://mdai.mercle.ai/api/devices
+```
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 3. BUILD & RUN RDK APPLICATION
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Build Application:
+
+```bash
+cd /home/mercleDev/codebase
+./build-and-run.sh
+```
+
+### Or build manually:
+
+```bash
+cd /home/mercleDev/codebase
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DHAVE_OPENCV=ON -DENABLE_MEDIAPIPE=ON
+make -j$(nproc)
+./mdai_system
+```
+
+### Expected Boot Sequence:
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║                    MDAI SYSTEM STARTED                        ║
+╚═══════════════════════════════════════════════════════════════╝
+
+📊 System Status:
+   • Device ID: RDK-XX:XX:XX:XX:XX:XX
+   • EC2 Server: mdai.mercle.ai
+   • Serial Port: /dev/ttyUSB0
+
+📹 Camera:
+   • RGB: 640x480 @ 30fps (Idle)
+   • RGB+IR+Depth: 1280x720 + 848x480 @ 30fps (Tracking)
+
+🔄 Flow:
+   Boot → Check WiFi → Scan QR → Warmup → Align → Process → Result
+
+[STATE] BOOT
+[SERIAL] Sending state 1 to LilyGo
+[CAMERA] Initializing RGB-only mode...
+[WIFI] Checking existing connection...
+```
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 4. COMPLETE SYSTEM FLOW TESTING
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Test 1: WiFi Provisioning (First Boot)
+
+#### On RDK:
+```bash
+./mdai_system
+```
+
+**Expected Screens:**
+- Screen 1: Logo (2s)
+- Screen 2: "Connecting to WiFi..." (spinner)
+- Screen 3: "WiFi Connected" or "Scan WiFi QR"
+
+#### On Admin Portal (https://mdai.mercle.ai/):
+1. Open portal in browser
+2. Select your RDK device from dropdown
+3. Enter WiFi SSID (auto-detected or manual)
+4. Enter WiFi password
+5. Click "Generate WiFi QR"
+6. Show QR to RDK camera
+
+**Expected Behavior:**
+- RDK scans QR → Decrypts challenge → Validates with server
+- Screen shows: "Connecting to WiFi..."
+- If success: "✓ WiFi Connected" (green, 5s) → Screen 4 (Idle)
+- If failure: "✗ WiFi Failed - Reverting" (red, 5s) → Falls back to old network
+
+### Test 2: Session Initialization
+
+#### On Mobile App (Flutter):
+1. Launch app
+2. Generate session QR with:
+   ```json
+   {
+     "platform_id": "USER_12345",
+     "session_id": "auto-generated-uuid",
+     "timestamp": "..."
+   }
+   ```
+3. Show QR to RDK camera
+
+**Expected Screens on RDK:**
+- Screen 4: "Scan QR Code" → QR detected
+- Screen 5: "Warmup" (camera switching to high-res mode, ~2s)
+- Screen 6: "Position Face" (waiting for mobile app "start" command)
+
+**Expected Console Output:**
+```
+📱 QR Code Detected (Idle State)
+🔑 Session QR Detected
+✅ Session QR Scanned: platform=USER_12345, session=xxx
+✅ WebSocket Connected
+[STATE] WARMUP
+[CAMERA] Switching to RGB+IR+Depth mode...
+[WS] Waiting for 'start' command from mobile app...
+```
+
+### Test 3: Face Tracking (Alignment Phase)
+
+#### On Mobile App:
+1. Send WebSocket message:
+   ```json
+   {
+     "type": "start"
+   }
+   ```
+
+**Expected Screens on RDK:**
+- Screen 7: "Align" - Shows circular tracking UI
+- Dot in center moves with nose position
+- Circular progress ring fills as user rotates head
+
+**Expected Console Output:**
+```
+📨 WS Message: {"type":"start"}
+▶️ Starting alignment phase
+[STATE] ALIGN
+[CAMERA] Recording started (RGB+IR+Depth)
+[FACE] 468 landmarks detected
+[NOSE] Position: X=0.52, Y=0.48 → Sending to LilyGo
+[PROGRESS] Circular motion: 25%
+[WS] Sending progress update: 0.25
+```
+
+**Expected LilyGo Display:**
+- Screen 7 shows target dot moving with nose
+- Circular ring gradually fills (0% → 100%)
+- When 100%: Automatically proceeds to processing
+
+### Test 4: Anti-Spoofing Processing
+
+**Expected Screens:**
+- Screen 8: "Processing" (progress bar)
+
+**Expected Console Output:**
+```
+[STATE] PROCESSING
+🔬 Starting Batch Processing...
+Processing 180 frames...
+[ANTI-SPOOF] Frame 3: PASS
+[ANTI-SPOOF] Frame 6: PASS
+[ANTI-SPOOF] Frame 9: PASS
+[ANTI-SPOOF] Frame 12: PASS
+[ANTI-SPOOF] Frame 15: PASS
+Max consecutive passes: 23
+✅ Anti-spoofing PASSED (23 consecutive frames)
+📤 Sending result to API...
+[WS] Sending: {"type":"submit_result", "platform_id":"USER_12345", ...}
+```
+
+### Test 5: Result Display
+
+**Expected Screens (if success):**
+- Screen 9: "✓ Success" (green, 5s)
+- Screen 10: "Thank You" (3s)
+- Screen 4: "Scan QR Code" (back to idle)
+
+**Expected Screens (if failed):**
+- Screen 10: "✗ Error" (red, 5s)
+- Screen 4: "Scan QR Code" (back to idle)
+
+**Expected Mobile App:**
+- Receives WebSocket message:
+  ```json
+  {
+    "type": "api_response",
+    "status": "success",
+    "message": "Verification successful",
+    "platform_id": "USER_12345"
+  }
+  ```
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 5. TROUBLESHOOTING
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Device Registration Failed
+```bash
+# Check internet connectivity
+ping mdai.mercle.ai
+
+# Check EC2 server is running
+curl https://mdai.mercle.ai/api/health
+
+# Manually register
+cd /home/mercleDev/codebase/tools
+python3 register_device.py
+
+# Verify
+curl https://mdai.mercle.ai/api/devices | python3 -m json.tool
+```
+
+### QR Not Detected
+```bash
+# Check camera
+rs-enumerate-devices
+
+# Check QR in logs
+# Should see: "📱 QR Code Detected"
+
+# Test OpenCV QR detection
+cd /home/mercleDev/codebase/examples
+./test_qr_detection
+```
+
+### WebSocket Connection Failed
+```bash
+# Check EC2 server
+curl https://mdai.mercle.ai/api/status
+
+# Check WebSocket endpoint
+wscat -c wss://mdai.mercle.ai/ws/device
+
+# Check device logs
+journalctl -u mdai-system -f
+```
+
+### Face Detection Not Working
+```bash
+# Check MediaPipe
+python3 -c "import mediapipe; print(mediapipe.__version__)"
+
+# Check GPU (if available)
+ls /dev/dri
+
+# Test face detection
+cd /home/mercleDev/codebase/examples
+./test_face_detection
+```
+
+### LilyGo Display Not Updating
+```bash
+# Check serial port
+ls -la /dev/ttyUSB*
+ls -la /dev/ttyACM*
+
+# Set permissions
+sudo chmod 666 /dev/ttyUSB0
+
+# Test serial communication
+echo "Hello" > /dev/ttyUSB0
+```
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 6. VERIFICATION CHECKLIST
+## ═══════════════════════════════════════════════════════════════════════════
+
+### EC2 Server:
+- [ ] Server running: `systemctl status mdai-server`
+- [ ] Nginx running: `systemctl status nginx`
+- [ ] SSL certificate active
+- [ ] Admin portal accessible at https://mdai.mercle.ai/
+- [ ] Health endpoint: `curl https://mdai.mercle.ai/api/health`
+
+### RDK Device:
+- [ ] Device registered: `/etc/mdai/device_config.json` exists
+- [ ] Keys generated: `/etc/mdai/device_private.pem` exists
+- [ ] Device appears in server: `curl https://mdai.mercle.ai/api/devices`
+- [ ] Camera connected: `rs-enumerate-devices`
+- [ ] LilyGo connected: `ls /dev/ttyUSB0`
+- [ ] Application builds: `./build-and-run.sh`
+
+### Complete Flow:
+- [ ] Boot → Logo screen → WiFi check
+- [ ] WiFi QR scan → Connection → Success screen
+- [ ] Session QR scan → WebSocket connect → Warmup
+- [ ] Mobile "start" → Alignment screen → Nose tracking
+- [ ] Circular motion complete → Processing screen
+- [ ] Anti-spoofing pass → Success screen
+- [ ] Return to idle screen
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 7. PERFORMANCE METRICS
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Expected Timings:
+- Boot sequence: ~5s
+- WiFi QR scan to connection: ~3-5s
+- Session QR scan to WebSocket: ~1-2s
+- Camera mode switch (RGB → Full): ~2s
+- Face alignment phase: ~10-15s (depends on user)
+- Anti-spoofing processing: ~5-8s
+- Total session time: ~25-35s
+
+### Resource Usage:
+- CPU: 40-60% during tracking, 80-100% during processing
+- Memory: ~800MB - 1.2GB
+- Camera bandwidth: ~150MB/s (full mode)
+- Network: <1MB/s (WebSocket messages)
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## 8. MAINTENANCE
+## ═══════════════════════════════════════════════════════════════════════════
+
+### Update EC2 Server:
+```bash
+cd /home/ubuntu/ec2-server
+git pull
+sudo systemctl restart mdai-server
+```
+
+### Update RDK Application:
+```bash
+cd /home/mercleDev/codebase
+git pull
+./build-and-run.sh --clean
+```
+
+### View Logs:
+```bash
+# EC2 server
+sudo journalctl -u mdai-server -f
+
+# RDK application
+journalctl -u mdai-system -f
+
+# Nginx
+sudo tail -f /var/log/nginx/access.log
+sudo tail -f /var/log/nginx/error.log
+```
+
+### Backup Database:
+```bash
+# On EC2
+sudo cp /var/lib/mdai/mdai_server.db /backup/mdai_server_$(date +%Y%m%d).db
+```
+
+---
+
+## ═══════════════════════════════════════════════════════════════════════════
+## SUMMARY
+## ═══════════════════════════════════════════════════════════════════════════
+
+The complete system is now integrated and ready for testing:
+
+✅ **RDK Device**:
+   - SystemController with full state machine
+   - Challenge-response QR authentication
+   - WiFi management with fallback
+   - Camera mode switching (RGB-only vs Full)
+   - MediaPipe face tracking (468 landmarks)
+   - Serial communication to LilyGo
+   - WebSocket client for session management
+   - Anti-spoofing pipeline (5+ consecutive frames)
+
+✅ **EC2 Server**:
+   - Device registration API
+   - Challenge-response authentication
+   - WebSocket server (WSS)
+   - Session management (SQLite)
+   - API result forwarding
+   - Admin portal hosting
+
+✅ **LilyGo Display**:
+   - 14 screens (0-13)
+   - State-driven UI updates
+   - Nose tracking visualization
+   - Success/Error feedback
+
+**Next Steps**: Run tests as described above and iterate based on results.
+
+Good luck with testing! 🚀
+
