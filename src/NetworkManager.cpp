@@ -100,6 +100,25 @@ std::string NetworkManager::get_ip_address() {
     return std::string(buffer);
 }
 
+std::string NetworkManager::get_current_ssid() {
+    // Use nmcli to get the currently connected WiFi SSID
+    FILE* pipe = popen("nmcli -t -f active,ssid dev wifi | awk -F: '$1 ~ /^yes/ {print $2}'", "r");
+    if (!pipe) return "";
+    
+    char buffer[256];
+    std::string ssid;
+    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        ssid = buffer;
+        // Remove trailing newline
+        if (!ssid.empty() && ssid.back() == '\n') {
+            ssid.pop_back();
+        }
+    }
+    pclose(pipe);
+    
+    return ssid;
+}
+
 // ============================================================================
 // WebSocket Client (WSS) Implementation
 // ============================================================================

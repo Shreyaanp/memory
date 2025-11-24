@@ -133,8 +133,7 @@ void SystemController::set_state(SystemState new_state) {
             serial_comm_->send_state(4); // Screen 4: "WiFi Connected" screen (show SSID, 3s)
             std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::seconds(3));
-                serial_comm_->send_state(5); // Screen 5: "mDai Ready" screen (2s preemptive)
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+                // Transition to IDLE (which will automatically show Screen 5)
                 set_state(SystemState::IDLE);
             }).detach();
             break;
@@ -215,6 +214,7 @@ void SystemController::set_state(SystemState new_state) {
             
         case SystemState::ERROR:
             serial_comm_->send_state(9); // Screen 9: "Error" screen
+            // Error message should already be sent via send_error() before entering ERROR state
             std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 set_state(SystemState::IDLE);
@@ -434,6 +434,12 @@ void SystemController::handle_idle(FrameBox* frame) {
     if (!decoded_info.empty()) {
         std::cout << "📱 QR Code Detected (Idle State)" << std::endl;
         
+        // FILTER: Ignore tiny QR codes (false positives from ZBar)
+        if (decoded_info.length() < 20) {
+            std::cout << "⚠️  Ignoring tiny QR code (" << decoded_info.length() << " bytes) - likely false positive" << std::endl;
+            return; // Skip processing
+        }
+        
         // STEP 1: Detect QR type by size and structure
         // Session QR: Raw encrypted 8-char token = ~44-88 base64 chars
         // WiFi QR: Much longer (~150+ chars)
@@ -485,12 +491,22 @@ void SystemController::handle_idle(FrameBox* frame) {
             
             try {
                 // Decrypt QR (no compression, no JSON - just raw token!)
-                std::string ws_token = CryptoUtils::aes256_decrypt(encrypted_data, qr_key);
+                std::string decrypted_data = CryptoUtils::aes256_decrypt(encrypted_data, qr_key);
                 std::cout << "✅ QR decrypted successfully" << std::endl;
                 
-                // Decrypted QR contains just the HMAC token (8 chars after stripping "S:" prefix)
+                // Check if decrypted data has "S:" prefix (new format)
+                std::string ws_token;
+                if (decrypted_data.length() > 2 && decrypted_data.substr(0, 2) == "S:") {
+                    ws_token = decrypted_data.substr(2);  // Strip "S:" prefix
+                    std::cout << "🔐 Detected: New format with S: prefix" << std::endl;
+                } else {
+                    ws_token = decrypted_data;  // Legacy format without prefix
+                    std::cout << "🔐 Detected: Legacy format without prefix" << std::endl;
+                }
+                
+                // Validate token is 8 chars
                 if (ws_token.empty() || ws_token.length() != 8) {
-                    std::cerr << "⚠ Invalid token in QR (expected 8 chars)" << std::endl;
+                    std::cerr << "⚠ Invalid token in QR (expected 8 chars, got " << ws_token.length() << ")" << std::endl;
                     return;
                 }
                 
@@ -540,10 +556,8 @@ void SystemController::handle_idle(FrameBox* frame) {
         // STEP 3: Handle WiFi QR (from admin portal)
         else if (is_wifi_qr) {
             // User scanned WiFi QR in IDLE state - wrong QR type!
-            std::cerr << "⚠ WiFi QR scanned in IDLE state - need Session QR!" << std::endl;
-            serial_comm_->send_state(9); // Show error screen
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-            serial_comm_->send_state(5); // Back to "Scan QR" screen
+            std::cerr << "⚠ WiFi QR scanned in IDLE state - ignoring (need Session QR)" << std::endl;
+            // Just ignore it - don't show error screen for wrong QR type
             return;
         }
     }
@@ -782,7 +796,56 @@ void SystemController::on_websocket_message(const std::string& message) {
             std::cout << "📍 Entering PLACEHOLDER Screen 7 (will auto-transition)" << std::endl;
             set_state(SystemState::PLACEHOLDER_SCREEN_7);
         }
-        // Handle start command (server forwards as plain JSON without "type" wrapper)
+        else if (msg_type == "mobile_disconnected") {
+            // Mobile app disconnected - go back to IDLE
+            std::cout << "⚠️  Mobile app disconnected - returning to IDLE" << std::endl;
+            network_mgr_->disconnect();
+            set_state(SystemState::IDLE);
+        }
+        else if (msg_type == "to_device") {
+            // Server wrapped message - extract the data payload
+            if (msg_json.contains("data")) {
+                nlohmann::json data = msg_json["data"];
+                
+                if (data.contains("command")) {
+                    std::string command = data.value("command", "");
+                    std::cout << "📩 Received command from mobile: " << command << std::endl;
+                    
+                    if (command == "start_verification" || command == "start") {
+                        std::cout << "▶️  Processing start verification command" << std::endl;
+                        
+                        if (current_state_ == SystemState::READY) {
+                            if (test_mode_) {
+                                // 🧪 TEST MODE: Skip verification, show success immediately
+                                std::cout << "🧪 TEST MODE: Bypassing verification flow → SUCCESS" << std::endl;
+                                serial_comm_->send_state(8); // Screen 8: Success
+                                
+                                // Send success message to mobile
+                                nlohmann::json success_msg = {
+                                    {"type", "to_mobile"},
+                                    {"data", {
+                                        {"type", "result"},
+                                        {"status", "success"},
+                                        {"message", "TEST MODE: Verification bypassed"}
+                                    }}
+                                };
+                                network_mgr_->send_message(success_msg.dump());
+                                
+                                set_state(SystemState::SUCCESS);
+                            } else {
+                                // REAL MODE: Do actual verification
+                                std::cout << "🔥 Starting WARMUP phase" << std::endl;
+                                set_state(SystemState::WARMUP);
+                            }
+                        } else {
+                            std::cerr << "⚠️  Received start command but not in READY state (current: " 
+                                      << static_cast<int>(current_state_.load()) << ")" << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+        // Handle start command (legacy: server forwards as plain JSON without "type" wrapper)
         else if (msg_json.contains("command")) {
             std::string command = msg_json.value("command", "");
             
@@ -836,8 +899,7 @@ void SystemController::on_websocket_message(const std::string& message) {
                     
                     if (producer_ && producer_->is_running()) {
                         std::cout << "✅ Camera reinitialized successfully!" << std::endl;
-                        serial_comm_->send_state(5); // Show "mDai Ready"
-                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        // Transition to IDLE (which will automatically show Screen 5)
                         set_state(SystemState::IDLE);
                     } else {
                         std::cerr << "❌ Camera retry failed" << std::endl;
@@ -1040,14 +1102,13 @@ void SystemController::handle_boot() {
     // Check WiFi connection status
     if (check_wifi_on_boot()) {
         // WiFi already connected - skip Screen 3 (WiFi QR scanning)
-        // Go directly to Screen 4: WiFi Connected
-        serial_comm_->send_state(4); // Screen 4: "WiFi Connected" (show SSID)
+        // Go directly to Screen 4: WiFi Connected (with SSID)
+        std::string ssid = network_mgr_->get_current_ssid();
+        if (ssid.empty()) ssid = "WiFi Connected";
+        serial_comm_->send_state_with_text(4, ssid); // Screen 4 with SSID
         std::this_thread::sleep_for(std::chrono::seconds(3));
         
-        // Screen 5: "mDai Ready" (2 seconds preemptive)
-        serial_comm_->send_state(5);
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        
+        // Transition to IDLE (which will automatically show Screen 5)
         set_state(SystemState::IDLE);
     } else {
         // No WiFi - show Screen 3: "Looking for WiFi QR"
@@ -1095,9 +1156,7 @@ bool SystemController::handle_wifi_qr(const std::string& qr_data) {
             serial_comm_->send_state(4); // Screen 4: "WiFi Success" (show SSID)
             std::this_thread::sleep_for(std::chrono::seconds(3));
             
-            serial_comm_->send_state(5); // Screen 5: "mDai Ready"
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            
+            // Transition to IDLE (which will automatically show Screen 5)
             set_state(SystemState::IDLE);
             return true;
         } else {

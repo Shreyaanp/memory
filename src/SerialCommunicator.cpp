@@ -169,6 +169,32 @@ bool SerialCommunicator::send_state(int state_id) {
     }
 }
 
+bool SerialCommunicator::send_state_with_text(int state_id, const std::string& text) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    
+    if (!connected_ || fd_ == -1) {
+        // Try to reconnect if disconnected
+        if (!try_reconnect()) {
+            return false;
+        }
+    }
+    
+    // Send JSON format: {"screen": 4, "text": "WiFi Name"}
+    std::string message = "{\"screen\": " + std::to_string(state_id) + ", \"text\": \"" + text + "\"}\n";
+    ssize_t written = write(fd_, message.c_str(), message.length());
+    
+    if (written == static_cast<ssize_t>(message.length())) {
+        last_state_ = state_id;  // Store for recovery
+        std::cout << "[Serial] Sent state: " << state_id << " with text: " << text << " to ESP32" << std::endl;
+        return true;
+    } else {
+        std::cerr << "Error writing to serial port" << std::endl;
+        // Mark as disconnected and try reconnect next time
+        connected_ = false;
+        return false;
+    }
+}
+
 bool SerialCommunicator::send_nose_position(float x, float y) {
     std::lock_guard<std::mutex> lock(write_mutex_);
     

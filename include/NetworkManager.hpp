@@ -20,6 +20,7 @@ public:
     bool connect_wifi(const std::string& ssid, const std::string& password);
     bool is_connected_to_internet();
     std::string get_ip_address();
+    std::string get_current_ssid();  // Get currently connected WiFi SSID
     void start_wifi_monitor();
     void stop_wifi_monitor();
     bool is_wifi_stable() const;

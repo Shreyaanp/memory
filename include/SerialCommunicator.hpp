@@ -64,6 +64,14 @@ public:
     bool send_state(int state_id);
     
     /**
+     * @brief Send state change with optional text
+     * @param state_id State/Screen ID (1-13)
+     * @param text Optional text to display on the screen
+     * @return true if sent successfully
+     */
+    bool send_state_with_text(int state_id, const std::string& text);
+    
+    /**
      * @brief Send nose tracking position update
      * @param x X coordinate (0.0-1.0, normalized)
      * @param y Y coordinate (0.0-1.0, normalized)
