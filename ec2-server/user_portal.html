@@ -436,6 +436,15 @@
             ws.onopen = () => {
                 updateStatus('connected', 'WebSocket Connected');
                 addLog('system', '✅ WebSocket connected');
+                
+                // Send authentication message immediately
+                const authMessage = {
+                    type: 'auth',
+                    bearer_token: jwtToken,
+                    session_id: sessionId
+                };
+                ws.send(JSON.stringify(authMessage));
+                addLog('sent', `📤 Authenticating: ${JSON.stringify(authMessage, null, 2)}`);
             };
 
             ws.onmessage = (event) => {
@@ -457,6 +466,14 @@
             ws.onclose = () => {
                 updateStatus('disconnected', 'WebSocket Disconnected');
                 addLog('system', '🔌 WebSocket closed');
+                
+                // Disable start button and show session ended message
+                document.getElementById('startBtn').disabled = true;
+                if (document.getElementById('sessionInfo').style.display !== 'none') {
+                    document.getElementById('deviceStatus').textContent = '⚠️ Connection lost - Create a new session';
+                    document.getElementById('deviceStatus').className = 'status-message error';
+                    document.getElementById('deviceStatus').style.display = 'block';
+                }
             };
         }
 
@@ -482,10 +499,16 @@
                 
                 case 'device_disconnected':
                     updateStatus('disconnected', 'Device Disconnected');
-                    document.getElementById('deviceStatus').textContent = '⚠️ Device disconnected';
+                    document.getElementById('deviceStatus').textContent = '⚠️ Device disconnected - Session ended';
                     document.getElementById('deviceStatus').className = 'status-message error';
+                    document.getElementById('deviceStatus').style.display = 'block';
                     document.getElementById('startBtn').disabled = true;
-                    addLog('error', '⚠️ Device disconnected');
+                    addLog('error', '⚠️ Device disconnected - Create a new session to continue');
+                    
+                    // Optionally auto-disconnect WebSocket
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.close();
+                    }
                     break;
                 
                 case 'device_ready':
