@@ -21,17 +21,18 @@ enum class SystemState {
     PROVISIONING,            // Screen 2: Connecting to WiFi
     PROVISIONED,             // Screen 3: Connection Success (3s display)
     AWAIT_ADMIN_QR,          // No screen (boot checks WiFi first)
-    IDLE,                    // Screen 4/5: Waiting for QR (User or WiFi Change)
+    IDLE,                    // Screen 6: Waiting for QR (User or WiFi Change)
     WIFI_CHANGE_CONNECTING,  // Screen 11-12: Connecting to new WiFi
     WIFI_CHANGE_SUCCESS,     // Screen 13: WiFi change success
     WIFI_CHANGE_FAILED,      // Screen 14: WiFi change failed + fallback
-    READY,                   // Screen 6: Connected, waiting for user to start
+    PLACEHOLDER_SCREEN_7,    // Screen 7: [PLACEHOLDER - TO BE IMPLEMENTED LATER]
+    READY,                   // Connected, waiting for user to start
     WARMUP,                  // Camera warming up (5 frames)
-    ALIGN,                   // Screen 7: Active Liveness (Recording + Face Mesh)
-    PROCESSING,              // Screen 8: Batch Anti-Spoofing Analysis
-    SUCCESS,                 // Screen 9: Success
-    ERROR,                   // Screen 10: Error
-    LOGOUT                   // Screen 10: Thank you / Logout
+    ALIGN,                   // Active Liveness (Recording + Face Mesh)
+    PROCESSING,              // Batch Anti-Spoofing Analysis
+    SUCCESS,                 // Success
+    ERROR,                   // Error
+    LOGOUT                   // Thank you / Logout
 };
 
 class SystemController {
@@ -71,6 +72,9 @@ private:
     // Middleware Config
     std::string middleware_host_ = "mdai.mercle.ai"; // EC2 instance
     
+    // Test Mode Flag (set to false for real verification)
+    bool test_mode_ = true;  // TODO: Set to false when ready for production
+    
     // Circular Motion Tracking
     struct MotionTracker {
         std::vector<cv::Point2f> nose_positions;
@@ -98,7 +102,6 @@ private:
     
     // QR Handlers
     bool handle_wifi_qr(const std::string& qr_data);
-    bool handle_session_qr(const std::string& qr_data);
     std::string load_qr_shared_key();  // Load QR encryption key from config
     
     // Camera Management

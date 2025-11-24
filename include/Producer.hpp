@@ -16,6 +16,7 @@ namespace mdai {
  */
 struct CameraConfig {
     // Stream configuration
+    bool enable_depth = true;
     int depth_width = 848;
     int depth_height = 480;
     int depth_fps = 30;
@@ -245,4 +246,3 @@ private:
 };
 
 } // namespace mdai
-

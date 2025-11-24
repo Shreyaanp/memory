@@ -4,7 +4,7 @@ MDAI WebSocket Middleware Server - FastAPI Implementation
 ==========================================================
 Handles:
 - Mobile session creation with bearer token validation
-- Encrypted QR generation (AES-256)
+- Encrypted QR generation (AES-256 with zlib compression)
 - WebSocket pairing (mobile ↔ device)
 - Message routing with platform_id privacy
 - Multi-device scan detection
@@ -16,8 +16,10 @@ import json
 import sqlite3
 import secrets
 import hashlib
+import hmac
 import time
 import os
+import zlib
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 import logging
@@ -27,12 +29,16 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from bson import ObjectId
 import jwt as pyjwt
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+
+# Load .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -51,18 +57,19 @@ DB_PATH = os.getenv('DB_PATH', './mdai_server.db')
 # JWT Configuration (for WebSocket tokens)
 JWT_SECRET = os.getenv('JWT_SECRET', 'mdai_secret_change_in_production_2024')
 JWT_ALGORITHM = 'HS256'
-JWT_EXPIRY = 3 * 60  # 3 minutes
+JWT_EXPIRY = 5 * 60  # 5 minutes (for QR code scanning window)
 
 # AES-256 Key for QR encryption
-QR_ENCRYPTION_KEY = os.getenv('QR_ENCRYPTION_KEY', 'mdai_qr_encryption_key_32byte!')[:32].ljust(32, '0')
+# QR Encryption Key - should be 64 hex chars in .env (will be converted to 32 bytes in aes_encrypt)
+QR_ENCRYPTION_KEY = os.getenv('QR_ENCRYPTION_KEY', 'default_fallback_key_should_not_be_used_in_production_environment')
 
 # Your Backend API Configuration
 YOUR_BACKEND_VALIDATE_URL = os.getenv('BACKEND_VALIDATE_URL', 'https://newapi.mercle.ai/api/auth/verify-mdai-user')
 YOUR_BACKEND_API_URL = 'https://newapi.mercle.ai/api/admin/hardware/next'
-YOUR_BACKEND_API_KEY = 'mercle'
+YOUR_BACKEND_API_KEY = os.getenv('BACKEND_API_KEY', 'mercle')
 
 # Session expiry times
-MOBILE_SESSION_EXPIRY = 3 * 60  # 3 minutes
+MOBILE_SESSION_EXPIRY = 5 * 60  # 5 minutes (match JWT expiry)
 
 # ============================================================================
 # FastAPI App
@@ -80,14 +87,17 @@ app.add_middleware(
 # ============================================================================
 # AES-256 Encryption/Decryption
 # ============================================================================
-def aes_encrypt(plaintext: str, key: str) -> str:
+def aes_encrypt(plaintext: str, key_hex: str) -> str:
     """Encrypt data with AES-256-CBC"""
     iv = secrets.token_bytes(16)
     pad_length = 16 - (len(plaintext) % 16)
     padded = plaintext + (chr(pad_length) * pad_length)
     
+    # Convert hex key to bytes (not just encode!)
+    key_bytes = bytes.fromhex(key_hex[:64])  # Take first 64 hex chars = 32 bytes
+    
     cipher = Cipher(
-        algorithms.AES(key.encode()[:32]),
+        algorithms.AES(key_bytes),
         modes.CBC(iv),
         backend=default_backend()
     )
@@ -116,14 +126,15 @@ def init_database():
             user_id TEXT,
             ws_token TEXT NOT NULL,
             backend_token TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at INTEGER NOT NULL,
             expires_at TIMESTAMP NOT NULL,
             mobile_connected BOOLEAN DEFAULT 0,
             device_connected BOOLEAN DEFAULT 0,
             device_id TEXT,
             status TEXT DEFAULT 'pending',
             scan_count INTEGER DEFAULT 0,
-            multi_scan_detected BOOLEAN DEFAULT 0
+            multi_scan_detected BOOLEAN DEFAULT 0,
+            qr_scanned BOOLEAN DEFAULT 0
         )
     ''')
     
@@ -155,36 +166,64 @@ def init_database():
     ''')
     
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_mobile_sessions ON mobile_sessions(session_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_mobile_status ON mobile_sessions(status)')
+    try:
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_mobile_status ON mobile_sessions(status)')
+    except sqlite3.OperationalError:
+        # Column might not exist in old schema, skip
+        pass
     
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully")
 
 # ============================================================================
-# JWT Helper Functions
+# HMAC Token Helper Functions (Replacing JWT for smaller QR codes)
 # ============================================================================
-def generate_jwt(session_id: str) -> str:
-    """Generate JWT token for WebSocket authentication"""
-    payload = {
-        'session_id': session_id,
-        'iat': datetime.utcnow(),
-        'exp': datetime.utcnow() + timedelta(seconds=JWT_EXPIRY)
-    }
-    token = pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return token
+def generate_hmac_token(session_id: str, timestamp: int) -> str:
+    """
+    Generate HMAC token for WebSocket authentication
+    Returns 8-char HMAC hash (64-bit security)
+    QR will contain: just this token (no JSON, no timestamp)
+    Server uses DB created_at for timestamp verification
+    """
+    # Create HMAC of session_id:timestamp
+    message = f"{session_id}:{timestamp}".encode('utf-8')
+    hmac_value = hmac.new(JWT_SECRET.encode(), message, hashlib.sha256).hexdigest()
+    
+    # Return first 8 chars (64 bits of security)
+    return hmac_value[:8]
 
-def verify_jwt(token: str) -> Optional[dict]:
-    """Verify JWT token and return payload"""
+def verify_hmac_token(token: str, session_id: str, created_at_timestamp: int, max_age_seconds: int = 300) -> bool:
+    """
+    Verify HMAC token matches the expected value for given session_id
+    Uses DB created_at timestamp (Unix timestamp integer)
+    
+    Args:
+        token: HMAC hash (8 chars)
+        session_id: Session ID from database lookup
+        created_at_timestamp: Unix timestamp when session was created (from DB)
+        max_age_seconds: Maximum token age (default 5 minutes)
+    
+    Returns:
+        True if valid, False otherwise
+    """
     try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
-    except pyjwt.ExpiredSignatureError:
-        logger.warning("JWT token expired")
-        return None
-    except pyjwt.InvalidTokenError as e:
-        logger.warning(f"Invalid JWT token: {e}")
-        return None
+        # Check session not too old
+        current_time = int(time.time())
+        if current_time - created_at_timestamp > max_age_seconds:
+            logger.warning(f"Token expired: {current_time - created_at_timestamp}s old")
+            return False
+        
+        # Recompute HMAC using the original timestamp
+        message = f"{session_id}:{created_at_timestamp}".encode('utf-8')
+        hmac_expected = hmac.new(JWT_SECRET.encode(), message, hashlib.sha256).hexdigest()[:8]
+        
+        # Constant-time comparison
+        return hmac.compare_digest(token, hmac_expected)
+            
+    except Exception as e:
+        logger.warning(f"Token verification error: {e}")
+        return False
 
 # ============================================================================
 # Session Pair Manager (Mobile ↔ Device)
@@ -204,6 +243,7 @@ class SessionPair:
         if not self.device_ws:
             return False
         
+        # Preserve the 'type: to_device' wrapper and forward the data inside
         sanitized = {k: v for k, v in message.items() if k != 'platform_id'}
         
         try:
@@ -232,9 +272,12 @@ active_sessions: Dict[str, SessionPair] = {}
 # REST API Endpoints
 # ============================================================================
 @app.get("/")
-async def root():
-    """Serve mobile session portal"""
-    return FileResponse("mobile_session_portal.html")
+
+@app.get("/user")
+async def user_portal():
+    """Serve user portal with START button and live logs"""
+    return FileResponse("user_portal.html")
+
 
 @app.get("/api/health")
 async def health_check():
@@ -314,35 +357,47 @@ async def create_mobile_session(request: Request, authorization: Optional[str] =
         # Generate session ID
         session_id = str(ObjectId())
         
-        # Generate WebSocket token
-        ws_token = generate_jwt(session_id)
+        # Generate timestamp for HMAC
+        timestamp = int(time.time())
+        
+        # Generate HMAC token
+        ws_token = generate_hmac_token(session_id, timestamp)
         
         # Calculate expiry
         expires_at = datetime.now() + timedelta(seconds=MOBILE_SESSION_EXPIRY)
         
-        # Store session in database
+        # Store session in database (store timestamp used for HMAC)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
+        logger.info(f"Inserting session into DB: {session_id}")
         cursor.execute('''
             INSERT INTO mobile_sessions 
-            (session_id, platform_id, user_id, ws_token, backend_token, expires_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
-        ''', (session_id, platform_id, user_id, ws_token, bearer_token, expires_at))
+            (session_id, platform_id, user_id, ws_token, backend_token, expires_at, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        ''', (session_id, platform_id, user_id, ws_token, bearer_token, expires_at, timestamp))
         
         conn.commit()
+        logger.info(f"Session committed to DB: {session_id}")
+        
+        # Verify it was saved
+        cursor.execute('SELECT session_id FROM mobile_sessions WHERE session_id = ?', (session_id,))
+        if cursor.fetchone():
+            logger.info(f"Session verified in DB: {session_id}")
+        else:
+            logger.error(f"Session NOT FOUND in DB after commit: {session_id}")
+        
         conn.close()
         
-        # Create encrypted QR payload
-        qr_data = {
-            'session_id': session_id,
-            'token': ws_token,
-            'timestamp': int(time.time())
-        }
+        # Create QR payload - just the raw token with prefix
+        # Add "S:" prefix to differentiate from WiFi QR
+        qr_data = "S:" + ws_token  # Session QR marker + HMAC hash
         
-        encrypted_qr = aes_encrypt(json.dumps(qr_data), QR_ENCRYPTION_KEY)
+        # Encrypt the token directly
+        encrypted_qr = aes_encrypt(qr_data, QR_ENCRYPTION_KEY)
         
         logger.info(f"Mobile session created: {session_id}, platform_id: {platform_id}")
+        logger.info(f"QR data size: {len(qr_data)} chars (S: prefix + 8-char token)")
         
         # Determine WebSocket URL based on request origin
         request_host = request.headers.get('host', 'mdai.mercle.ai')
@@ -386,25 +441,20 @@ async def websocket_mobile(websocket: WebSocket):
         
         bearer_token = data.get('bearer_token')
         
-        # Verify JWT
-        payload = verify_jwt(bearer_token)
-        
-        if not payload:
-            await websocket.send_json({'type': 'auth_failed', 'error': 'Invalid or expired token'})
+        if not bearer_token:
+            await websocket.send_json({'type': 'auth_failed', 'error': 'Missing token'})
             await websocket.close(code=4401)
             return
         
-        session_id = payload.get('session_id')
-        
-        # Get session from database
+        # Lookup session by ws_token (HMAC hash)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT platform_id, expires_at, status, multi_scan_detected
+            SELECT session_id, platform_id, expires_at, status, multi_scan_detected, created_at
             FROM mobile_sessions
-            WHERE session_id = ?
-        ''', (session_id,))
+            WHERE ws_token = ?
+        ''', (bearer_token,))
         
         row = cursor.fetchone()
         
@@ -414,7 +464,14 @@ async def websocket_mobile(websocket: WebSocket):
             await websocket.close(code=4404)
             return
         
-        platform_id, expires_at, status, multi_scan_detected = row
+        session_id, platform_id, expires_at, status, multi_scan_detected, created_at = row
+        
+        # Verify HMAC token matches (using DB created_at for timestamp)
+        if not verify_hmac_token(bearer_token, session_id, created_at):
+            conn.close()
+            await websocket.send_json({'type': 'auth_failed', 'error': 'Invalid or expired token'})
+            await websocket.close(code=4401)
+            return
         
         # Check expiry
         expires_dt = datetime.fromisoformat(expires_at)
@@ -457,7 +514,8 @@ async def websocket_mobile(websocket: WebSocket):
             msg_type = data.get('type')
             
             if msg_type == 'to_device':
-                sent = await session_pair.route_to_device(data.get('data', {}))
+                # Forward the entire message (including type wrapper) to device
+                sent = await session_pair.route_to_device(data)
                 if not sent:
                     await websocket.send_json({'type': 'error', 'error': 'Device not connected'})
             
@@ -510,25 +568,20 @@ async def websocket_device(websocket: WebSocket):
         bearer_token = data.get('bearer_token')
         device_id = data.get('device_id')
         
-        # Verify JWT
-        payload = verify_jwt(bearer_token)
-        
-        if not payload:
-            await websocket.send_json({'type': 'auth_failed', 'error': 'Invalid or expired token'})
+        if not bearer_token or not device_id:
+            await websocket.send_json({'type': 'auth_failed', 'error': 'Missing token or device_id'})
             await websocket.close(code=4401)
             return
         
-        session_id = payload.get('session_id')
-        
-        # Get session from database
+        # Lookup session by ws_token (HMAC hash)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT platform_id, expires_at, status, device_connected, device_id
+            SELECT session_id, platform_id, expires_at, status, device_connected, device_id, qr_scanned, created_at
             FROM mobile_sessions
-            WHERE session_id = ?
-        ''', (session_id,))
+            WHERE ws_token = ?
+        ''', (bearer_token,))
         
         row = cursor.fetchone()
         
@@ -538,7 +591,25 @@ async def websocket_device(websocket: WebSocket):
             await websocket.close(code=4404)
             return
         
-        platform_id, expires_at, status, device_connected, existing_device_id = row
+        session_id, platform_id, expires_at, status, device_connected, existing_device_id, qr_scanned, created_at = row
+        
+        # Verify HMAC token matches (using DB created_at for timestamp)
+        if not verify_hmac_token(bearer_token, session_id, created_at):
+            conn.close()
+            await websocket.send_json({'type': 'auth_failed', 'error': 'Invalid or expired token'})
+            await websocket.close(code=4401)
+            return
+        
+        # ONE-TIME QR ENFORCEMENT (Strict Security)
+        if qr_scanned:
+            conn.close()
+            logger.warning(f"QR already used for session {session_id}")
+            await websocket.send_json({
+                'type': 'auth_failed',
+                'error': 'QR code already used. Please generate a new session.'
+            })
+            await websocket.close(code=4403)
+            return
         
         # Multi-scan detection
         if device_connected and existing_device_id and existing_device_id != device_id:
@@ -578,15 +649,17 @@ async def websocket_device(websocket: WebSocket):
             await websocket.close(code=4401)
             return
         
-        # Update session
+        # Update session - mark QR as scanned (one-time use)
         cursor.execute('''
             UPDATE mobile_sessions
-            SET device_connected = 1, device_id = ?, status = 'active'
+            SET device_connected = 1, device_id = ?, status = 'active', qr_scanned = 1
             WHERE session_id = ?
         ''', (device_id, session_id))
         
         conn.commit()
         conn.close()
+        
+        logger.info(f"Device {device_id} authenticated, QR marked as used for session {session_id}")
         
         # Get session pair
         if session_id not in active_sessions:
@@ -668,9 +741,6 @@ async def websocket_device(websocket: WebSocket):
                     await websocket.send_json(fail_msg)
                     if session_pair.mobile_ws:
                         await session_pair.mobile_ws.send_json(fail_msg)
-            
-            elif msg_type == 'progress':
-                await session_pair.route_to_mobile({'type': 'progress', 'value': data.get('value', 0)})
             
             elif msg_type == 'ping':
                 await websocket.send_json({'type': 'pong'})

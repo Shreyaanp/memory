@@ -388,10 +388,10 @@
 
                 const data = await response.json();
                 sessionId = data.session_id;
-                jwtToken = data.token;
+                jwtToken = data.ws_token;
 
                 addLog('received', `✅ Session created: ${sessionId}`);
-                addLog('system', `JWT Token generated (expires in 5 minutes)`);
+                addLog('system', `JWT Token generated (expires in ${data.expires_in} seconds)`);
 
                 // Show session info
                 document.getElementById('sessionId').textContent = sessionId;
@@ -399,8 +399,8 @@
                 document.getElementById('sessionInfo').style.display = 'block';
                 document.getElementById('createSessionBtn').disabled = true;
 
-                // Generate QR code
-                generateQRCode();
+                // Generate QR code with server's encrypted data
+                generateQRCode(data.qr_encrypted);
 
                 // Connect WebSocket
                 connectWebSocket();
@@ -412,21 +412,12 @@
         }
 
         // Generate QR Code
-        function generateQRCode() {
-            const qrData = {
-                qr_encrypted: CryptoJS.AES.encrypt(
-                    JSON.stringify({
-                        session_id: sessionId,
-                        token: jwtToken,
-                        timestamp: Math.floor(Date.now() / 1000)
-                    }),
-                    'mdai_qr_encryption_key_32byte!'
-                ).toString()
-            };
-
+        function generateQRCode(qrEncrypted) {
+            // Use the encrypted QR data from server response
+            // DO NOT encrypt on client side - server already did it securely
             document.getElementById('qrcode').innerHTML = '';
             new QRCode(document.getElementById('qrcode'), {
-                text: JSON.stringify(qrData),
+                text: qrEncrypted,
                 width: 300,
                 height: 300
             });
@@ -472,6 +463,31 @@
         // Handle WebSocket messages
         function handleWebSocketMessage(data) {
             switch (data.type) {
+                case 'auth_success':
+                    addLog('system', '✅ Authentication successful');
+                    break;
+                
+                case 'auth_failed':
+                    addLog('error', `❌ Authentication failed: ${data.error || 'Unknown error'}`);
+                    break;
+                
+                case 'device_connected':
+                    updateStatus('connected', 'Device Ready');
+                    document.getElementById('deviceStatus').textContent = '✅ Device connected and ready!';
+                    document.getElementById('deviceStatus').className = 'status-message success';
+                    document.getElementById('deviceStatus').style.display = 'block';
+                    document.getElementById('startBtn').disabled = false;
+                    addLog('system', `🎉 Device ${data.device_id || 'unknown'} is ready! Click START to begin verification.`);
+                    break;
+                
+                case 'device_disconnected':
+                    updateStatus('disconnected', 'Device Disconnected');
+                    document.getElementById('deviceStatus').textContent = '⚠️ Device disconnected';
+                    document.getElementById('deviceStatus').className = 'status-message error';
+                    document.getElementById('startBtn').disabled = true;
+                    addLog('error', '⚠️ Device disconnected');
+                    break;
+                
                 case 'device_ready':
                     updateStatus('connected', 'Device Ready');
                     document.getElementById('deviceStatus').textContent = '✅ Device connected and ready!';
@@ -499,15 +515,35 @@
                     } else {
                         document.getElementById('deviceStatus').textContent = '❌ Verification FAILED';
                         document.getElementById('deviceStatus').className = 'status-message error';
-                        addLog('error', `❌ Verification failed: ${data.reason}`);
+                        addLog('error', `❌ Verification failed: ${data.reason || 'Unknown reason'}`);
+                    }
+                    document.getElementById('startBtn').disabled = true;
+                    break;
+                
+                case 'verification_result':
+                    if (data.status === 'success') {
+                        document.getElementById('deviceStatus').textContent = '🎉 Verification SUCCESS!';
+                        document.getElementById('deviceStatus').className = 'status-message success';
+                        addLog('system', '✅ Verification passed!');
+                        if (data.message) {
+                            addLog('system', `Message: ${data.message}`);
+                        }
+                    } else {
+                        document.getElementById('deviceStatus').textContent = '❌ Verification FAILED';
+                        document.getElementById('deviceStatus').className = 'status-message error';
+                        addLog('error', `❌ Verification failed: ${data.reason || 'Unknown reason'}`);
                     }
                     document.getElementById('startBtn').disabled = true;
                     break;
 
                 case 'error':
-                    addLog('error', `❌ Error: ${data.message}`);
-                    document.getElementById('deviceStatus').textContent = `❌ ${data.message}`;
+                    addLog('error', `❌ Error: ${data.error || data.message || 'Unknown error'}`);
+                    document.getElementById('deviceStatus').textContent = `❌ ${data.error || data.message}`;
                     document.getElementById('deviceStatus').className = 'status-message error';
+                    break;
+                
+                default:
+                    addLog('system', `ℹ️ Unknown message type: ${data.type}`);
                     break;
             }
         }

@@ -8,6 +8,7 @@
 #include <openssl/err.h>
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
+#include <zlib.h>
 #include <sys/stat.h>
 #include <vector>
 #include <cstring>
@@ -369,6 +370,47 @@ std::string CryptoUtils::aes256_decrypt(const std::string& ciphertext_base64, co
     EVP_CIPHER_CTX_free(ctx);
     
     return std::string(reinterpret_cast<char*>(plaintext.data()), plaintext_len);
+}
+
+std::string CryptoUtils::aes256_decrypt_compressed(const std::string& ciphertext_base64, const std::string& key_hex) {
+    // First, decrypt the data
+    std::string decrypted = aes256_decrypt(ciphertext_base64, key_hex);
+    
+    // Decode base64 to get compressed data
+    std::vector<uint8_t> compressed_data = base64_decode(decrypted);
+    
+    // Decompress using zlib
+    z_stream stream{};
+    stream.avail_in = compressed_data.size();
+    stream.next_in = compressed_data.data();
+    
+    if (inflateInit(&stream) != Z_OK) {
+        throw std::runtime_error("Failed to initialize zlib decompression");
+    }
+    
+    std::vector<uint8_t> decompressed;
+    const size_t CHUNK_SIZE = 4096;
+    
+    int ret;
+    do {
+        uint8_t out[CHUNK_SIZE];
+        stream.avail_out = CHUNK_SIZE;
+        stream.next_out = out;
+        
+        ret = inflate(&stream, Z_NO_FLUSH);
+        
+        if (ret != Z_OK && ret != Z_STREAM_END) {
+            inflateEnd(&stream);
+            throw std::runtime_error("Decompression failed: " + std::to_string(ret));
+        }
+        
+        size_t have = CHUNK_SIZE - stream.avail_out;
+        decompressed.insert(decompressed.end(), out, out + have);
+    } while (ret != Z_STREAM_END);
+    
+    inflateEnd(&stream);
+    
+    return std::string(reinterpret_cast<char*>(decompressed.data()), decompressed.size());
 }
 
 // ============================================================

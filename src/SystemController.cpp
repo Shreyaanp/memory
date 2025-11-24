@@ -121,31 +121,50 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::AWAIT_ADMIN_QR:
-            serial_comm_->send_state(3); // "Scan WiFi QR" screen
+            serial_comm_->send_state(3); // Screen 3: "Scan WiFi QR" (only if WiFi not connected)
             configure_camera_for_state(SystemState::AWAIT_ADMIN_QR);
             break;
             
         case SystemState::PROVISIONING:
-            serial_comm_->send_state(2); // "Connecting to WiFi" screen
+            serial_comm_->send_state(2); // Screen 2: "Connecting to WiFi" (reuse boot screen)
             break;
             
         case SystemState::PROVISIONED:
-            serial_comm_->send_state(3); // "WiFi Connected" screen (3s)
+            serial_comm_->send_state(4); // Screen 4: "WiFi Connected" screen (show SSID, 3s)
             std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::seconds(3));
-                serial_comm_->send_state(4); // "mDai Ready" screen (3s)
-                std::this_thread::sleep_for(std::chrono::seconds(3));
+                serial_comm_->send_state(5); // Screen 5: "mDai Ready" screen (2s preemptive)
+                std::this_thread::sleep_for(std::chrono::seconds(2));
                 set_state(SystemState::IDLE);
             }).detach();
             break;
             
         case SystemState::IDLE:
-            serial_comm_->send_state(5); // "Scan QR Code" screen
+            serial_comm_->send_state(5); // Screen 5: "Waiting for User QR" (IDLE phase)
             configure_camera_for_state(SystemState::IDLE);
             break;
             
+        case SystemState::PLACEHOLDER_SCREEN_7:
+            // ═══════════════════════════════════════════════════════════════════
+            // SCREEN 7: PLACEHOLDER - TO BE IMPLEMENTED LATER
+            // ═══════════════════════════════════════════════════════════════════
+            // This is a dummy placeholder as requested. No complex logic here.
+            // Just displays a screen and waits for 3 seconds before continuing.
+            serial_comm_->send_state(7); // Screen 7: Placeholder screen
+            std::cout << "📍 [PLACEHOLDER] Screen 7 displayed (dummy implementation)" << std::endl;
+            
+            // Auto-transition after 3 seconds (dummy behavior)
+            std::thread([this]() {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                if (current_state_ == SystemState::PLACEHOLDER_SCREEN_7) {
+                    std::cout << "📍 [PLACEHOLDER] Auto-transitioning from Screen 7 → READY" << std::endl;
+                    set_state(SystemState::READY);
+                }
+            }).detach();
+            break;
+            
         case SystemState::READY:
-            serial_comm_->send_state(6); // "Connected - Waiting for Start" screen
+            serial_comm_->send_state(6); // Screen 6: "Ready?" (waiting for Start button)
             configure_camera_for_state(SystemState::READY);
             
             // Safety Timeout: If user doesn't start within 60 seconds, go back to IDLE
@@ -161,7 +180,7 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::WARMUP:
-            serial_comm_->send_state(6); // Keep showing "Ready?" screen (no change)
+            serial_comm_->send_state(7); // Screen 7: Warmup (prepare for nose tracking)
             // Camera already switched to Full in READY state
             // Just wait for camera to stabilize (2-3 seconds)
             std::thread([this]() {
@@ -174,7 +193,7 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::ALIGN:
-            serial_comm_->send_state(7); // "Nose Tracking" screen
+            serial_comm_->send_state(7); // Screen 7: "Nose Tracking" with target
             motion_tracker_.reset();
             ring_buffer_->clear();
             ring_buffer_->set_recording_active(true); 
@@ -182,13 +201,12 @@ void SystemController::set_state(SystemState new_state) {
             
         case SystemState::PROCESSING:
             ring_buffer_->set_recording_active(false); 
-            serial_comm_->send_state(2); // "Processing" screen (reuse Screen 2 with text update)
-            // Update screen 2 text to "Processing..." via serial command
+            serial_comm_->send_state(10); // Screen 10: "Processing" screen
             std::thread([this]() { handle_processing(); }).detach();
             break;
             
         case SystemState::SUCCESS:
-            serial_comm_->send_state(8); // "Success" screen
+            serial_comm_->send_state(8); // Screen 8: "Success" screen
             std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 set_state(SystemState::LOGOUT);
@@ -196,7 +214,7 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::ERROR:
-            serial_comm_->send_state(9); // "Error" screen
+            serial_comm_->send_state(9); // Screen 9: "Error" screen
             std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 set_state(SystemState::IDLE);
@@ -204,10 +222,10 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::LOGOUT:
-            serial_comm_->send_state(10); // "Thank You" screen
-            // Switch camera back: Full → RGB-only (happens in background)
+            serial_comm_->send_state(13); // Screen 13: "Thank You" screen
+            // Switch camera back: Full → Low Power (camera stays on, just changes mode)
             configure_camera_for_state(SystemState::IDLE);
-            std::cout << "🔄 Camera switching: Full → RGB-only (cooling down)" << std::endl;
+            std::cout << "🔄 Camera switching: High Power → Low Power (persistent)" << std::endl;
             
             // Close WebSocket connection
             network_mgr_->disconnect();
@@ -231,15 +249,26 @@ void SystemController::configure_camera_for_state(SystemState state) {
     if (state == SystemState::BOOT ||
         state == SystemState::AWAIT_ADMIN_QR || 
         state == SystemState::IDLE ||
+        state == SystemState::READY ||  // READY state stays in RGB_ONLY (QR scanning only)
         state == SystemState::WIFI_CHANGE_CONNECTING ||
         state == SystemState::WIFI_CHANGE_SUCCESS ||
         state == SystemState::WIFI_CHANGE_FAILED) {
         
         target_mode = CameraMode::RGB_ONLY;
         config.enable_ir = false;
-        config.color_width = 640;
-        config.color_height = 480;
+        config.enable_depth = false;
+        config.emitter_enabled = 0;
+        config.laser_power = 0.0f;
+        config.align_to_color = false;
+        config.color_width = 1280;  // Increased from 640 for better QR detection
+        config.color_height = 720;   // Increased from 480 for better QR detection
         config.color_fps = 30;
+        config.depth_width = 0;
+        config.depth_height = 0;
+        config.enable_spatial_filter = false;
+        config.enable_temporal_filter = false;
+        config.enable_hole_filling = false;
+        config.auto_exposure = true;  // Let the camera adapt lighting for QR readability
         
     } else {
         target_mode = CameraMode::FULL;
@@ -253,18 +282,42 @@ void SystemController::configure_camera_for_state(SystemState state) {
         config.laser_power = 300.0f;
     }
     
-    // **OPTIMIZATION**: Skip reconfiguration if already in correct mode
+    // **CRITICAL**: Camera should NEVER be stopped once started
+    // Only reconfigure if changing modes (low power → high power or vice versa)
     if (current_camera_mode_.load() == target_mode && producer_) {
-        std::cout << "📹 Camera already in correct mode - skipping reconfiguration" << std::endl;
+        std::cout << "📹 Camera already in correct mode - no reconfiguration needed" << std::endl;
         return;
     }
     
-    // Stop existing producer
-    if (producer_) producer_->stop();
+    // **CRITICAL FIX**: Only stop camera when switching from LOW to HIGH power
+    // LOW POWER mode should NEVER be closed once started
+    if (current_camera_mode_.load() == CameraMode::RGB_ONLY && target_mode == CameraMode::FULL) {
+        // Switching from low power to high power - safe to stop and restart
+        std::cout << "📹 Camera: Upgrading from Low Power → High Power" << std::endl;
+        if (producer_) {
+            producer_->stop();
+            // CRITICAL: Wait for hardware to fully release resources
+            std::cout << "⏳ Waiting 2 seconds for camera hardware to release..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    } else if (current_camera_mode_.load() == CameraMode::FULL && target_mode == CameraMode::RGB_ONLY) {
+        // Switching from high power to low power - stop high power mode
+        std::cout << "📹 Camera: Downgrading from High Power → Low Power" << std::endl;
+        if (producer_) {
+            producer_->stop();
+            // CRITICAL: Wait for hardware to fully release resources
+            std::cout << "⏳ Waiting 2 seconds for camera hardware to release..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    } else if (current_camera_mode_.load() == CameraMode::UNINITIALIZED) {
+        // First time initialization
+        std::cout << "📹 Camera: Initial startup in " << (target_mode == CameraMode::RGB_ONLY ? "Low Power" : "High Power") << " mode" << std::endl;
+    }
     
     // Log mode change
     if (target_mode == CameraMode::RGB_ONLY) {
-        std::cout << "📹 Camera: RGB-only mode (640x480@30fps) - Low Power" << std::endl;
+        std::cout << "📹 Camera: RGB-only mode (" << config.color_width << "x" 
+                  << config.color_height << "@" << config.color_fps << "fps) - Low Power - PERSISTENT" << std::endl;
     } else {
         std::cout << "📹 Camera: Full mode (1280x720 RGB + 848x480 Depth + IR + Laser)" << std::endl;
     }
@@ -281,6 +334,7 @@ void SystemController::process_frame(FrameBox* frame) {
     switch (state) {
         case SystemState::AWAIT_ADMIN_QR: handle_await_admin_qr(frame); break;
         case SystemState::IDLE: handle_idle(frame); break;
+        case SystemState::PLACEHOLDER_SCREEN_7: break;  // Placeholder - no processing
         case SystemState::READY: handle_idle(frame); break;  // READY also scans for session QR
         case SystemState::WARMUP: handle_warmup(frame); break;
         case SystemState::ALIGN: handle_align(frame); break;
@@ -331,12 +385,24 @@ void SystemController::handle_idle(FrameBox* frame) {
     cv::Mat gray;
     cv::cvtColor(color_img, gray, cv::COLOR_BGR2GRAY);
     
-    // Use ZBar instead of OpenCV QRCodeDetector
+    // Use ZBar with enhanced settings for better QR detection
     zbar::ImageScanner scanner;
     scanner.set_config(zbar::ZBAR_QRCODE, zbar::ZBAR_CFG_ENABLE, 1);
+    scanner.set_config(zbar::ZBAR_NONE, zbar::ZBAR_CFG_X_DENSITY, 1);  // Scan every pixel
+    scanner.set_config(zbar::ZBAR_NONE, zbar::ZBAR_CFG_Y_DENSITY, 1);  // Scan every line
     
-    zbar::Image zbar_image(gray.cols, gray.rows, "Y800", gray.data, gray.cols * gray.rows);
+    // Try to enhance contrast for better QR detection
+    cv::Mat enhanced;
+    cv::equalizeHist(gray, enhanced);  // Improve contrast
+    
+    zbar::Image zbar_image(enhanced.cols, enhanced.rows, "Y800", enhanced.data, enhanced.cols * enhanced.rows);
     int n = scanner.scan(zbar_image);
+    
+    // Debug: Save enhanced frame every 100 scans
+    if (scan_count % 100 == 0) {
+        cv::imwrite("/tmp/qr_enhanced_latest.jpg", enhanced);
+        std::cout << "[QR Debug] Saved enhanced frame to /tmp/qr_enhanced_latest.jpg" << std::endl;
+    }
     
     if (scan_count % 50 == 0 && n == 0) {
         // Periodically save frame for debugging
@@ -354,6 +420,13 @@ void SystemController::handle_idle(FrameBox* frame) {
              symbol != zbar_image.symbol_end(); ++symbol) {
             decoded_info = symbol->get_data();
             std::cout << "📱 QR Data length: " << decoded_info.length() << " bytes" << std::endl;
+            
+            // 📸 SAVE QR IMAGE FOR VERIFICATION
+            static int qr_capture_count = 0;
+            std::string qr_image_path = "/tmp/qr_captured_" + std::to_string(++qr_capture_count) + ".jpg";
+            cv::imwrite(qr_image_path, color_img);
+            std::cout << "📸 QR Image saved: " << qr_image_path << std::endl;
+            
             break; // Take first QR code
         }
     }
@@ -361,89 +434,101 @@ void SystemController::handle_idle(FrameBox* frame) {
     if (!decoded_info.empty()) {
         std::cout << "📱 QR Code Detected (Idle State)" << std::endl;
         
-        // STEP 1: Detect QR type by structure (JSON wrapper check)
+        // STEP 1: Detect QR type by size and structure
+        // Session QR: Raw encrypted 8-char token = ~44-88 base64 chars
+        // WiFi QR: Much longer (~150+ chars)
         bool is_session_qr = false;
         bool is_wifi_qr = false;
         std::string encrypted_data;
         
+        // First, check if it's JSON with qr_encrypted field (legacy format)
         try {
             nlohmann::json qr_json = nlohmann::json::parse(decoded_info);
             
-            // Session QR has "qr_encrypted" field (JSON wrapper)
             if (qr_json.contains("qr_encrypted")) {
                 is_session_qr = true;
                 encrypted_data = qr_json["qr_encrypted"].get<std::string>();
-                std::cout << "🔐 Detected: SESSION QR (has qr_encrypted field)" << std::endl;
-            } 
-            // If no qr_encrypted field, could be raw WiFi QR or needs device_key
-            else {
+                std::cout << "🔐 Detected: SESSION QR (JSON format)" << std::endl;
+            } else {
+                // JSON but no qr_encrypted = WiFi QR
                 is_wifi_qr = true;
-                encrypted_data = decoded_info;  // Entire QR is encrypted data
-                std::cout << "🔐 Detected: WIFI QR (no qr_encrypted field)" << std::endl;
+                encrypted_data = decoded_info;
+                std::cout << "🔐 Detected: WIFI QR (JSON format)" << std::endl;
             }
         } catch (...) {
-            // Not JSON, treat as raw encrypted WiFi QR
-            is_wifi_qr = true;
-            encrypted_data = decoded_info;
-            std::cout << "🔐 Detected: WIFI QR (not JSON format)" << std::endl;
+            // Not JSON - check for Session QR prefix "S:" or size
+            if (decoded_info.length() > 2 && decoded_info.substr(0, 2) == "S:") {
+                // Session QR with "S:" prefix (remove prefix before decryption)
+                is_session_qr = true;
+                encrypted_data = decoded_info.substr(2);  // Remove "S:" prefix
+                std::cout << "🔐 Detected: SESSION QR (S: prefix, " << encrypted_data.length() << " chars)" << std::endl;
+            } else if (decoded_info.length() < 100) {
+                // Legacy Session QR without prefix
+                is_session_qr = true;
+                encrypted_data = decoded_info;
+                std::cout << "🔐 Detected: SESSION QR (legacy format, " << decoded_info.length() << " chars)" << std::endl;
+            } else {
+                is_wifi_qr = true;
+                encrypted_data = decoded_info;
+                std::cout << "🔐 Detected: WIFI QR (raw format, " << decoded_info.length() << " chars)" << std::endl;
+            }
         }
         
         // STEP 2: Handle Session QR (from mobile app)
         if (is_session_qr) {
-            std::string qr_key = "mdai_qr_encryption_key_32byte!";  // Shared key
+            // Prefer configured key, fallback to legacy default
+            std::string qr_key = load_qr_shared_key();
+            if (qr_key.empty()) {
+                // Production encryption key (must match EC2 server's QR_ENCRYPTION_KEY)
+                qr_key = "ad5295ee97afce972b8ac5fb9d8314b33578cf85f22e84429939c4ea981d9320";
+            }
             
             try {
-                std::string decrypted_json = CryptoUtils::aes256_decrypt(encrypted_data, qr_key);
+                // Decrypt QR (no compression, no JSON - just raw token!)
+                std::string ws_token = CryptoUtils::aes256_decrypt(encrypted_data, qr_key);
                 std::cout << "✅ QR decrypted successfully" << std::endl;
                 
-                nlohmann::json session_data = nlohmann::json::parse(decrypted_json);
-                
-                // Extract session_id and token
-                std::string session_id = session_data.value("session_id", "");
-                std::string ws_token = session_data.value("token", "");
-                int64_t timestamp = session_data.value("timestamp", 0);
-                
-                if (session_id.empty() || ws_token.empty()) {
-                    std::cerr << "⚠ Invalid session data in QR" << std::endl;
+                // Decrypted QR contains just the HMAC token (8 chars after stripping "S:" prefix)
+                if (ws_token.empty() || ws_token.length() != 8) {
+                    std::cerr << "⚠ Invalid token in QR (expected 8 chars)" << std::endl;
                     return;
                 }
                 
-                std::cout << "🔑 Session ID: " << session_id << std::endl;
-                std::cout << "⏰ QR Timestamp: " << timestamp << std::endl;
+                std::cout << "🔐 Token (HMAC): " << ws_token << std::endl;
                 
-                // Check if QR is too old (> 5 minutes)
-                int64_t current_time = std::time(nullptr);
-                if (current_time - timestamp > 300) {
-                    std::cerr << "⚠ QR code expired (>5 minutes old)" << std::endl;
-                    serial_comm_->send_state(9); // Error screen
-                    return;
-                }
-                
-                // Connect to WebSocket
+                // Connect to WebSocket (async - wait for connection)
                 std::cout << "🔌 Connecting to WebSocket..." << std::endl;
                 
-                std::string ws_path = "/ws/device?session_id=" + session_id_;
+                // No session_id in path - server will lookup by ws_token
+                std::string ws_path = "/ws/device";
                 
-                if (network_mgr_->connect_to_middleware(middleware_host_, 443, ws_path, device_id_)) {
+                // Start connection (spawns background thread)
+                network_mgr_->connect_to_middleware(middleware_host_, 443, ws_path, device_id_);
+                
+                // Wait for connection to be established (max 10 seconds)
+                int wait_count = 0;
+                while (!network_mgr_->is_connected() && wait_count < 100) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    wait_count++;
+                }
+                
+                if (network_mgr_->is_connected()) {
                     std::cout << "✅ WebSocket connected" << std::endl;
                     
-                    // Send authentication message
+                    // Send authentication message (no timestamp - server uses DB created_at)
                     nlohmann::json auth_msg = {
                         {"type", "auth"},
-                        {"token", ws_token},
-                        {"device_id", device_id_},
-                        {"session_id", session_id}
+                        {"bearer_token", ws_token},
+                        {"device_id", device_id_}
                     };
                     
                     network_mgr_->send_message(auth_msg.dump());
-                    std::cout << "📤 Sent auth message" << std::endl;
+                    std::cout << "📤 Sent auth message with 8-char HMAC token" << std::endl;
                     
-                    // Store session info
-                    session_id_ = session_id;
-                    
-                    // State will change to READY after receiving auth_success from server
+                    // Note: session_id will be determined by server from ws_token
+                    // State will change to PLACEHOLDER_SCREEN_7 after receiving auth_success from server
                 } else {
-                    std::cerr << "❌ WebSocket connection failed" << std::endl;
+                    std::cerr << "❌ WebSocket connection failed (timeout)" << std::endl;
                     serial_comm_->send_state(9); // Error screen
                 }
                 
@@ -690,47 +775,85 @@ void SystemController::on_websocket_message(const std::string& message) {
             // WebSocket authentication successful
             std::cout << "✅ WebSocket authenticated successfully" << std::endl;
             
-            // Send "device_ready" signal to mobile
-            nlohmann::json ready_msg = {
-                {"type", "device_ready"},
-                {"device_id", device_id_},
-                {"message", "Device is ready for face verification"}
-            };
-            network_mgr_->send_message(ready_msg.dump());
-            std::cout << "📤 Sent 'device_ready' signal to mobile" << std::endl;
+            // Server already notifies mobile with "device_connected"
+            // No need to send redundant "device_ready" message
             
-            // Enter READY state and wait for user to click "Start" on mobile
-            std::cout << "⏸️  Waiting for user to start verification..." << std::endl;
-            set_state(SystemState::READY);
+            // Enter PLACEHOLDER_SCREEN_7 first (dummy screen)
+            std::cout << "📍 Entering PLACEHOLDER Screen 7 (will auto-transition)" << std::endl;
+            set_state(SystemState::PLACEHOLDER_SCREEN_7);
         }
-        else if (msg_type == "start_verification") {
-            // Mobile sent start command after user clicked "Start"
-            std::cout << "▶️  Received 'start_verification' command from mobile" << std::endl;
+        // Handle start command (server forwards as plain JSON without "type" wrapper)
+        else if (msg_json.contains("command")) {
+            std::string command = msg_json.value("command", "");
             
-            if (current_state_ == SystemState::READY) {
-                std::cout << "🔥 Starting WARMUP phase" << std::endl;
-                set_state(SystemState::WARMUP);
-            } else {
-                std::cerr << "⚠️  Received start_verification but not in READY state" << std::endl;
-            }
-        }
-        else if (msg_type == "to_device") {
-            // Mobile sent message to device (forwarded by server)
-            if (msg_json.contains("data")) {
-                auto data = msg_json["data"];
-                std::string command = data.value("command", "");
+            if (command == "start_verification" || command == "start") {
+                std::cout << "▶️  Received start command from mobile" << std::endl;
                 
-                if (command == "start_verification" || command == "start") {
-                    std::cout << "▶️  Received start command from mobile" << std::endl;
-                    
-                    if (current_state_ == SystemState::READY) {
+                if (current_state_ == SystemState::READY) {
+                    if (test_mode_) {
+                        // 🧪 TEST MODE: Skip verification, show success immediately
+                        std::cout << "🧪 TEST MODE: Bypassing verification flow → SUCCESS" << std::endl;
+                        serial_comm_->send_state(8); // Screen 8: Success
+                        
+                        // Send success message to mobile
+                        nlohmann::json success_msg = {
+                            {"type", "to_mobile"},
+                            {"data", {
+                                {"type", "result"},
+                                {"status", "success"},
+                                {"message", "TEST MODE: Verification bypassed"}
+                            }}
+                        };
+                        network_mgr_->send_message(success_msg.dump());
+                        
+                        set_state(SystemState::SUCCESS);
+                    } else {
+                        // REAL MODE: Do actual verification
                         std::cout << "🔥 Starting WARMUP phase" << std::endl;
                         set_state(SystemState::WARMUP);
-                    } else {
-                        std::cerr << "⚠️  Received start command but not in READY state (current: " 
-                                  << static_cast<int>(current_state_.load()) << ")" << std::endl;
                     }
+                } else {
+                    std::cerr << "⚠️  Received start command but not in READY state (current: " 
+                              << static_cast<int>(current_state_.load()) << ")" << std::endl;
                 }
+            }
+            else if (command == "retry_camera") {
+                std::cout << "🔄 Received camera retry command" << std::endl;
+                
+                // Only allow retry if in ERROR state or camera is not running
+                if (current_state_ == SystemState::ERROR || !producer_ || !producer_->is_running()) {
+                    std::cout << "📹 Attempting to reinitialize camera..." << std::endl;
+                    serial_comm_->send_state(2); // Show "Connecting..." screen
+                    
+                    // Clean up existing producer
+                    if (producer_) {
+                        producer_.reset();
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                    }
+                    
+                    // Try to restart camera
+                    configure_camera_for_state(SystemState::BOOT);
+                    
+                    if (producer_ && producer_->is_running()) {
+                        std::cout << "✅ Camera reinitialized successfully!" << std::endl;
+                        serial_comm_->send_state(5); // Show "mDai Ready"
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        set_state(SystemState::IDLE);
+                    } else {
+                        std::cerr << "❌ Camera retry failed" << std::endl;
+                        serial_comm_->send_error("Camera retry failed - check hardware");
+                        serial_comm_->send_state(9); // Error screen
+                        set_state(SystemState::ERROR);
+                    }
+                } else {
+                    std::cout << "⚠️  Retry command ignored - system not in error state" << std::endl;
+                }
+            }
+            else if (command == "restart_system") {
+                std::cout << "🔄 Received system restart command" << std::endl;
+                std::cout << "⚠️  Initiating controlled shutdown..." << std::endl;
+                serial_comm_->send_state(2); // Show connecting screen
+                running_ = false; // This will cause main loop to exit and systemd to restart
             }
         }
         else if (msg_type == "verification_result" || msg_type == "api_response") {
@@ -839,32 +962,97 @@ bool SystemController::check_wifi_on_boot() {
 }
 
 void SystemController::handle_boot() {
-    // Screen 1: Logo displayed for 3 seconds
+    // Screen 1: Logo displayed for 3 seconds (preemptive kernel-level control loop)
     serial_comm_->send_state(1);
     std::this_thread::sleep_for(std::chrono::seconds(3));
     
-    // Screen 2: "Booting into mDai" - initializing camera
+    // Screen 2: "Booting into mDai" - Starting services (NOT preemptive)
     serial_comm_->send_state(2);
     
-    // Initialize camera in RGB-only mode for QR scanning
-    configure_camera_for_state(SystemState::BOOT);
+    // Service 1: Initialize camera in LOW POWER mode (persistent, never closed)
+    // Retry logic: attempt up to 3 times with increasing delays
+    std::cout << "🔧 Service: Initializing camera..." << std::endl;
+    
+    const int MAX_CAMERA_RETRIES = 3;
+    bool camera_initialized = false;
+    
+    for (int attempt = 1; attempt <= MAX_CAMERA_RETRIES; attempt++) {
+        std::cout << "📹 Camera initialization attempt " << attempt << "/" << MAX_CAMERA_RETRIES << std::endl;
+        
+        // Clean up previous attempt if needed
+        if (producer_ && !producer_->is_running()) {
+            std::cout << "🔄 Cleaning up previous camera instance..." << std::endl;
+            producer_.reset();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        
+        configure_camera_for_state(SystemState::BOOT);
+        
+        if (producer_ && producer_->is_running()) {
+            camera_initialized = true;
+            std::cout << "✅ Service: Camera started successfully on attempt " << attempt << std::endl;
+            break;
+        }
+        
+        std::cerr << "❌ Camera initialization failed (attempt " << attempt << "/" << MAX_CAMERA_RETRIES << ")" << std::endl;
+        
+        if (attempt < MAX_CAMERA_RETRIES) {
+            int wait_time = attempt * 3; // 3s, 6s, 9s
+            std::cout << "⏳ Waiting " << wait_time << " seconds before retry..." << std::endl;
+            serial_comm_->send_error("Camera init failed - retrying...");
+            std::this_thread::sleep_for(std::chrono::seconds(wait_time));
+        }
+    }
+    
+    if (!camera_initialized) {
+        std::cerr << "❌ FATAL: Camera initialization failed after " << MAX_CAMERA_RETRIES << " attempts" << std::endl;
+        serial_comm_->send_error("Camera hardware error - please restart device");
+        serial_comm_->send_state(9); // Screen 9: Error screen (was 11, but 9 is correct per state mapping)
+        
+        // Enter error state - don't exit, allow system to stay alive for diagnostics
+        // Mobile/Admin can send reset command or manually restart device
+        std::cout << "⚠️  System entering ERROR state - camera unavailable" << std::endl;
+        std::cout << "💡 Tip: Check USB connections and restart device" << std::endl;
+        
+        // Stay in error state indefinitely - don't kill the process
+        // This allows:
+        // 1. Serial communication to remain active (display shows error)
+        // 2. Network stays up (can receive reset commands)
+        // 3. Logs continue to be written
+        // 4. Admin can SSH in to diagnose
+        
+        set_state(SystemState::ERROR);
+        return; // Exit boot sequence but keep system running
+    }
+    std::cout << "✅ Camera initialization complete" << std::endl;
+    
+    // Service 2: Verify serial communication
+    std::cout << "🔧 Service: Checking display..." << std::endl;
+    if (!serial_comm_->is_connected()) {
+        std::cerr << "⚠️  WARNING: Display not connected (non-fatal)" << std::endl;
+        // Continue anyway - serial is optional for operation
+    } else {
+        std::cout << "✅ Service: Display connected" << std::endl;
+    }
     
     std::this_thread::sleep_for(std::chrono::seconds(2));
     
-    // Check WiFi
+    // Check WiFi connection status
     if (check_wifi_on_boot()) {
-        // WiFi already connected
-        serial_comm_->send_state(3); // "WiFi Connected" screen
+        // WiFi already connected - skip Screen 3 (WiFi QR scanning)
+        // Go directly to Screen 4: WiFi Connected
+        serial_comm_->send_state(4); // Screen 4: "WiFi Connected" (show SSID)
         std::this_thread::sleep_for(std::chrono::seconds(3));
         
-        // Show "mDai Ready" screen
-        serial_comm_->send_state(4);
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+        // Screen 5: "mDai Ready" (2 seconds preemptive)
+        serial_comm_->send_state(5);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
         
         set_state(SystemState::IDLE);
     } else {
-        // No WiFi, need provisioning
-        configure_camera_for_state(SystemState::AWAIT_ADMIN_QR);
+        // No WiFi - show Screen 3: "Looking for WiFi QR"
+        // This screen only displays if WiFi is NOT connected (as per plan)
+        std::cout << "📡 No WiFi connection - entering provisioning mode" << std::endl;
         set_state(SystemState::AWAIT_ADMIN_QR);
     }
 }
@@ -897,22 +1085,25 @@ bool SystemController::handle_wifi_qr(const std::string& qr_data) {
         
         // Try to connect
         set_state(SystemState::WIFI_CHANGE_CONNECTING);
-        serial_comm_->send_state(11); // "Connecting to WiFi" screen
+        serial_comm_->send_state(2); // Reuse Screen 2 for "Connecting to WiFi"
         
         if (network_mgr_->connect_wifi(wifi_ssid, wifi_password)) {
             previous_ssid_ = wifi_ssid;
             previous_password_ = wifi_password;
             
             set_state(SystemState::WIFI_CHANGE_SUCCESS);
-            serial_comm_->send_state(12); // "WiFi Success" screen
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            serial_comm_->send_state(4); // Screen 4: "WiFi Success" (show SSID)
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            
+            serial_comm_->send_state(5); // Screen 5: "mDai Ready"
+            std::this_thread::sleep_for(std::chrono::seconds(2));
             
             set_state(SystemState::IDLE);
             return true;
         } else {
             // Failed, fallback
             set_state(SystemState::WIFI_CHANGE_FAILED);
-            serial_comm_->send_state(13); // "WiFi Failed" screen
+            serial_comm_->send_state(13); // Screen 13: "WiFi Failed" error screen
             serial_comm_->send_error("WiFi Failed - Reverting to known network");
             
             // Try fallback to previous network
@@ -928,55 +1119,7 @@ bool SystemController::handle_wifi_qr(const std::string& qr_data) {
         
     } catch (const std::exception& e) {
         std::cerr << "⚠ WiFi QR processing error: " << e.what() << std::endl;
-        return false;
-    }
-}
-
-bool SystemController::handle_session_qr(const std::string& qr_data) {
-    try {
-        // Parse session QR from Flutter app
-        // Expected format: {"platform_id":"xxx", "session_id":"xxx", "timestamp":"xxx"}
-        nlohmann::json qr_json = nlohmann::json::parse(qr_data);
-        
-        platform_id_ = qr_json["platform_id"].get<std::string>();
-        session_id_ = qr_json["session_id"].get<std::string>();
-        
-        std::cout << "✅ Session QR Scanned: platform=" << platform_id_ 
-                  << ", session=" << session_id_ << std::endl;
-        
-        // Connect to WebSocket with session_id
-        std::string ws_path = "/ws/device?session_id=" + session_id_;
-        bool connected = network_mgr_->connect_to_middleware(
-            middleware_host_, 
-            443, 
-            ws_path, 
-            device_id_
-        );
-        
-        if (connected) {
-            std::cout << "✅ WebSocket Connected" << std::endl;
-            
-            // Send authentication message with session_id
-            nlohmann::json auth_msg;
-            auth_msg["type"] = "auth";
-            auth_msg["session_id"] = session_id_;
-            auth_msg["device_id"] = device_id_;
-            
-            network_mgr_->send_message(auth_msg.dump());
-            
-            // Wait a moment for auth response
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            
-            set_state(SystemState::READY);
-            return true;
-        } else {
-            std::cerr << "⚠ WebSocket connection failed" << std::endl;
-            serial_comm_->send_error("Connection failed");
-            return false;
-        }
-        
-    } catch (const std::exception& e) {
-        std::cerr << "⚠ Session QR processing error: " << e.what() << std::endl;
+        serial_comm_->send_state(12); // Error screen
         return false;
     }
 }

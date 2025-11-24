@@ -159,6 +159,10 @@ void Producer::stop() {
         if (pipe_.get_active_profile()) {
             pipe_.stop();
             report_status("Pipeline stopped");
+            
+            // CRITICAL: Give the hardware time to flush buffers and release resources
+            // RealSense cameras need time to fully release USB and memory resources
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     } catch (const rs2::error& e) {
         report_error(std::string("Error stopping pipeline: ") + e.what());
@@ -233,26 +237,33 @@ void Producer::set_status_callback(std::function<void(const std::string&)> callb
 }
 
 bool Producer::configure_pipeline() {
-    // Enable depth stream
-    rs_config_.enable_stream(
-        RS2_STREAM_DEPTH,
-        config_.depth_width,
-        config_.depth_height,
-        RS2_FORMAT_Z16,
-        config_.depth_fps
-    );
+    // Enable depth stream if requested
+    if (config_.enable_depth && config_.depth_width > 0 && config_.depth_height > 0) {
+        rs_config_.enable_stream(
+            RS2_STREAM_DEPTH,
+            config_.depth_width,
+            config_.depth_height,
+            RS2_FORMAT_Z16,
+            config_.depth_fps
+        );
+    }
     
-    // Enable color stream
-    rs_config_.enable_stream(
-        RS2_STREAM_COLOR,
-        config_.color_width,
-        config_.color_height,
-        RS2_FORMAT_BGR8,
-        config_.color_fps
-    );
+    // Enable color stream (required)
+    if (config_.color_width > 0 && config_.color_height > 0) {
+        rs_config_.enable_stream(
+            RS2_STREAM_COLOR,
+            config_.color_width,
+            config_.color_height,
+            RS2_FORMAT_BGR8,
+            config_.color_fps
+        );
+    } else {
+        report_error("Invalid color stream dimensions");
+        return false;
+    }
     
     // Enable IR streams if requested
-    if (config_.enable_ir) {
+    if (config_.enable_ir && config_.ir_width > 0 && config_.ir_height > 0) {
         rs_config_.enable_stream(
             RS2_STREAM_INFRARED, 1,
             config_.ir_width,
@@ -284,24 +295,26 @@ void Producer::configure_sensor_options() {
         auto device = profile_.get_device();
         
         // Configure depth sensor
-        auto depth_sensor = device.first<rs2::depth_sensor>();
-        
-        // Set internal queue size
-        if (depth_sensor.supports(RS2_OPTION_FRAMES_QUEUE_SIZE)) {
-            depth_sensor.set_option(RS2_OPTION_FRAMES_QUEUE_SIZE, config_.internal_queue_size);
-            std::cout << "  Internal queue size set to: " << config_.internal_queue_size << std::endl;
-        }
-        
-        // Set emitter
-        if (depth_sensor.supports(RS2_OPTION_EMITTER_ENABLED)) {
-            depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED, config_.emitter_enabled);
-            std::cout << "  Emitter enabled: " << config_.emitter_enabled << std::endl;
-        }
-        
-        // Set laser power
-        if (depth_sensor.supports(RS2_OPTION_LASER_POWER)) {
-            depth_sensor.set_option(RS2_OPTION_LASER_POWER, config_.laser_power);
-            std::cout << "  Laser power: " << config_.laser_power << " mW" << std::endl;
+        if (config_.enable_depth) {
+            auto depth_sensor = device.first<rs2::depth_sensor>();
+            
+            // Set internal queue size
+            if (depth_sensor.supports(RS2_OPTION_FRAMES_QUEUE_SIZE)) {
+                depth_sensor.set_option(RS2_OPTION_FRAMES_QUEUE_SIZE, config_.internal_queue_size);
+                std::cout << "  Internal queue size set to: " << config_.internal_queue_size << std::endl;
+            }
+            
+            // Set emitter
+            if (depth_sensor.supports(RS2_OPTION_EMITTER_ENABLED)) {
+                depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED, config_.emitter_enabled);
+                std::cout << "  Emitter enabled: " << config_.emitter_enabled << std::endl;
+            }
+            
+            // Set laser power
+            if (depth_sensor.supports(RS2_OPTION_LASER_POWER)) {
+                depth_sensor.set_option(RS2_OPTION_LASER_POWER, config_.laser_power);
+                std::cout << "  Laser power: " << config_.laser_power << " mW" << std::endl;
+            }
         }
         
         // Configure color sensor
@@ -337,12 +350,19 @@ void Producer::configure_sensor_options() {
 
 void Producer::query_camera_parameters() {
     try {
-        // Get depth stream profile
-        auto depth_stream = profile_.get_stream(RS2_STREAM_DEPTH)
-                                   .as<rs2::video_stream_profile>();
-        depth_intrinsics_ = depth_stream.get_intrinsics();
+        // Depth info (only if enabled)
+        rs2::video_stream_profile depth_stream;
+        if (config_.enable_depth) {
+            depth_stream = profile_.get_stream(RS2_STREAM_DEPTH).as<rs2::video_stream_profile>();
+            depth_intrinsics_ = depth_stream.get_intrinsics();
+            auto depth_sensor = profile_.get_device().first<rs2::depth_sensor>();
+            depth_scale_ = depth_sensor.get_depth_scale();
+        } else {
+            depth_scale_ = 0.0f;
+            depth_intrinsics_ = {};
+        }
         
-        // Get color stream profile
+        // Color stream profile
         auto color_stream = profile_.get_stream(RS2_STREAM_COLOR)
                                    .as<rs2::video_stream_profile>();
         color_intrinsics_ = color_stream.get_intrinsics();
@@ -354,17 +374,21 @@ void Producer::query_camera_parameters() {
             ir_intrinsics_ = ir_stream.get_intrinsics();
         }
         
-        // Get extrinsics
-        extrinsics_depth_to_color_ = depth_stream.get_extrinsics_to(color_stream);
-        
-        // Get depth scale
-        auto depth_sensor = profile_.get_device().first<rs2::depth_sensor>();
-        depth_scale_ = depth_sensor.get_depth_scale();
+        // Get extrinsics if both depth and color are available
+        if (config_.enable_depth) {
+            extrinsics_depth_to_color_ = depth_stream.get_extrinsics_to(color_stream);
+        } else {
+            extrinsics_depth_to_color_ = {};
+        }
         
         std::cout << "Camera parameters:" << std::endl;
-        std::cout << "  Depth scale: " << depth_scale_ << " m/unit" << std::endl;
-        std::cout << "  Depth intrinsics: fx=" << depth_intrinsics_.fx 
-                  << ", fy=" << depth_intrinsics_.fy << std::endl;
+        if (config_.enable_depth) {
+            std::cout << "  Depth scale: " << depth_scale_ << " m/unit" << std::endl;
+            std::cout << "  Depth intrinsics: fx=" << depth_intrinsics_.fx 
+                      << ", fy=" << depth_intrinsics_.fy << std::endl;
+        } else {
+            std::cout << "  Depth stream disabled in this mode" << std::endl;
+        }
         std::cout << "  Color intrinsics: fx=" << color_intrinsics_.fx 
                   << ", fy=" << color_intrinsics_.fy << std::endl;
         

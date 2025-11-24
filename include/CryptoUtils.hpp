@@ -66,6 +66,14 @@ public:
     static std::string aes256_decrypt(const std::string& ciphertext_base64, const std::string& key);
     
     /**
+     * @brief AES-256-CBC decryption with zlib decompression
+     * @param ciphertext_base64 Base64-encoded ciphertext (includes IV)
+     * @param key 256-bit key (32 bytes or 64 hex chars)
+     * @return Decrypted and decompressed plaintext
+     */
+    static std::string aes256_decrypt_compressed(const std::string& ciphertext_base64, const std::string& key);
+    
+    /**
      * @brief HMAC-SHA256
      * @param data Data to hash
      * @param key HMAC key
