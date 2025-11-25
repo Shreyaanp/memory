@@ -4721,7 +4721,23 @@ float AntiSpoofingDetector::analyze_landmark_distribution_anomalies(const std::v
 
 // Core material analysis function - IR material properties
 float AntiSpoofingDetector::analyze_ir_material_properties(const FrameBox* frame, const FaceROI& face) {
-    if (!frame || !face.detected || frame->ir_left_data.empty() || frame->ir_right_data.empty()) {
+    if (!frame || !face.detected) {
+        return 0.5f;  // Can't analyze without frame or face
+    }
+    
+    // Check IR data availability
+    bool has_ir_left = !frame->ir_left_data.empty();
+    bool has_ir_right = !frame->ir_right_data.empty();
+    
+    if (!has_ir_left || !has_ir_right) {
+        // Debug: Show why IR analysis is failing
+        static int ir_debug = 0;
+        if (++ir_debug % 30 == 0) {
+            std::cout << "🔍 IR Material Analysis: ir_left=" << has_ir_left 
+                      << ", ir_right=" << has_ir_right 
+                      << ", ir_left_size=" << frame->ir_left_data.size()
+                      << ", ir_right_size=" << frame->ir_right_data.size() << std::endl;
+        }
         return 0.5f;  // Can't analyze without IR data
     }
     

@@ -427,6 +427,13 @@ FrameBox Producer::process_frameset(rs2::frameset& frames) {
         auto ir_left = frames.get_infrared_frame(1);
         auto ir_right = frames.get_infrared_frame(2);
         
+        // Debug: Check if IR frames are being received
+        static int ir_frame_debug = 0;
+        if (++ir_frame_debug % 30 == 0) {
+            std::cout << "🔍 IR Frame Debug: ir_left=" << (ir_left ? "YES" : "NO") 
+                      << ", ir_right=" << (ir_right ? "YES" : "NO") << std::endl;
+        }
+        
         if (ir_left) {
             fb.ir_width = ir_left.get_width();
             fb.ir_height = ir_left.get_height();

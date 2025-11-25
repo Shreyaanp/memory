@@ -30,7 +30,7 @@ int main() {
     config.color_height = 480;
     config.depth_fps = 30;
     config.color_fps = 30;
-    config.enable_ir = false;  // Disable IR for this example
+    config.enable_ir = true;  // Enable IR for material-based spoof detection
     
     // Create producer
     Producer producer(config, &ring_buffer);
@@ -52,6 +52,8 @@ int main() {
             std::cout << "Frame " << frame->sequence_id 
                       << " - Depth: " << (frame->get_depth_ptr() ? "YES" : "NO")
                       << " - Color: " << (frame->get_color_ptr() ? "YES" : "NO")
+                      << " - IR_L: " << (frame->ir_left_data.empty() ? "NO" : "YES")
+                      << " - IR_R: " << (frame->ir_right_data.empty() ? "NO" : "YES")
                       << " - Size: " << frame->get_depth_vector().size() << " depth pixels"
                       << " - Dimensions: " << frame->depth_width << "x" << frame->depth_height
                       << std::endl;

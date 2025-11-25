@@ -7,6 +7,7 @@
 #include "Producer.hpp"
 #include "RingBuffer.hpp"
 #include "AntiSpoofing.hpp"
+#include "FaceDetector.hpp"
 
 using namespace mdai;
 
@@ -79,6 +80,7 @@ public:
     
     void run_test() {
         std::cout << "🧪 HUMAN FACE DETECTION TEST" << std::endl;
+        std::cout << "🔧 Starting test initialization..." << std::endl;
         std::cout << "============================" << std::endl;
         std::cout << "Duration: " << params_.test_duration_seconds << " seconds" << std::endl;
         std::cout << "Target: Detect and validate human faces" << std::endl;
@@ -91,13 +93,23 @@ public:
         std::cout << "3. Keep relatively still during the test" << std::endl;
         std::cout << "4. Test will run for " << params_.test_duration_seconds << " seconds" << std::endl;
         std::cout << "\nPress Enter to start the test..." << std::endl;
-        std::cin.get();
+        // std::cin.get(); // Skip user input for automated testing
         
         // Initialize components
         CameraConfig camera_config;
         camera_config.align_to_color = true;  // Required for accurate ROI mapping
         DynamicRingBuffer ring_buffer(32, 5ULL * 1024 * 1024 * 1024); // 5GB limit
         Producer producer(camera_config, &ring_buffer);
+        
+        // Initialize face detector (MediaPipe or OpenCV DNN fallback)
+        std::cout << "🔧 Creating face detector..." << std::endl;
+        auto face_detector = create_face_detector();
+        if (!face_detector) {
+            std::cerr << "❌ No face detector available!" << std::endl;
+            return;
+        }
+        std::cout << "✓ Face detector initialized: " << face_detector->name() << std::endl;
+        
         QualityGate quality_gate(config_);
         AntiSpoofingDetector anti_spoofing(config_);
         
@@ -118,7 +130,7 @@ public:
             system("clear");
             
             // Run test
-            run_detection_loop(ring_buffer, quality_gate, anti_spoofing);
+            run_detection_loop(ring_buffer, quality_gate, anti_spoofing, face_detector.get());
             
         } catch (const std::exception& e) {
             std::cerr << "❌ Exception occurred: " << e.what() << std::endl;
@@ -150,7 +162,8 @@ private:
     
     void run_detection_loop(DynamicRingBuffer& ring_buffer, 
                            QualityGate& quality_gate, 
-                           AntiSpoofingDetector& anti_spoofing) {
+                           AntiSpoofingDetector& anti_spoofing,
+                           FaceDetector* face_detector) {
         
         auto start_time = std::chrono::high_resolution_clock::now();
         auto last_display_update = start_time;
@@ -177,7 +190,16 @@ private:
                 
                 auto process_start = std::chrono::high_resolution_clock::now();
                 
-                // Run quality gate
+                // STEP 1: Face detection (MediaPipe or OpenCV DNN)
+                if (face_detector) {
+                    face_detector->detect(frame);
+                    // Debug: Check if face was detected
+                    if (frame->metadata.face_detected) {
+                        std::cout << "🔍 Face detected! Confidence: " << frame->metadata.face_detection_confidence << std::endl;
+                    }
+                }
+                
+                // STEP 2: Run quality gate
                 quality_gate.process_frame(frame);
                 bool quality_ok = frame->metadata.quality_gate.quality_gate_passed;
                 if (quality_ok) results_.quality_passed++;
