@@ -25,8 +25,8 @@ enum class SystemState {
     WIFI_CHANGE_CONNECTING,  // Screen 11-12: Connecting to new WiFi
     WIFI_CHANGE_SUCCESS,     // Screen 13: WiFi change success
     WIFI_CHANGE_FAILED,      // Screen 14: WiFi change failed + fallback
-    PLACEHOLDER_SCREEN_7,    // Screen 7: [PLACEHOLDER - TO BE IMPLEMENTED LATER]
-    READY,                   // Connected, waiting for user to start
+    READY,                   // Screen 7: Connected, waiting for user to start
+    COUNTDOWN,               // Screen 8: Countdown (5,4,3,2,1)
     WARMUP,                  // Camera warming up (5 frames)
     ALIGN,                   // Active Liveness (Recording + Face Mesh)
     PROCESSING,              // Batch Anti-Spoofing Analysis
@@ -57,6 +57,12 @@ private:
     std::atomic<SystemState> current_state_{SystemState::BOOT};
     std::atomic<bool> running_{false};
     
+    // Timer for state transitions (e.g., Thank You -> IDLE)
+    std::chrono::steady_clock::time_point state_timer_start_;
+    std::atomic<bool> state_timer_active_{false};
+    SystemState state_timer_target_{SystemState::IDLE};
+    int state_timer_duration_ms_{0};
+    
     // Configuration
     std::string device_id_;
     std::string hardware_id_;
@@ -73,18 +79,73 @@ private:
     std::string middleware_host_ = "mdai.mercle.ai"; // EC2 instance
     
     // Test Mode Flag (set to false for real verification)
-    bool test_mode_ = true;  // TODO: Set to false when ready for production
+    bool test_mode_ = false;  // Set to false to enable full verification flow (including countdown)
     
-    // Circular Motion Tracking
+    // UI Test Mode - For testing Screen 0 (nose tracking UI)
+    // When true: Skips all screens except Screen 0, Screen 11 (success), Screen 12 (error)
+    bool ui_test_mode_ = false;  // PRODUCTION MODE
+    
+    // Result ACK tracking
+    std::atomic<bool> result_ack_received_{false};
+    
+    // Camera health monitoring
+    std::atomic<bool> camera_error_detected_{false};
+    std::string camera_error_message_;
+    
+    // Face Validation States
+    enum class FaceValidationState {
+        VALID,              // Face detected, distance OK, orientation OK
+        NO_FACE,            // No face detected
+        TOO_CLOSE,          // Face too close (< 25cm)
+        TOO_FAR,            // Face too far (> 60cm)
+        EXTREME_ROTATION    // Head rotated too far (can't complete spiral)
+    };
+    
+    // =========================================================================
+    // Face Validation Constants (CALIBRATION REQUIRED)
+    // =========================================================================
+    // These values need to be calibrated based on actual camera setup:
+    //
+    // REFERENCE_FACE_WIDTH: Measure face bounding box width at REFERENCE_DISTANCE
+    //   - Place a person at 40cm from camera
+    //   - Log the face_w value from FrameBox metadata
+    //   - Update this constant with that value
+    //
+    // Distance formula: distance_cm = (REFERENCE_FACE_WIDTH * REFERENCE_DISTANCE) / face_width
+    //
+    // EXTREME_YAW_THRESHOLD: How far nose can be toward an eye before invalid
+    //   - 0.75 = nose 75% of the way from eye midpoint to one eye
+    //   - Lower = stricter (require more centered head)
+    //   - Higher = more lenient
+    // =========================================================================
+    static constexpr float REFERENCE_FACE_WIDTH = 150.0f;  // pixels at 40cm (CALIBRATE THIS)
+    static constexpr float REFERENCE_DISTANCE = 40.0f;     // cm (reference measurement distance)
+    static constexpr float MIN_DISTANCE_CM = 25.0f;        // Too close threshold
+    static constexpr float MAX_DISTANCE_CM = 60.0f;        // Too far threshold
+    static constexpr float EXTREME_YAW_THRESHOLD = 0.75f;  // 75% toward eye = extreme rotation
+    static constexpr float SPIRAL_COMPLETE_ANGLE = 2.0f * 3.14159f;  // 360 degrees in radians
+    static constexpr float MOTION_PAUSE_THRESHOLD = 0.005f; // Min angular velocity to count
+    
+    // Circular Motion Tracking with Face Validation
     struct MotionTracker {
         std::vector<cv::Point2f> nose_positions;
-        float progress = 0.0f; // 0.0 to 1.0
+        float progress = 0.0f;           // 0.0 to 1.0
+        float cumulative_angle = 0.0f;   // Total angular displacement
+        float last_angle = 0.0f;         // Previous angle for delta calculation
+        bool angle_initialized = false;  // First angle captured
         int no_face_counter = 0;
+        FaceValidationState validation_state = FaceValidationState::NO_FACE;
+        float estimated_distance_cm = 0.0f;
         
         void reset() {
             nose_positions.clear();
             progress = 0.0f;
+            cumulative_angle = 0.0f;
+            last_angle = 0.0f;
+            angle_initialized = false;
             no_face_counter = 0;
+            validation_state = FaceValidationState::NO_FACE;
+            estimated_distance_cm = 0.0f;
         }
     } motion_tracker_;
 
@@ -99,6 +160,7 @@ private:
     void handle_warmup(FrameBox* frame);
     void handle_align(FrameBox* frame);
     void handle_processing();
+    void handle_face_timeout();
     
     // QR Handlers
     bool handle_wifi_qr(const std::string& qr_data);
@@ -114,6 +176,17 @@ private:
     float calculate_circular_motion_progress(const cv::Point2f& nose);
     bool load_device_config();
     bool check_wifi_on_boot();
+    
+    // Face Validation
+    FaceValidationState validate_face_position(FrameBox* frame);
+    float estimate_face_distance(float face_width_pixels);
+    bool is_face_orientation_extreme(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
+    
+    // Hardware Health Monitoring
+    bool check_camera_health();
+    bool check_display_health();
+    bool check_network_health();
+    void handle_hardware_error(const std::string& component, const std::string& error_msg);
 };
 
 } // namespace mdai

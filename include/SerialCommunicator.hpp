@@ -85,6 +85,18 @@ public:
     bool send_progress(int progress_percent);
     
     /**
+     * @brief Send combined tracking data (position, progress, target color)
+     * @param x X coordinate (screen pixels)
+     * @param y Y coordinate (screen pixels)
+     * @param progress_percent Progress (0-100)
+     * @param target_valid true = green target, false = grey target
+     * @return true if sent successfully
+     * 
+     * Format: "X:233,Y:180,P:75,C:1\n"
+     */
+    bool send_tracking_data(int x, int y, int progress_percent, bool target_valid);
+    
+    /**
      * @brief Send error message to display
      * @param error_msg Error message string (max 250 chars)
      */

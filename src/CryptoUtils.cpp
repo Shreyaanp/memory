@@ -455,7 +455,12 @@ std::pair<std::string, std::string> CryptoUtils::get_or_create_device_keys(const
     
     // Create directory if it doesn't exist
     std::string mkdir_cmd = "mkdir -p " + key_path;
-    system(mkdir_cmd.c_str());
+    int mkdir_result = system(mkdir_cmd.c_str());
+    if (mkdir_result != 0) {
+        std::cerr << "[CryptoUtils] Warning: Failed to create directory: " << key_path 
+                  << " (system() returned " << mkdir_result << ")" << std::endl;
+        // Continue anyway - directory might already exist or we'll fail on file write
+    }
     
     // Save keys
     save_key_to_file(public_key_file, keys.first);

@@ -139,6 +139,19 @@ public:
     bool is_camera_connected() const;
     
     /**
+     * @brief Check if camera is healthy (receiving frames within timeout)
+     * @param timeout_ms Timeout in milliseconds (default 3000ms)
+     * @return true if frames received within timeout, false otherwise
+     */
+    bool is_camera_healthy(int timeout_ms = 3000) const;
+    
+    /**
+     * @brief Get milliseconds since last frame was received
+     * @return Milliseconds since last frame, or -1 if no frame received yet
+     */
+    int64_t get_ms_since_last_frame() const;
+    
+    /**
      * @brief Set error callback
      * @param callback Function to call on error (receives error message)
      */
@@ -181,6 +194,11 @@ private:
     std::chrono::steady_clock::time_point last_fps_calc_time_;
     std::atomic<float> current_fps_{0.0f};
     uint64_t frames_since_last_calc_{0};
+    
+    // Frame health monitoring
+    mutable std::mutex frame_time_mutex_;
+    std::chrono::steady_clock::time_point last_frame_time_;
+    std::atomic<bool> first_frame_received_{false};
     
     // Callbacks
     std::function<void(const std::string&)> error_callback_;

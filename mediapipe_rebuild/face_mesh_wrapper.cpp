@@ -11,78 +11,81 @@ namespace mdai {
 
 // Static initialization for Python
 static std::once_flag python_init_flag;
-static PyObject* mediapipe_module = nullptr;
-static PyObject* solutions_module = nullptr;
-static PyObject* face_mesh_class = nullptr;
+static PyObject* bridge_module = nullptr;
+static PyObject* process_func = nullptr;
+static PyObject* init_func = nullptr;
+static PyObject* cleanup_func = nullptr;
+static bool python_initialized = false;
 
-// Helper function for NumPy initialization (needed because import_array is a macro)
+// Helper function for NumPy initialization
 static int init_numpy() {
     import_array();
     return 0;
 }
 
 /**
- * Initialize Python interpreter and MediaPipe modules
+ * Initialize Python interpreter and import the bridge module
  */
 static bool InitializePython() {
-    static bool initialized = false;
-    if (initialized) return true;
+    if (python_initialized) return true;
     
     std::call_once(python_init_flag, []() {
-        std::cout << "[MediaPipe] Initializing Python interpreter..." << std::endl;
+        std::cout << "[FaceMeshBridge] Initializing Python..." << std::endl;
         
         Py_Initialize();
         
         if (!Py_IsInitialized()) {
-            std::cerr << "[MediaPipe] Failed to initialize Python" << std::endl;
+            std::cerr << "[FaceMeshBridge] Failed to initialize Python" << std::endl;
             return;
         }
         
-        // Initialize NumPy C API
+        // Initialize NumPy
         if (init_numpy() < 0) {
-            std::cerr << "[MediaPipe] Failed to initialize NumPy" << std::endl;
+            std::cerr << "[FaceMeshBridge] Failed to initialize NumPy" << std::endl;
             return;
         }
         
-        // Import MediaPipe
-        mediapipe_module = PyImport_ImportModule("mediapipe");
-        if (!mediapipe_module) {
+        // Add the bridge module path to Python path
+        PyObject* sys_path = PySys_GetObject("path");
+        if (sys_path) {
+            PyList_Append(sys_path, PyUnicode_FromString("/home/mercleDev/codebase/lib/mediapipe"));
+        }
+        
+        // Import the bridge module
+        bridge_module = PyImport_ImportModule("face_mesh_bridge");
+        if (!bridge_module) {
             PyErr_Print();
-            std::cerr << "[MediaPipe] Failed to import mediapipe" << std::endl;
+            std::cerr << "[FaceMeshBridge] Failed to import face_mesh_bridge module" << std::endl;
+            std::cerr << "[FaceMeshBridge] Make sure face_mesh_bridge.py is in /home/mercleDev/codebase/lib/mediapipe/" << std::endl;
             return;
         }
         
-        // Get solutions module
-        solutions_module = PyObject_GetAttrString(mediapipe_module, "solutions");
-        if (!solutions_module) {
+        // Get the functions
+        init_func = PyObject_GetAttrString(bridge_module, "initialize");
+        process_func = PyObject_GetAttrString(bridge_module, "process_image");
+        cleanup_func = PyObject_GetAttrString(bridge_module, "cleanup");
+        
+        if (!init_func || !process_func || !cleanup_func) {
             PyErr_Print();
-            std::cerr << "[MediaPipe] Failed to get solutions module" << std::endl;
+            std::cerr << "[FaceMeshBridge] Failed to get bridge functions" << std::endl;
             return;
         }
         
-        // Get face_mesh module
-        PyObject* face_mesh_module = PyObject_GetAttrString(solutions_module, "face_mesh");
-        if (!face_mesh_module) {
+        // Call initialize()
+        PyObject* init_result = PyObject_CallObject(init_func, nullptr);
+        if (!init_result || init_result == Py_False) {
             PyErr_Print();
-            std::cerr << "[MediaPipe] Failed to get face_mesh module" << std::endl;
+            std::cerr << "[FaceMeshBridge] Failed to initialize MediaPipe bridge" << std::endl;
+            Py_XDECREF(init_result);
             return;
         }
+        Py_DECREF(init_result);
         
-        // Get FaceMesh class
-        face_mesh_class = PyObject_GetAttrString(face_mesh_module, "FaceMesh");
-        if (!face_mesh_class) {
-            PyErr_Print();
-            std::cerr << "[MediaPipe] Failed to get FaceMesh class" << std::endl;
-            Py_DECREF(face_mesh_module);
-            return;
-        }
-        
-        Py_DECREF(face_mesh_module);
-        initialized = true;
-        std::cout << "[MediaPipe] Python initialization complete" << std::endl;
+        python_initialized = true;
+        std::cout << "[FaceMeshBridge] Python bridge initialized successfully" << std::endl;
     });
     
-    return initialized;
+    return python_initialized;
 }
 
 /**
@@ -91,14 +94,12 @@ static bool InitializePython() {
 static PyObject* Mat2NumPy(const cv::Mat& image) {
     npy_intp dimensions[3] = {image.rows, image.cols, image.channels()};
     
-    // Create NumPy array (this creates a copy)
     PyObject* array = PyArray_SimpleNew(3, dimensions, NPY_UINT8);
     if (!array) {
         PyErr_Print();
         return nullptr;
     }
     
-    // Copy data
     uint8_t* dst = (uint8_t*)PyArray_DATA((PyArrayObject*)array);
     memcpy(dst, image.data, image.total() * image.elemSize());
     
@@ -106,14 +107,13 @@ static PyObject* Mat2NumPy(const cv::Mat& image) {
 }
 
 // ============================================================================
-// FaceMeshDetector::Impl - PIMPL Implementation
+// FaceMeshDetector::Impl - PIMPL Implementation using Python Bridge
 // ============================================================================
 
 class FaceMeshDetector::Impl {
 public:
     Impl(const FaceMeshConfig& config) 
         : config_(config)
-        , face_mesh_instance_(nullptr)
         , initialized_(false)
         , last_error_("Not initialized")
     {
@@ -121,48 +121,20 @@ public:
     }
     
     ~Impl() {
-        if (face_mesh_instance_) {
-            Py_DECREF(face_mesh_instance_);
-        }
+        // Note: Don't cleanup Python here as it may be shared
     }
     
     bool Initialize() {
         if (initialized_) return true;
         
         if (!InitializePython()) {
-            last_error_ = "Failed to initialize Python";
-            return false;
-        }
-        
-        if (!face_mesh_class) {
-            last_error_ = "FaceMesh class not available";
-            return false;
-        }
-        
-        // Create FaceMesh instance with parameters
-        PyObject* kwargs = PyDict_New();
-        PyDict_SetItemString(kwargs, "max_num_faces", PyLong_FromLong(config_.num_faces));
-        PyDict_SetItemString(kwargs, "refine_landmarks", PyBool_FromLong(1));
-        PyDict_SetItemString(kwargs, "min_detection_confidence", 
-                            PyFloat_FromDouble(config_.min_detection_confidence));
-        PyDict_SetItemString(kwargs, "min_tracking_confidence", 
-                            PyFloat_FromDouble(config_.min_tracking_confidence));
-        
-        // Static image mode = False for video processing
-        PyDict_SetItemString(kwargs, "static_image_mode", PyBool_FromLong(0));
-        
-        face_mesh_instance_ = PyObject_Call(face_mesh_class, PyTuple_New(0), kwargs);
-        Py_DECREF(kwargs);
-        
-        if (!face_mesh_instance_) {
-            PyErr_Print();
-            last_error_ = "Failed to create FaceMesh instance";
+            last_error_ = "Failed to initialize Python bridge";
             return false;
         }
         
         initialized_ = true;
         last_error_ = "";
-        std::cout << "[MediaPipe] FaceMesh detector initialized with GPU support" << std::endl;
+        std::cout << "[FaceMeshBridge] Detector ready" << std::endl;
         return true;
     }
     
@@ -181,52 +153,43 @@ public:
         cv::Mat rgb_image;
         cv::cvtColor(bgr_image, rgb_image, cv::COLOR_BGR2RGB);
         
-        // Convert to NumPy array
+        // Acquire GIL
+        PyGILState_STATE gstate = PyGILState_Ensure();
+        
+        // Convert to NumPy
         PyObject* numpy_image = Mat2NumPy(rgb_image);
         if (!numpy_image) {
             last_error_ = "Failed to convert image to NumPy";
+            PyGILState_Release(gstate);
             return false;
         }
         
-        // Call process() method
-        PyObject* process_method = PyObject_GetAttrString(face_mesh_instance_, "process");
-        if (!process_method) {
-            PyErr_Print();
-            Py_DECREF(numpy_image);
-            last_error_ = "Failed to get process method";
-            return false;
-        }
-        
+        // Call process_image(numpy_image)
         PyObject* args = PyTuple_Pack(1, numpy_image);
-        PyObject* process_result = PyObject_CallObject(process_method, args);
-        
+        PyObject* result_dict = PyObject_CallObject(process_func, args);
         Py_DECREF(args);
         Py_DECREF(numpy_image);
-        Py_DECREF(process_method);
         
-        if (!process_result) {
+        if (!result_dict) {
             PyErr_Print();
-            last_error_ = "Process method failed";
+            last_error_ = "Bridge process call failed";
+            PyGILState_Release(gstate);
             return false;
         }
         
-        // Parse results
-        bool success = ParseResults(process_result, rgb_image.cols, rgb_image.rows, result);
-        Py_DECREF(process_result);
+        // Parse the result
+        bool success = ParseResult(result_dict, rgb_image.cols, rgb_image.rows, result);
+        Py_DECREF(result_dict);
         
+        PyGILState_Release(gstate);
         return success;
     }
     
-    bool IsInitialized() const {
-        return initialized_;
-    }
-    
-    std::string GetLastError() const {
-        return last_error_;
-    }
+    bool IsInitialized() const { return initialized_; }
+    std::string GetLastError() const { return last_error_; }
     
 private:
-    bool ParseResults(PyObject* results, int width, int height, FaceMeshResult& result) {
+    bool ParseResult(PyObject* result_dict, int width, int height, FaceMeshResult& result) {
         // Clear previous results
         result.landmarks.clear();
         result.visibility.clear();
@@ -235,91 +198,77 @@ private:
         result.image_width = width;
         result.image_height = height;
         
-        // Check if multi_face_landmarks exists
-        PyObject* multi_face_landmarks = PyObject_GetAttrString(results, "multi_face_landmarks");
-        if (!multi_face_landmarks || multi_face_landmarks == Py_None) {
-            Py_XDECREF(multi_face_landmarks);
+        // None means no face detected
+        if (result_dict == Py_None) {
             last_error_ = "No face detected";
-            return true; // Not an error, just no face
+            return true;  // Not an error, just no face
         }
         
-        // Get list length
-        Py_ssize_t num_faces = PyList_Size(multi_face_landmarks);
-        if (num_faces == 0) {
-            Py_DECREF(multi_face_landmarks);
-            last_error_ = "No face detected";
+        // Must be a dict
+        if (!PyDict_Check(result_dict)) {
+            last_error_ = "Result is not a dict";
+            return false;
+        }
+        
+        // Get landmarks list
+        PyObject* landmarks_list = PyDict_GetItemString(result_dict, "landmarks");
+        if (!landmarks_list || !PyList_Check(landmarks_list)) {
+            last_error_ = "No landmarks in result";
+            return true;  // No face
+        }
+        
+        Py_ssize_t num_landmarks = PyList_Size(landmarks_list);
+        if (num_landmarks <= 0) {
+            last_error_ = "Empty landmarks list";
             return true;
         }
-        
-        // Get first face landmarks
-        PyObject* face_landmarks = PyList_GetItem(multi_face_landmarks, 0); // Borrowed reference
-        if (!face_landmarks) {
-            Py_DECREF(multi_face_landmarks);
-            last_error_ = "Failed to get face landmarks";
-            return false;
-        }
-        
-        // Get landmark list
-        PyObject* landmark_list = PyObject_GetAttrString(face_landmarks, "landmark");
-        if (!landmark_list) {
-            PyErr_Print();
-            Py_DECREF(multi_face_landmarks);
-            last_error_ = "Failed to get landmark list";
-            return false;
-        }
-        
-        Py_ssize_t num_landmarks = PyList_Size(landmark_list);
         
         // Reserve space
         result.landmarks.reserve(num_landmarks);
         result.visibility.reserve(num_landmarks);
         result.presence.reserve(num_landmarks);
         
-        // Parse each landmark
         float min_x = 1.0f, min_y = 1.0f, max_x = 0.0f, max_y = 0.0f;
         
+        // Parse each landmark (now it's a simple Python list of dicts!)
         for (Py_ssize_t i = 0; i < num_landmarks; i++) {
-            PyObject* landmark = PyList_GetItem(landmark_list, i); // Borrowed reference
+            PyObject* lm_dict = PyList_GetItem(landmarks_list, i);  // Borrowed reference
+            if (!lm_dict || !PyDict_Check(lm_dict)) {
+                continue;
+            }
             
-            // Get x, y, z (normalized coordinates 0-1)
-            PyObject* x_obj = PyObject_GetAttrString(landmark, "x");
-            PyObject* y_obj = PyObject_GetAttrString(landmark, "y");
-            PyObject* z_obj = PyObject_GetAttrString(landmark, "z");
-            PyObject* vis_obj = PyObject_GetAttrString(landmark, "visibility");
-            PyObject* pres_obj = PyObject_GetAttrString(landmark, "presence");
+            // Get x, y, z from dict
+            PyObject* x_obj = PyDict_GetItemString(lm_dict, "x");
+            PyObject* y_obj = PyDict_GetItemString(lm_dict, "y");
+            PyObject* z_obj = PyDict_GetItemString(lm_dict, "z");
+            PyObject* vis_obj = PyDict_GetItemString(lm_dict, "visibility");
+            PyObject* pres_obj = PyDict_GetItemString(lm_dict, "presence");
             
-            float x_norm = PyFloat_AsDouble(x_obj);
-            float y_norm = PyFloat_AsDouble(y_obj);
-            float z_norm = PyFloat_AsDouble(z_obj);
+            float x_norm = x_obj ? (float)PyFloat_AsDouble(x_obj) : 0.0f;
+            float y_norm = y_obj ? (float)PyFloat_AsDouble(y_obj) : 0.0f;
+            float z_norm = z_obj ? (float)PyFloat_AsDouble(z_obj) : 0.0f;
             
             // Convert to pixel coordinates
             float x_pix = x_norm * width;
             float y_pix = y_norm * height;
-            float z_pix = z_norm * width; // Z is also normalized
+            float z_pix = z_norm * width;
             
             result.landmarks.push_back(cv::Point3f(x_pix, y_pix, z_pix));
             
-            // Visibility and presence (may be None)
-            float visibility = (vis_obj && vis_obj != Py_None) ? PyFloat_AsDouble(vis_obj) : 1.0f;
-            float presence = (pres_obj && pres_obj != Py_None) ? PyFloat_AsDouble(pres_obj) : 1.0f;
+            float visibility = vis_obj ? (float)PyFloat_AsDouble(vis_obj) : 1.0f;
+            float presence = pres_obj ? (float)PyFloat_AsDouble(pres_obj) : 1.0f;
             
             result.visibility.push_back(visibility);
             result.presence.push_back(presence);
             
-            // Update bounding box
+            // Track bounding box
             if (x_norm < min_x) min_x = x_norm;
             if (x_norm > max_x) max_x = x_norm;
             if (y_norm < min_y) min_y = y_norm;
             if (y_norm > max_y) max_y = y_norm;
-            
-            Py_XDECREF(x_obj);
-            Py_XDECREF(y_obj);
-            Py_XDECREF(z_obj);
-            Py_XDECREF(vis_obj);
-            Py_XDECREF(pres_obj);
         }
         
-        // Calculate bounding box
+        // Set bounding box
         result.bbox = cv::Rect(
             static_cast<int>(min_x * width),
             static_cast<int>(min_y * height),
@@ -327,22 +276,15 @@ private:
             static_cast<int>((max_y - min_y) * height)
         );
         
-        // Estimate confidence from presence scores
-        float avg_presence = 0.0f;
-        for (float p : result.presence) {
-            avg_presence += p;
-        }
-        result.confidence = avg_presence / result.presence.size();
-        
-        Py_DECREF(landmark_list);
-        Py_DECREF(multi_face_landmarks);
+        // Get confidence
+        PyObject* conf_obj = PyDict_GetItemString(result_dict, "confidence");
+        result.confidence = conf_obj ? (float)PyFloat_AsDouble(conf_obj) : 0.0f;
         
         last_error_ = "";
         return true;
     }
     
     FaceMeshConfig config_;
-    PyObject* face_mesh_instance_;
     bool initialized_;
     std::string last_error_;
 };
@@ -384,13 +326,13 @@ bool FaceMeshResult::IsLandmarkValid(int index, float min_visibility) const {
     }
     
     if (index >= static_cast<int>(visibility.size())) {
-        return true; // No visibility info, assume valid
+        return true;
     }
     
     return visibility[index] >= min_visibility;
 }
 
-// Landmark indices (MediaPipe standard 468-point topology)
+// Landmark indices
 const std::vector<int> FaceMeshResult::LandmarkIndices::FACE_OVAL = {
     10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
     397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
@@ -461,4 +403,3 @@ std::string FaceMeshDetector::GetLastError() const {
 }
 
 }  // namespace mdai
-

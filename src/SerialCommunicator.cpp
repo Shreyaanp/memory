@@ -220,18 +220,81 @@ bool SerialCommunicator::send_progress(int progress_percent) {
     return send_packet(SerialCommand::CMD_UPDATE_PROGRESS, payload);
 }
 
+bool SerialCommunicator::send_tracking_data(int x, int y, int progress_percent, bool target_valid) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    
+    if (!connected_ || fd_ == -1) {
+        if (!try_reconnect()) {
+            return false;
+        }
+    }
+    
+    // Clamp values
+    if (progress_percent < 0) progress_percent = 0;
+    if (progress_percent > 100) progress_percent = 100;
+    
+    // Send combined format: "X:233,Y:180,P:75,C:1\n"
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "X:%d,Y:%d,P:%d,C:%d\n", 
+             x, y, progress_percent, target_valid ? 1 : 0);
+    ssize_t written = write(fd_, buffer, strlen(buffer));
+    
+    if (written != static_cast<ssize_t>(strlen(buffer))) {
+        std::cerr << "Error writing tracking data to serial port" << std::endl;
+        connected_ = false;
+        return false;
+    }
+    
+    return true;
+}
+
 bool SerialCommunicator::send_error(const std::string& error_msg) {
-    std::vector<uint8_t> payload(error_msg.begin(), error_msg.end());
-    // Truncate if too long for standard buffer (say 250 bytes)
-    if (payload.size() > 250) payload.resize(250);
-    return send_packet(SerialCommand::CMD_SHOW_ERROR, payload);
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    
+    if (!connected_ || fd_ == -1) {
+        if (!try_reconnect()) {
+            return false;
+        }
+    }
+    
+    // Send JSON format that ESP32 expects: {"error": "message"}
+    // Truncate message if too long
+    std::string msg = error_msg;
+    if (msg.length() > 200) {
+        msg = msg.substr(0, 200);
+    }
+    
+    // Escape any quotes in the message
+    std::string escaped_msg;
+    for (char c : msg) {
+        if (c == '"') {
+            escaped_msg += "\\\"";
+        } else if (c == '\\') {
+            escaped_msg += "\\\\";
+        } else {
+            escaped_msg += c;
+        }
+    }
+    
+    std::string message = "{\"error\": \"" + escaped_msg + "\"}\n";
+    ssize_t written = write(fd_, message.c_str(), message.length());
+    
+    if (written == static_cast<ssize_t>(message.length())) {
+        std::cout << "[Serial] Sent error: " << error_msg << std::endl;
+        return true;
+    } else {
+        std::cerr << "Error writing to serial port" << std::endl;
+        connected_ = false;
+        return false;
+    }
 }
 
 bool SerialCommunicator::auto_detect_port() {
-    // Try ttyACM0 first
+    // Try ttyACM0 first (most common for ESP32)
     std::ifstream acm0("/dev/ttyACM0");
     if (acm0.good()) {
         config_.port_name = "/dev/ttyACM0";
+        std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM0" << std::endl;
         return true;
     }
     
@@ -239,6 +302,7 @@ bool SerialCommunicator::auto_detect_port() {
     std::ifstream acm1("/dev/ttyACM1");
     if (acm1.good()) {
         config_.port_name = "/dev/ttyACM1";
+        std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM1" << std::endl;
         return true;
     }
     
@@ -246,8 +310,29 @@ bool SerialCommunicator::auto_detect_port() {
     std::ifstream acm2("/dev/ttyACM2");
     if (acm2.good()) {
         config_.port_name = "/dev/ttyACM2";
+        std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM2" << std::endl;
         return true;
     }
+    
+    // Try ttyUSB devices (alternative ESP32 connection method)
+    for (int i = 0; i < 5; i++) {
+        std::string usb_port = "/dev/ttyUSB" + std::to_string(i);
+        std::ifstream usb_check(usb_port);
+        if (usb_check.good()) {
+            config_.port_name = usb_port;
+            std::cout << "[Serial] Auto-detected ESP32 on " << usb_port << std::endl;
+            return true;
+        }
+    }
+    
+    std::cerr << "[Serial] ❌ ESP32 not detected!" << std::endl;
+    std::cerr << "[Serial]    Checked: /dev/ttyACM0, /dev/ttyACM1, /dev/ttyACM2, /dev/ttyUSB0-4" << std::endl;
+    std::cerr << "[Serial]    Troubleshooting:" << std::endl;
+    std::cerr << "[Serial]      1. Ensure ESP32 is plugged in and powered on" << std::endl;
+    std::cerr << "[Serial]      2. Check USB cable (must support data, not power-only)" << std::endl;
+    std::cerr << "[Serial]      3. Run: lsusb (should show ESP32/CP210x/CH340 device)" << std::endl;
+    std::cerr << "[Serial]      4. Run: ls -la /dev/ttyACM* /dev/ttyUSB*" << std::endl;
+    std::cerr << "[Serial]      5. Check user is in dialout group: groups | grep dialout" << std::endl;
     
     return false;
 }
@@ -267,7 +352,9 @@ bool SerialCommunicator::try_reconnect() {
     
     // Auto-detect port
     if (!auto_detect_port()) {
-        std::cerr << "[Serial] No ESP32 device found on /dev/ttyACM*" << std::endl;
+        std::cerr << "[Serial] ❌ No ESP32 device found. Auto-detection failed." << std::endl;
+        std::cerr << "[Serial]    The application will continue without display control." << std::endl;
+        std::cerr << "[Serial]    To fix: Connect ESP32 and restart the application." << std::endl;
         return false;
     }
     
@@ -279,7 +366,8 @@ bool SerialCommunicator::try_reconnect() {
         if (last_state_ >= 0) {
             std::cout << "[Serial] Restoring last state: " << last_state_ << std::endl;
             std::string message = std::to_string(last_state_) + "\n";
-            write(fd_, message.c_str(), message.length());
+            ssize_t written = write(fd_, message.c_str(), message.length());
+            (void)written; // Suppress unused result warning - reconnect is best effort
         }
         
         return true;

@@ -19,22 +19,24 @@ class MediaPipeFaceDetector::Impl {
 public:
     Impl() : initialized_(false) {
         // Configure MediaPipe Face Mesh
+        // Note: model_path is not used by the Python MediaPipe wrapper
+        // The wrapper uses Python's mediapipe.solutions.face_mesh.FaceMesh directly
         FaceMeshConfig config;
-        config.model_path = "models/face_landmarker.task";
         config.num_faces = 1;
         config.min_detection_confidence = 0.5f;
         config.min_tracking_confidence = 0.5f;
         config.min_presence_confidence = 0.5f;
-        config.use_gpu = false;  // Disable GPU to avoid EGL issues
+        config.use_gpu = true;  // Enable GPU acceleration (MediaPipe Python handles this automatically)
         
         detector_ = std::make_unique<FaceMeshDetector>(config);
         initialized_ = detector_->IsInitialized();
         
         if (initialized_) {
-            std::cout << "✓ MediaPipe Face Mesh (468 points) initialized with GPU acceleration" << std::endl;
+            std::cout << "✓ MediaPipe Face Mesh (468 points) initialized successfully" << std::endl;
         } else {
             std::cerr << "❌ Failed to initialize MediaPipe Face Mesh: " 
                       << detector_->GetLastError() << std::endl;
+            std::cerr << "   Make sure MediaPipe Python is installed: pip3 install mediapipe" << std::endl;
         }
     }
     

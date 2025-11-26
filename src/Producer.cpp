@@ -107,6 +107,14 @@ bool Producer::start() {
                     // Process frameset and extract raw data (no rs2::frame references!)
                     FrameBox framebox = process_frameset(processed);
                     
+                    // Update frame health tracking BEFORE ring buffer write
+                    // This ensures we know frames are arriving even if buffer is full/disabled
+                    {
+                        std::lock_guard<std::mutex> lock(frame_time_mutex_);
+                        last_frame_time_ = std::chrono::steady_clock::now();
+                    }
+                    first_frame_received_.store(true);
+                    
                     // Write to ring buffer (non-blocking)
                     // Ring buffer internally handles recording_active flag
                     if (ring_buffer_->write(std::move(framebox))) {
@@ -224,6 +232,43 @@ uint64_t Producer::get_total_frames_captured() const {
 
 bool Producer::is_camera_connected() const {
     return camera_connected_.load();
+}
+
+bool Producer::is_camera_healthy(int timeout_ms) const {
+    // Must be running
+    if (!running_.load()) {
+        return false;
+    }
+    
+    // Must be connected
+    if (!camera_connected_.load()) {
+        return false;
+    }
+    
+    // Check if we've received any frames yet
+    if (!first_frame_received_.load()) {
+        return false;
+    }
+    
+    // Check if frames are still arriving within timeout
+    int64_t ms_since_last = get_ms_since_last_frame();
+    if (ms_since_last < 0 || ms_since_last > timeout_ms) {
+        return false;
+    }
+    
+    return true;
+}
+
+int64_t Producer::get_ms_since_last_frame() const {
+    if (!first_frame_received_.load()) {
+        return -1;  // No frame received yet
+    }
+    
+    std::lock_guard<std::mutex> lock(frame_time_mutex_);
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_frame_time_
+    ).count();
 }
 
 void Producer::set_error_callback(std::function<void(const std::string&)> callback) {
@@ -399,12 +444,46 @@ void Producer::query_camera_parameters() {
 
 void Producer::capture_loop() {
     // With callback mode, frames are delivered automatically
-    // This thread just updates FPS and monitors health
+    // This thread updates FPS and monitors camera health via frame timing only
+    // NOTE: Do NOT create rs2::context() here - it conflicts with running pipeline!
     report_status("Capture loop started (callback mode)");
+    
+    const int FRAME_TIMEOUT_MS = 5000;  // 5 seconds without frames = error
+    const int HEALTH_CHECK_INTERVAL = 20;  // Check every 2 seconds (20 * 100ms)
+    int health_check_counter = 0;
+    bool error_reported = false;
     
     while (running_.load()) {
         // Update FPS periodically
         update_fps();
+        
+        // Check camera health periodically (frame timing only - safe)
+        if (++health_check_counter >= HEALTH_CHECK_INTERVAL) {
+            health_check_counter = 0;
+            
+            // Only check if we've received at least one frame
+            if (first_frame_received_.load()) {
+                int64_t ms_since_last = get_ms_since_last_frame();
+                
+                if (ms_since_last > FRAME_TIMEOUT_MS) {
+                    // Camera has stopped sending frames
+                    if (!error_reported) {
+                        std::cerr << "⚠️  Camera frame timeout! No frames for " << ms_since_last << "ms" << std::endl;
+                        camera_connected_.store(false);
+                        report_error("Camera disconnected - no frames for " + 
+                                     std::to_string(ms_since_last / 1000) + "s");
+                        error_reported = true;
+                    }
+                } else if (error_reported && ms_since_last < FRAME_TIMEOUT_MS) {
+                    // Frames started arriving again
+                    std::cout << "✅ Camera recovered - frames arriving again" << std::endl;
+                    camera_connected_.store(true);
+                    report_status("Camera recovered");
+                    error_reported = false;
+                }
+            }
+            // Removed rs2::context() query - it conflicts with running pipeline!
+        }
         
         // Sleep to avoid busy-waiting
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
