@@ -173,3 +173,6 @@ groups | grep dialout
 4. Enable auto-start on boot if desired
 5. Update any scripts that manually start mdai_system to use systemctl instead
 
+
+
+

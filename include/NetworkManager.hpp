@@ -12,6 +12,7 @@ namespace mdai {
 class NetworkManager {
 public:
     using MsgCallback = std::function<void(const std::string&)>;
+    using ConnectCallback = std::function<void()>;
 
     NetworkManager();
     ~NetworkManager();
@@ -30,6 +31,7 @@ public:
     void disconnect();
     bool send_message(const std::string& message);
     void set_message_callback(MsgCallback cb);
+    void set_connect_callback(ConnectCallback cb);  // Called on (re)connect
     bool is_connected() const;
 
 private:
@@ -37,6 +39,7 @@ private:
     std::atomic<bool> connected_{false};
     std::thread client_thread_;
     MsgCallback message_callback_;
+    ConnectCallback connect_callback_;
     
     // WiFi monitoring
     std::atomic<bool> wifi_monitor_running_{false};

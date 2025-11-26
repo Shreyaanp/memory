@@ -1,6 +1,8 @@
 #include "NetworkManager.hpp"
 #include "CryptoUtils.hpp"
 #include <iostream>
+#include <thread>
+#include <chrono>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -66,46 +68,8 @@ bool NetworkManager::connect_wifi(const std::string& ssid, const std::string& pa
 }
 
 bool NetworkManager::is_connected_to_internet() {
-    // Multi-layer connectivity check:
-    // 1. Try to connect to Google DNS (8.8.8.8) on port 53
-    // 2. This tests actual network connectivity, not just DNS cache
-    
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-    
-    // Set socket timeout to 2 seconds
-    struct timeval timeout;
-    timeout.tv_sec = 2;
-    timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
-    struct sockaddr_in addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(53);  // DNS port
-    addr.sin_addr.s_addr = inet_addr("8.8.8.8");  // Google DNS
-    
-    // Try to connect (non-blocking would be better but this is simpler)
-    int result = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-    close(sock);
-    
-    if (result == 0) {
-        return true;
-    }
-    
-    // Fallback: Try Cloudflare DNS
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-    
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
-    addr.sin_addr.s_addr = inet_addr("1.1.1.1");  // Cloudflare DNS
-    result = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-    close(sock);
-    
-    return (result == 0);
+    struct hostent* host = gethostbyname("google.com");
+    return (host != nullptr);
 }
 
 std::string NetworkManager::get_ip_address() {
@@ -198,56 +162,27 @@ void NetworkManager::set_message_callback(MsgCallback cb) {
     message_callback_ = cb;
 }
 
+void NetworkManager::set_connect_callback(ConnectCallback cb) {
+    connect_callback_ = cb;
+}
+
 void NetworkManager::client_loop(std::string host, int port, std::string path, std::string device_id) {
-    // NO RETRIES: Connect once, if fails or disconnects, exit cleanly
-    // Reconnection is handled at the SystemController level via QR scan
-    bool initial_connection = true;
-    
     while (running_) {
         if (!connected_) {
-            // Only allow ONE connection attempt - no retries from RDK side
-            if (!initial_connection) {
-                std::cerr << "⚠️  WebSocket disconnected - not retrying (handled by QR scan)" << std::endl;
-                running_ = false;
-                
-                // Notify via callback that connection was lost
-                if (message_callback_) {
-                    message_callback_("{\"type\":\"disconnected\",\"reason\":\"connection_lost\"}");
-                }
-                return;
-            }
-            
-            initial_connection = false;  // Mark that we've tried once
-            std::cout << "🔌 WebSocket connecting (single attempt, no retries)..." << std::endl;
-            
             // 1. Create Socket
             socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
             if (socket_fd_ < 0) {
-                std::cerr << "❌ Socket creation failed - not retrying" << std::endl;
-                running_ = false;
-                if (message_callback_) {
-                    message_callback_("{\"type\":\"connection_failed\",\"reason\":\"socket_error\"}");
-                }
-                return;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
             }
-
-            // Set socket timeout
-            struct timeval timeout;
-            timeout.tv_sec = 5;
-            timeout.tv_usec = 0;
-            setsockopt(socket_fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-            setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
             // 2. Resolve Host
             struct hostent* server = gethostbyname(host.c_str());
             if (!server) {
-                std::cerr << "❌ Could not resolve host: " << host << " - not retrying" << std::endl;
+                std::cerr << "Could not resolve host: " << host << std::endl;
                 close(socket_fd_);
-                running_ = false;
-                if (message_callback_) {
-                    message_callback_("{\"type\":\"connection_failed\",\"reason\":\"dns_error\"}");
-                }
-                return;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
             }
 
             struct sockaddr_in serv_addr;
@@ -258,53 +193,44 @@ void NetworkManager::client_loop(std::string host, int port, std::string path, s
 
             // 3. Connect TCP
             if (connect(socket_fd_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-                std::cerr << "❌ TCP connection failed - not retrying" << std::endl;
+                std::cerr << "Connection failed" << std::endl;
                 close(socket_fd_);
-                running_ = false;
-                if (message_callback_) {
-                    message_callback_("{\"type\":\"connection_failed\",\"reason\":\"tcp_error\"}");
-                }
-                return;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
             }
 
             // 4. Upgrade to SSL
             ssl_ = SSL_new((SSL_CTX*)ssl_ctx_);
             SSL_set_fd((SSL*)ssl_, socket_fd_);
             if (SSL_connect((SSL*)ssl_) <= 0) {
-                std::cerr << "❌ SSL handshake failed - not retrying" << std::endl;
+                std::cerr << "SSL handshake failed" << std::endl;
                 ERR_print_errors_fp(stderr);
-                SSL_free((SSL*)ssl_);
-                ssl_ = nullptr;
                 close(socket_fd_);
-                running_ = false;
-                if (message_callback_) {
-                    message_callback_("{\"type\":\"connection_failed\",\"reason\":\"ssl_error\"}");
-                }
-                return;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
             }
 
             // 5. WebSocket Handshake
             if (perform_handshake(host, path, device_id)) {
                 connected_ = true;
-                std::cout << "✅ Connected to Middleware (WSS)" << std::endl;
-            } else {
-                std::cerr << "❌ WebSocket handshake failed - not retrying" << std::endl;
-                SSL_shutdown((SSL*)ssl_);
-                SSL_free((SSL*)ssl_);
-                ssl_ = nullptr;
-                close(socket_fd_);
-                running_ = false;
-                if (message_callback_) {
-                    message_callback_("{\"type\":\"connection_failed\",\"reason\":\"handshake_error\"}");
+                std::cout << "✓ Connected to Middleware (WSS)" << std::endl;
+                
+                // Notify on (re)connect so caller can re-auth if needed
+                if (connect_callback_) {
+                    connect_callback_();
                 }
-                return;
+            } else {
+                std::cerr << "WebSocket handshake failed" << std::endl;
+                close(socket_fd_);
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
             }
         }
 
         // 6. Read Loop
         std::string msg = receive_frame();
         if (msg.empty()) {
-            std::cerr << "⚠️  Connection lost" << std::endl;
+            std::cout << "⚠️  receive_frame returned empty - connection issue" << std::endl;
             connected_ = false;
             if (ssl_) {
                 SSL_shutdown((SSL*)ssl_);
@@ -312,12 +238,6 @@ void NetworkManager::client_loop(std::string host, int port, std::string path, s
                 ssl_ = nullptr;
             }
             close(socket_fd_);
-            socket_fd_ = -1;
-            
-            // Notify about disconnection
-            if (message_callback_) {
-                message_callback_("{\"type\":\"disconnected\"}");
-            }
             continue;
         }
 
@@ -366,95 +286,126 @@ bool NetworkManager::send_frame_internal(const std::string& message) {
     std::vector<uint8_t> frame;
     frame.push_back(0x81); // FIN + Text Frame
     
-    // Proper WebSocket length encoding per RFC 6455
+    // Proper length encoding per WebSocket RFC 6455
     size_t payload_len = message.length();
-    
     if (payload_len <= 125) {
-        // 7-bit length
-        frame.push_back(0x80 | static_cast<uint8_t>(payload_len));
+        frame.push_back(0x80 | payload_len);  // MASK bit + length
     } else if (payload_len <= 65535) {
-        // 16-bit length
-        frame.push_back(0x80 | 126);
-        frame.push_back(static_cast<uint8_t>((payload_len >> 8) & 0xFF));
-        frame.push_back(static_cast<uint8_t>(payload_len & 0xFF));
+        frame.push_back(0x80 | 126);  // MASK bit + 126 (extended 16-bit length)
+        frame.push_back((payload_len >> 8) & 0xFF);
+        frame.push_back(payload_len & 0xFF);
     } else {
-        // 64-bit length (for very large messages like images)
-        frame.push_back(0x80 | 127);
+        frame.push_back(0x80 | 127);  // MASK bit + 127 (extended 64-bit length)
         for (int i = 7; i >= 0; --i) {
-            frame.push_back(static_cast<uint8_t>((payload_len >> (i * 8)) & 0xFF));
+            frame.push_back((payload_len >> (i * 8)) & 0xFF);
         }
     }
     
-    // Generate random masking key (required for client-to-server)
-    uint8_t mask[4];
-    std::random_device rd;
-    std::uniform_int_distribution<int> dist(0, 255);
-    for (int i = 0; i < 4; ++i) {
-        mask[i] = static_cast<uint8_t>(dist(rd));
-    }
-    frame.push_back(mask[0]);
-    frame.push_back(mask[1]);
-    frame.push_back(mask[2]);
-    frame.push_back(mask[3]);
+    // Masking Key (should be random per RFC, using fixed for simplicity)
+    uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78}; 
+    frame.push_back(mask[0]); frame.push_back(mask[1]); frame.push_back(mask[2]); frame.push_back(mask[3]);
     
-    // Mask and append payload
+    // Mask Payload
     for (size_t i = 0; i < message.length(); ++i) {
         frame.push_back(message[i] ^ mask[i % 4]);
     }
     
-    // Send in chunks if large (SSL may have buffer limits)
-    size_t total_sent = 0;
-    while (total_sent < frame.size()) {
-        int chunk_size = std::min(static_cast<size_t>(16384), frame.size() - total_sent);
-        int sent = SSL_write((SSL*)ssl_, frame.data() + total_sent, chunk_size);
-        if (sent <= 0) {
-            std::cerr << "WebSocket send failed at byte " << total_sent << std::endl;
-            return false;
-        }
-        total_sent += sent;
-    }
-    
-    return true;
+    int sent = SSL_write((SSL*)ssl_, frame.data(), frame.size());
+    return (sent == static_cast<int>(frame.size()));
 }
 
 std::string NetworkManager::receive_frame() {
     if (!connected_ || !ssl_) return "";
     
-    // Set read timeout to detect silent disconnects (10 seconds)
-    struct timeval timeout;
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
-    setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
-    uint8_t header[2];
-    int read_result = SSL_read((SSL*)ssl_, header, 2);
-    if (read_result <= 0) {
-        int ssl_error = SSL_get_error((SSL*)ssl_, read_result);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-            // Timeout or would block - treat as disconnect
-            std::cerr << "⚠️  WebSocket read timeout (10s) - connection may be dead" << std::endl;
+    while (true) {  // Loop to handle control frames
+        uint8_t header[2];
+        int read_result = SSL_read((SSL*)ssl_, header, 2);
+        if (read_result <= 0) {
+            int ssl_error = SSL_get_error((SSL*)ssl_, read_result);
+            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;  // Retry
+            }
+            return "";  // Real error or disconnect
         }
-        return "";
+        
+        uint8_t opcode = header[0] & 0x0F;
+        bool is_fin = (header[0] & 0x80) != 0;
+        uint64_t payload_len = header[1] & 0x7F;
+        
+        // Handle extended payload length
+        if (payload_len == 126) {
+            uint8_t len_bytes[2];
+            if (SSL_read((SSL*)ssl_, len_bytes, 2) <= 0) return "";
+            payload_len = (len_bytes[0] << 8) | len_bytes[1];
+        } else if (payload_len == 127) {
+            uint8_t len_bytes[8];
+            if (SSL_read((SSL*)ssl_, len_bytes, 8) <= 0) return "";
+            payload_len = 0;
+            for (int i = 0; i < 8; i++) {
+                payload_len = (payload_len << 8) | len_bytes[i];
+            }
+        }
+        
+        // Read payload
+        std::vector<uint8_t> buffer(payload_len);
+        size_t total_read = 0;
+        while (total_read < payload_len) {
+            int r = SSL_read((SSL*)ssl_, buffer.data() + total_read, payload_len - total_read);
+            if (r <= 0) return "";
+            total_read += r;
+        }
+        
+        // Handle different frame types
+        switch (opcode) {
+            case 0x01:  // Text frame
+            case 0x02:  // Binary frame
+                return std::string(buffer.begin(), buffer.end());
+                
+            case 0x08:  // Close frame
+                {
+                    // Extract close code if present
+                    uint16_t close_code = 0;
+                    std::string close_reason;
+                    if (buffer.size() >= 2) {
+                        close_code = (buffer[0] << 8) | buffer[1];
+                        if (buffer.size() > 2) {
+                            close_reason = std::string(buffer.begin() + 2, buffer.end());
+                        }
+                    }
+                    std::cout << "🔌 WebSocket close frame received - Code: " << close_code 
+                              << ", Reason: " << (close_reason.empty() ? "(none)" : close_reason) << std::endl;
+                    
+                    // Send close frame back
+                    uint8_t close_resp[2] = {0x88, 0x00};
+                    SSL_write((SSL*)ssl_, close_resp, 2);
+                }
+                return "";  // Signal disconnect
+                
+            case 0x09:  // Ping frame - respond with Pong
+                {
+                    std::vector<uint8_t> pong_frame;
+                    pong_frame.push_back(0x8A);  // FIN + Pong opcode
+                    pong_frame.push_back(0x80 | (payload_len & 0x7F));  // Mask bit + length
+                    // Add mask key
+                    uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
+                    pong_frame.insert(pong_frame.end(), mask, mask + 4);
+                    // Add masked payload (echo back ping data)
+                    for (size_t i = 0; i < buffer.size(); i++) {
+                        pong_frame.push_back(buffer[i] ^ mask[i % 4]);
+                    }
+                    SSL_write((SSL*)ssl_, pong_frame.data(), pong_frame.size());
+                }
+                continue;  // Keep reading for actual data
+                
+            case 0x0A:  // Pong frame - ignore
+                continue;  // Keep reading for actual data
+                
+            default:
+                // Unknown opcode, skip
+                continue;
+        }
     }
-    
-    uint64_t payload_len = header[1] & 0x7F;
-    if (payload_len == 126) {
-        uint8_t len_bytes[2];
-        if (SSL_read((SSL*)ssl_, len_bytes, 2) <= 0) return "";
-        payload_len = (len_bytes[0] << 8) | len_bytes[1];
-    }
-    
-    // Note: Server-to-Client frames are usually NOT masked
-    
-    std::vector<uint8_t> buffer(payload_len);
-    size_t total_read = 0;
-    while (total_read < payload_len) {
-        int r = SSL_read((SSL*)ssl_, buffer.data() + total_read, payload_len - total_read);
-        if (r <= 0) return "";
-        total_read += r;
-    }
-    
-    return std::string(buffer.begin(), buffer.end());
 }
 
 void NetworkManager::start_wifi_monitor() {
@@ -479,13 +430,11 @@ bool NetworkManager::is_wifi_stable() const {
 
 void NetworkManager::wifi_monitor_loop() {
     int consecutive_failures = 0;
-    const int max_failures = 2;  // Faster detection: 2 failures × 2s = 4s max
-    int reconnect_attempts = 0;
-    const int max_reconnect_attempts = 3;
+    const int max_failures = 3;
     
     while (wifi_monitor_running_) {
-        // Check WiFi every 2 seconds for faster detection
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // Check WiFi every 10 seconds
+        std::this_thread::sleep_for(std::chrono::seconds(10));
         
         if (!is_connected_to_internet()) {
             consecutive_failures++;
@@ -495,35 +444,24 @@ void NetworkManager::wifi_monitor_loop() {
                 std::cerr << "🔄 WiFi lost! Attempting reconnection..." << std::endl;
                 
                 // Try to reconnect using stored credentials
-                if (!last_ssid_.empty() && reconnect_attempts < max_reconnect_attempts) {
-                    reconnect_attempts++;
-                    std::cout << "📡 Reconnect attempt " << reconnect_attempts << "/" << max_reconnect_attempts << std::endl;
-                    
-                    std::string cmd = "nmcli device wifi connect '" + last_ssid_ + "' password '" + last_password_ + "' 2>/dev/null";
+                if (!last_ssid_.empty()) {
+                    std::string cmd = "nmcli device wifi connect '" + last_ssid_ + "' password '" + last_password_ + "'";
                     if (std::system(cmd.c_str()) == 0) {
                         std::cout << "✅ WiFi reconnected successfully!" << std::endl;
                         consecutive_failures = 0;
-                        reconnect_attempts = 0;
                     } else {
-                        std::cerr << "❌ WiFi reconnection attempt " << reconnect_attempts << " failed" << std::endl;
-                        // Exponential backoff: 2s, 4s, 8s
-                        std::this_thread::sleep_for(std::chrono::seconds(2 * reconnect_attempts));
+                        std::cerr << "❌ WiFi reconnection failed, will retry..." << std::endl;
+                        // Wait longer before next attempt
+                        std::this_thread::sleep_for(std::chrono::seconds(5));
                     }
-                } else if (reconnect_attempts >= max_reconnect_attempts) {
-                    // Give up on auto-reconnect, wait for user to scan WiFi QR
-                    std::cerr << "❌ Auto-reconnect failed after " << max_reconnect_attempts << " attempts" << std::endl;
-                    std::cerr << "📱 Please scan WiFi QR to reconnect" << std::endl;
-                    // Don't keep spamming reconnect - wait longer
-                    std::this_thread::sleep_for(std::chrono::seconds(10));
                 }
             }
         } else {
-            // Reset counters on successful check
+            // Reset counter on successful check
             if (consecutive_failures > 0) {
                 std::cout << "✅ WiFi connection restored" << std::endl;
             }
             consecutive_failures = 0;
-            reconnect_attempts = 0;
         }
     }
 }

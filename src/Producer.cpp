@@ -46,7 +46,12 @@ bool Producer::start() {
         });
         
         // Perform camera initialization with stabilization
-        report_status("Starting camera initialization with stabilization...");
+        if (config_.quick_init) {
+            report_status("Starting QUICK camera initialization (mode switch)...");
+            camera_initializer_->set_quick_mode(true);
+        } else {
+            report_status("Starting camera initialization with stabilization...");
+        }
         auto init_result = camera_initializer_->initialize(30000); // 30 second timeout
         
         if (init_result != CameraInitializer::Result::SUCCESS) {
@@ -75,6 +80,10 @@ bool Producer::start() {
         // Get the initialized profile and pipeline
         profile_ = camera_initializer_->get_profile();
         pipe_ = std::move(camera_initializer_->get_pipeline());
+        
+        // Detect camera orientation using IMU (before starting main pipeline)
+        report_status("Checking camera orientation via IMU...");
+        detect_camera_orientation();
         
         // Now start the pipeline with callback
         report_status("Starting camera pipeline...");
@@ -635,6 +644,184 @@ void Producer::report_status(const std::string& status) {
     std::cout << "[Producer Status] " << status << std::endl;
     if (status_callback_) {
         status_callback_(status);
+    }
+}
+
+// ============================================================================
+// IMU-Based Camera Orientation Detection
+// ============================================================================
+
+Producer::CameraOrientation Producer::detect_camera_orientation() {
+    try {
+        // Check if device has IMU (D435I has it, D435 doesn't)
+        rs2::context ctx;
+        auto devices = ctx.query_devices();
+        if (devices.size() == 0) {
+            report_status("No RealSense device found for IMU check");
+            return CameraOrientation::UNKNOWN;
+        }
+        
+        rs2::device dev = devices[0];
+        
+        // Check for motion sensor
+        bool found_accel = false;
+        for (auto&& sensor : dev.query_sensors()) {
+            for (auto&& profile : sensor.get_stream_profiles()) {
+                if (profile.stream_type() == RS2_STREAM_ACCEL) {
+                    found_accel = true;
+                    break;
+                }
+            }
+        }
+        
+        if (!found_accel) {
+            report_status("⚠️  Camera does not have IMU (D435 vs D435I?) - orientation detection unavailable");
+            has_imu_ = false;
+            detected_orientation_ = CameraOrientation::UNKNOWN;  // Don't assume - unknown orientation
+            return detected_orientation_;
+        }
+        
+        has_imu_ = true;
+        report_status("IMU detected - reading accelerometer for orientation...");
+        
+        // Create a separate pipeline for IMU
+        rs2::pipeline imu_pipe;
+        rs2::config imu_config;
+        imu_config.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F, 200);
+        
+        imu_pipe.start(imu_config);
+        
+        // Collect accelerometer samples to average out noise
+        float accel_x = 0, accel_y = 0, accel_z = 0;
+        int sample_count = 0;
+        const int NUM_SAMPLES = 50;
+        
+        auto start_time = std::chrono::steady_clock::now();
+        while (sample_count < NUM_SAMPLES) {
+            rs2::frameset frames;
+            if (imu_pipe.poll_for_frames(&frames)) {
+                for (auto&& frame : frames) {
+                    if (auto motion = frame.as<rs2::motion_frame>()) {
+                        if (motion.get_profile().stream_type() == RS2_STREAM_ACCEL) {
+                            auto data = motion.get_motion_data();
+                            accel_x += data.x;
+                            accel_y += data.y;
+                            accel_z += data.z;
+                            sample_count++;
+                        }
+                    }
+                }
+            }
+            
+            // Timeout after 2 seconds
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time).count();
+            if (elapsed > 2000) break;
+        }
+        
+        imu_pipe.stop();
+        
+        if (sample_count == 0) {
+            report_status("Failed to read IMU data");
+            detected_orientation_ = CameraOrientation::NORMAL;
+            return detected_orientation_;
+        }
+        
+        // Average the samples
+        accel_x /= sample_count;
+        accel_y /= sample_count;
+        accel_z /= sample_count;
+        
+        report_status("IMU Accelerometer: X=" + std::to_string(accel_x) + 
+                     " Y=" + std::to_string(accel_y) + 
+                     " Z=" + std::to_string(accel_z));
+        
+        // Determine orientation from gravity vector
+        // In RealSense coordinate system:
+        // - Camera facing user horizontally: gravity should be mostly in -Y
+        // - Rotated 90° CW: gravity in -X
+        // - Rotated 90° CCW: gravity in +X
+        // - Upside down: gravity in +Y
+        
+        const float GRAVITY_THRESHOLD = 7.0f;  // ~70% of 9.8 m/s²
+        
+        if (accel_y < -GRAVITY_THRESHOLD) {
+            detected_orientation_ = CameraOrientation::NORMAL;
+            report_status("📷 Camera orientation: NORMAL (correct)");
+        } else if (accel_y > GRAVITY_THRESHOLD) {
+            detected_orientation_ = CameraOrientation::UPSIDE_DOWN;
+            report_status("⚠️  Camera orientation: UPSIDE DOWN (180° rotation applied)");
+        } else if (accel_x < -GRAVITY_THRESHOLD) {
+            detected_orientation_ = CameraOrientation::ROTATED_90_CW;
+            report_status("⚠️  Camera orientation: ROTATED 90° CW (rotation applied)");
+        } else if (accel_x > GRAVITY_THRESHOLD) {
+            detected_orientation_ = CameraOrientation::ROTATED_90_CCW;
+            report_status("⚠️  Camera orientation: ROTATED 90° CCW (rotation applied)");
+        } else {
+            // Camera might be tilted or pointing up/down
+            detected_orientation_ = CameraOrientation::NORMAL;
+            report_status("📷 Camera orientation: Could not determine precisely, assuming NORMAL");
+        }
+        
+        return detected_orientation_;
+        
+    } catch (const rs2::error& e) {
+        report_status("IMU detection error: " + std::string(e.what()));
+        detected_orientation_ = CameraOrientation::NORMAL;
+        return detected_orientation_;
+    }
+}
+
+int Producer::get_rotation_degrees() const {
+    switch (detected_orientation_) {
+        case CameraOrientation::NORMAL:        return 0;
+        case CameraOrientation::ROTATED_90_CW: return 90;
+        case CameraOrientation::UPSIDE_DOWN:   return 180;
+        case CameraOrientation::ROTATED_90_CCW: return 270;
+        default:                               return 0;
+    }
+}
+
+void Producer::transform_coordinates(int x, int y, int max_x, int max_y, int& out_x, int& out_y) const {
+    switch (detected_orientation_) {
+        case CameraOrientation::NORMAL:
+            // No transformation needed
+            out_x = x;
+            out_y = y;
+            break;
+            
+        case CameraOrientation::ROTATED_90_CW:
+            // Rotate 90° clockwise: (x,y) -> (max_y - y, x)
+            out_x = max_y - y;
+            out_y = x;
+            break;
+            
+        case CameraOrientation::ROTATED_90_CCW:
+            // Rotate 90° counter-clockwise: (x,y) -> (y, max_x - x)
+            out_x = y;
+            out_y = max_x - x;
+            break;
+            
+        case CameraOrientation::UPSIDE_DOWN:
+            // Rotate 180°: (x,y) -> (max_x - x, max_y - y)
+            out_x = max_x - x;
+            out_y = max_y - y;
+            break;
+            
+        default:
+            out_x = x;
+            out_y = y;
+            break;
+    }
+}
+
+std::string Producer::orientation_to_string(CameraOrientation orientation) {
+    switch (orientation) {
+        case CameraOrientation::NORMAL:        return "NORMAL";
+        case CameraOrientation::ROTATED_90_CW: return "ROTATED_90_CW";
+        case CameraOrientation::ROTATED_90_CCW: return "ROTATED_90_CCW";
+        case CameraOrientation::UPSIDE_DOWN:   return "UPSIDE_DOWN";
+        default:                               return "UNKNOWN";
     }
 }
 

@@ -71,6 +71,10 @@ private:
     std::string session_id_;
     std::string platform_id_;
     
+    // WebSocket auth credentials (for auto-reauth on reconnect)
+    std::string pending_ws_token_;
+    std::mutex ws_auth_mutex_;
+    
     // Camera Mode Tracking
     enum class CameraMode { UNINITIALIZED, RGB_ONLY, FULL };
     std::atomic<CameraMode> current_camera_mode_{CameraMode::UNINITIALIZED};
@@ -113,12 +117,17 @@ private:
     //
     // Distance formula: distance_cm = (REFERENCE_FACE_WIDTH * REFERENCE_DISTANCE) / face_width
     //
+    // CALIBRATION for 848x480 resolution:
+    //   - Original: 150px at 1280x720
+    //   - Scale factor: 848/1280 = 0.6625
+    //   - New value: 150 * 0.6625 ≈ 100px
+    //
     // EXTREME_YAW_THRESHOLD: How far nose can be toward an eye before invalid
     //   - 0.75 = nose 75% of the way from eye midpoint to one eye
     //   - Lower = stricter (require more centered head)
     //   - Higher = more lenient
     // =========================================================================
-    static constexpr float REFERENCE_FACE_WIDTH = 150.0f;  // pixels at 40cm (CALIBRATE THIS)
+    static constexpr float REFERENCE_FACE_WIDTH = 100.0f;  // pixels at 40cm for 848x480 resolution
     static constexpr float REFERENCE_DISTANCE = 40.0f;     // cm (reference measurement distance)
     static constexpr float MIN_DISTANCE_CM = 25.0f;        // Too close threshold
     static constexpr float MAX_DISTANCE_CM = 60.0f;        // Too far threshold

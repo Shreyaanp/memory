@@ -52,11 +52,20 @@ private:
     std::atomic<bool> cancelled_{false};
     std::atomic<Phase> current_phase_{Phase::CONNECTING};
     
-    // Timing constants (in milliseconds)
+    // Timing constants (in milliseconds) - FULL initialization
     static constexpr int SENSOR_WARMUP_TIME = 2000;        // 2 seconds
     static constexpr int AUTOFOCUS_STABILIZATION_TIME = 3000; // 3 seconds  
     static constexpr int EXPOSURE_STABILIZATION_TIME = 2000;  // 2 seconds
     static constexpr int FINAL_CALIBRATION_TIME = 1000;      // 1 second
+    
+    // QUICK mode timing (for mode switches when camera is already warm)
+    static constexpr int QUICK_SENSOR_WARMUP_TIME = 500;        // 0.5 seconds
+    static constexpr int QUICK_AUTOFOCUS_TIME = 500;            // 0.5 seconds
+    static constexpr int QUICK_EXPOSURE_TIME = 500;             // 0.5 seconds
+    static constexpr int QUICK_CALIBRATION_TIME = 500;          // 0.5 seconds
+    
+    // Quick mode flag
+    bool quick_mode_ = false;
     
     // Callbacks
     StatusCallback status_callback_;
@@ -109,6 +118,12 @@ public:
      * @return true if ready, false otherwise
      */
     bool is_ready() const { return initialized_.load(); }
+    
+    /**
+     * @brief Enable quick mode for faster initialization (when camera already warm)
+     * @param enable true to enable quick mode
+     */
+    void set_quick_mode(bool enable) { quick_mode_ = enable; }
     
     /**
      * @brief Get current initialization phase

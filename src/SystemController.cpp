@@ -75,6 +75,21 @@ bool SystemController::initialize() {
         this->on_websocket_message(msg);
     });
     
+    // Set connect callback to send auth IMMEDIATELY when WebSocket connects
+    // This ensures auth is sent within milliseconds of handshake, not waiting for polling
+    network_mgr_->set_connect_callback([this]() {
+        std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+        if (!pending_ws_token_.empty()) {
+            nlohmann::json auth_msg = {
+                {"type", "auth"},
+                {"bearer_token", pending_ws_token_},
+                {"device_id", device_id_}
+            };
+            network_mgr_->send_message(auth_msg.dump());
+            std::cout << "📤 [CONNECT CALLBACK] Sent auth immediately on connect" << std::endl;
+        }
+    });
+    
     // UI Test Mode: Skip all screens, go directly to Screen 0 for tracking test
     if (ui_test_mode_) {
         std::cout << "🧪 UI TEST MODE: Starting Screen 0 (nose tracking test)" << std::endl;
@@ -89,7 +104,7 @@ bool SystemController::initialize() {
         test_config.emitter_enabled = 0;
         test_config.laser_power = 0.0f;
         test_config.align_to_color = false;
-        test_config.color_width = 640;   // Lower resolution for faster MediaPipe processing
+        test_config.color_width = 848;   // Same as production FULL mode for consistency
         test_config.color_height = 480;
         test_config.color_fps = 30;
         test_config.depth_width = 0;
@@ -133,11 +148,20 @@ void SystemController::run() {
         // If WiFi disconnects during ANY state, immediately go to Screen 3 (WiFi QR scan)
         // If WiFi connects while in AWAIT_ADMIN_QR state, transition to PROVISIONED
         static int wifi_check_counter = 0;
+        static int wifi_fail_count = 0;  // Track consecutive failures to avoid false positives
+        const int WIFI_FAIL_THRESHOLD = 3;  // Require 3 consecutive failures (~1.5s) before aborting
+        
         if (++wifi_check_counter >= 100) {  // Check every ~500ms (100 * 5ms) for faster detection
             wifi_check_counter = 0;
             
             if (network_mgr_->is_connected_to_internet()) {
-                // WiFi is connected - check if we need to transition from AWAIT_ADMIN_QR
+                // WiFi is connected - reset failure counter
+                if (wifi_fail_count > 0) {
+                    std::cout << "✅ WiFi recovered after " << wifi_fail_count << " failed check(s)" << std::endl;
+                }
+                wifi_fail_count = 0;
+                
+                // Check if we need to transition from AWAIT_ADMIN_QR
                 if (current_state_ == SystemState::AWAIT_ADMIN_QR) {
                     std::string ssid = network_mgr_->get_current_ssid();
                     std::string ip = network_mgr_->get_ip_address();
@@ -147,13 +171,21 @@ void SystemController::run() {
                     set_state(SystemState::PROVISIONED);
                 }
             } else {
-                // WiFi is disconnected - check if we need to transition to AWAIT_ADMIN_QR
-                if (current_state_ != SystemState::AWAIT_ADMIN_QR && 
+                // WiFi check failed - increment counter
+                wifi_fail_count++;
+                if (wifi_fail_count < WIFI_FAIL_THRESHOLD) {
+                    std::cout << "⚠️  WiFi check failed (" << wifi_fail_count << "/" << WIFI_FAIL_THRESHOLD << ") - waiting..." << std::endl;
+                }
+                
+                // Only abort after multiple consecutive failures
+                if (wifi_fail_count >= WIFI_FAIL_THRESHOLD &&
+                    current_state_ != SystemState::AWAIT_ADMIN_QR && 
                     current_state_ != SystemState::BOOT &&
                     current_state_ != SystemState::ERROR &&
                     current_state_ != SystemState::LOGOUT) {
-                    // WiFi disconnected during operation - ABORT EVERYTHING
-                    std::cerr << "⚠️  CRITICAL: WiFi LOST - ABORTING and entering provisioning mode" << std::endl;
+                    // WiFi truly disconnected - ABORT
+                    std::cerr << "⚠️  CRITICAL: WiFi LOST (" << wifi_fail_count << " consecutive failures) - ABORTING" << std::endl;
+                    wifi_fail_count = 0;  // Reset for next time
                     
                     // Clean up current session
                     session_id_.clear();
@@ -280,10 +312,15 @@ void SystemController::set_state(SystemState new_state) {
             
         case SystemState::READY:
             serial_comm_->send_state(7); // Screen 7: "Ready to Start"
-            configure_camera_for_state(SystemState::READY);
             
-            // TODO: Camera turn to high mode, start stabilizing camera.
-            // Stabilization might continue to next page, keep RealSense connection open.
+            // Switch camera to FULL mode now (RGB+Depth+IR+Emitter)
+            // This gives camera time to warm up/stabilize before countdown starts
+            std::cout << "📹 READY: Switching camera to FULL mode for warmup..." << std::endl;
+            configure_camera_for_state(SystemState::READY);
+            std::cout << "📹 Camera in FULL mode (Depth+IR+Emitter ON) - warming up" << std::endl;
+            
+            // Recording stays OFF until ALIGN state (Screen 9)
+            // Camera stabilizes during READY and COUNTDOWN screens
             
             // Safety Timeout: If user doesn't start within 30 seconds, go back to IDLE
             std::thread([this]() {
@@ -405,7 +442,11 @@ void SystemController::set_state(SystemState new_state) {
             platform_id_.clear();
             motion_tracker_.reset();
             
-            // Disconnect WebSocket if connected
+            // Disconnect WebSocket if connected and clear auth token
+            {
+                std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                pending_ws_token_.clear();
+            }
             if (network_mgr_ && network_mgr_->is_connected()) {
                 network_mgr_->disconnect();
                 std::cout << "✅ WebSocket disconnected due to error" << std::endl;
@@ -436,7 +477,11 @@ void SystemController::set_state(SystemState new_state) {
             platform_id_.clear();
             motion_tracker_.reset();
             
-            // Close WebSocket connection
+            // Close WebSocket connection and clear auth token
+            {
+                std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                pending_ws_token_.clear();
+            }
             if (network_mgr_) {
             network_mgr_->disconnect();
                 std::cout << "✅ WebSocket disconnected" << std::endl;
@@ -469,10 +514,16 @@ void SystemController::configure_camera_for_state(SystemState state) {
     CameraMode target_mode;
     
     // Determine target camera mode based on state
+    // LOW POWER (RGB-only): Boot, WiFi setup, Idle (QR scanning)
+    // FULL MODE (RGB+Depth+IR): Ready, Countdown, Align, Processing, etc.
+    // 
+    // Resolution: ALL streams use 848x480 for consistency
+    // This matches RealSense default and ensures proper alignment between RGB/Depth/IR
+    
     if (state == SystemState::BOOT ||
         state == SystemState::AWAIT_ADMIN_QR || 
         state == SystemState::IDLE ||
-        state == SystemState::READY ||  // READY state stays in RGB_ONLY (QR scanning only)
+        // READY removed - now triggers FULL mode for camera warmup before countdown
         state == SystemState::WIFI_CHANGE_CONNECTING ||
         state == SystemState::WIFI_CHANGE_SUCCESS ||
         state == SystemState::WIFI_CHANGE_FAILED) {
@@ -483,8 +534,8 @@ void SystemController::configure_camera_for_state(SystemState state) {
         config.emitter_enabled = 0;
         config.laser_power = 0.0f;
         config.align_to_color = false;
-        config.color_width = 1280;  // Increased from 640 for better QR detection
-        config.color_height = 720;   // Increased from 480 for better QR detection
+        config.color_width = 848;    // Same as FULL mode & IR for consistency
+        config.color_height = 480;
         config.color_fps = 30;
         config.depth_width = 0;
         config.depth_height = 0;
@@ -494,15 +545,26 @@ void SystemController::configure_camera_for_state(SystemState state) {
         config.auto_exposure = true;  // Let the camera adapt lighting for QR readability
         
     } else {
+        // FULL MODE: READY, COUNTDOWN, WARMUP, ALIGN, PROCESSING
+        // Camera switches to full mode at READY so it can warm up during "Ready?" screen
+        // All streams at 848x480 for proper alignment
         target_mode = CameraMode::FULL;
         config.enable_ir = true;
+        config.enable_depth = true;
         config.depth_width = 848;
         config.depth_height = 480;
-        config.color_width = 1280;
-        config.color_height = 720;
+        config.color_width = 848;    // Same as Depth/IR for proper alignment
+        config.color_height = 480;
         config.color_fps = 30;
+        config.ir_width = 848;
+        config.ir_height = 480;
+        config.ir_fps = 30;
         config.align_to_color = true;
+        config.emitter_enabled = 1;
         config.laser_power = 300.0f;
+        config.enable_spatial_filter = true;
+        config.enable_temporal_filter = true;
+        config.enable_hole_filling = true;
     }
     
     
@@ -514,35 +576,43 @@ void SystemController::configure_camera_for_state(SystemState state) {
     
     // **CRITICAL FIX**: Only stop camera when switching from LOW to HIGH power
     // LOW POWER mode should NEVER be closed once started
+    bool use_quick_init = false;
+    
     if (current_camera_mode_.load() == CameraMode::RGB_ONLY && target_mode == CameraMode::FULL) {
-        // Switching from low power to high power - safe to stop and restart
-        std::cout << "📹 Camera: Upgrading from Low Power → High Power" << std::endl;
+        // Switching from low power to high power - camera already warm, use quick init
+        std::cout << "📹 Camera: Upgrading from Low Power → High Power (quick init)" << std::endl;
+        use_quick_init = true;  // Camera is already warm
         if (producer_) {
             producer_->stop();
-            // CRITICAL: Wait for hardware to fully release resources
-            std::cout << "⏳ Waiting 2 seconds for camera hardware to release..." << std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            // Reduced wait time since camera is warm
+            std::cout << "⏳ Waiting 1 second for camera hardware to release..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     } else if (current_camera_mode_.load() == CameraMode::FULL && target_mode == CameraMode::RGB_ONLY) {
         // Switching from high power to low power - stop high power mode
-        std::cout << "📹 Camera: Downgrading from High Power → Low Power" << std::endl;
+        std::cout << "📹 Camera: Downgrading from High Power → Low Power (quick init)" << std::endl;
+        use_quick_init = true;  // Camera is already warm
         if (producer_) {
             producer_->stop();
-            // CRITICAL: Wait for hardware to fully release resources
-            std::cout << "⏳ Waiting 2 seconds for camera hardware to release..." << std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            // Reduced wait time since camera is warm
+            std::cout << "⏳ Waiting 1 second for camera hardware to release..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     } else if (current_camera_mode_.load() == CameraMode::UNINITIALIZED) {
-        // First time initialization
+        // First time initialization - full warmup needed
         std::cout << "📹 Camera: Initial startup in " << (target_mode == CameraMode::RGB_ONLY ? "Low Power" : "High Power") << " mode" << std::endl;
     }
+    
+    // Set quick init flag
+    config.quick_init = use_quick_init;
     
     // Log mode change
     if (target_mode == CameraMode::RGB_ONLY) {
         std::cout << "📹 Camera: RGB-only mode (" << config.color_width << "x" 
                   << config.color_height << "@" << config.color_fps << "fps) - Low Power - PERSISTENT" << std::endl;
     } else {
-        std::cout << "📹 Camera: Full mode (1280x720 RGB + 848x480 Depth + IR + Laser)" << std::endl;
+        std::cout << "📹 Camera: Full mode (" << config.color_width << "x" << config.color_height 
+                  << " RGB + " << config.depth_width << "x" << config.depth_height << " Depth + IR + Laser)" << std::endl;
     }
     
     producer_ = std::make_unique<Producer>(config, ring_buffer_.get());
@@ -603,6 +673,17 @@ void SystemController::handle_await_admin_qr(FrameBox* frame) {
 
 void SystemController::handle_idle(FrameBox* frame) {
 #ifdef HAVE_OPENCV
+    // IMPORTANT: Re-check state before processing - state might have changed
+    SystemState current = current_state_.load();
+    if (current != SystemState::IDLE && current != SystemState::READY) {
+        return;  // Don't process QR codes if we're not in IDLE/READY
+    }
+    
+    // Debounce: Don't process QR if we recently processed one
+    static auto last_qr_time = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_qr_time).count();
+    
     static int frame_skip = 0;
     static int scan_count = 0;
     if (frame_skip++ % 5 != 0) return; // Process every 5th frame
@@ -667,6 +748,12 @@ void SystemController::handle_idle(FrameBox* frame) {
     }
     
     if (!decoded_info.empty()) {
+        // Debounce: Ignore QR if we processed one in the last 5 seconds
+        if (elapsed < 5000) {
+            return;  // Too soon after last QR, skip
+        }
+        last_qr_time = std::chrono::steady_clock::now();
+        
         std::cout << "📱 QR Code Detected (Idle State)" << std::endl;
         
         // FILTER: Ignore tiny QR codes (false positives from ZBar)
@@ -768,6 +855,12 @@ void SystemController::handle_idle(FrameBox* frame) {
                 
                 std::cout << "🔐 Token (HMAC): " << ws_token << std::endl;
                 
+                // Store token for auto-auth on connect (and reconnect)
+                {
+                    std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                    pending_ws_token_ = ws_token;
+                }
+                
                 // Connect to WebSocket (async - wait for connection)
                 std::cout << "🔌 Connecting to WebSocket..." << std::endl;
                 
@@ -775,6 +868,7 @@ void SystemController::handle_idle(FrameBox* frame) {
                 std::string ws_path = "/ws/device";
                 
                 // Start connection (spawns background thread)
+                // Auth will be sent automatically via connect_callback
                 network_mgr_->connect_to_middleware(middleware_host_, 443, ws_path, device_id_);
                 
                 // Wait for connection to be established (max 10 seconds)
@@ -785,19 +879,8 @@ void SystemController::handle_idle(FrameBox* frame) {
                 }
                 
                 if (network_mgr_->is_connected()) {
-                    std::cout << "✅ WebSocket connected" << std::endl;
-                    
-                    // Send authentication message (no timestamp - server uses DB created_at)
-                    nlohmann::json auth_msg = {
-                        {"type", "auth"},
-                        {"bearer_token", ws_token},
-                        {"device_id", device_id_}
-                    };
-                    
-                    network_mgr_->send_message(auth_msg.dump());
-                    std::cout << "📤 Sent auth message with 8-char HMAC token" << std::endl;
-                    
-                    // Note: session_id will be determined by server from ws_token
+                    std::cout << "✅ WebSocket connected (auth sent via callback)" << std::endl;
+                    // Auth already sent via connect_callback - just wait for auth_success
                     // State will change to READY after receiving auth_success from server
                 } else {
                     std::cerr << "❌ WebSocket connection failed (timeout)" << std::endl;
@@ -944,8 +1027,17 @@ void SystemController::handle_align(FrameBox* frame) {
     float nose_y_norm = landmarks[4].y / frame->color_height;
                 
     // Convert to screen coordinates (466x466 display)
-    int screen_x = static_cast<int>(nose_x_norm * 466.0f);
-    int screen_y = static_cast<int>(nose_y_norm * 466.0f);
+    int raw_x = static_cast<int>(nose_x_norm * 466.0f);
+    int raw_y = static_cast<int>(nose_y_norm * 466.0f);
+    
+    // Apply IMU-based rotation correction for camera orientation
+    int screen_x, screen_y;
+    if (producer_) {
+        producer_->transform_coordinates(raw_x, raw_y, 465, 465, screen_x, screen_y);
+    } else {
+        screen_x = raw_x;
+        screen_y = raw_y;
+    }
     
     // Clamp to display bounds
     screen_x = std::max(0, std::min(465, screen_x));
@@ -970,6 +1062,22 @@ void SystemController::handle_align(FrameBox* frame) {
     // Send combined tracking data to display
     serial_comm_->send_tracking_data(screen_x, screen_y, 
         static_cast<int>(progress * 100), is_valid);
+    
+    // Debug: Log tracking even when invalid (every 60 frames)
+    static int track_debug = 0;
+    if (++track_debug % 60 == 0) {
+        std::string val_str;
+        switch (motion_tracker_.validation_state) {
+            case FaceValidationState::VALID: val_str = "VALID"; break;
+            case FaceValidationState::NO_FACE: val_str = "NO_FACE"; break;
+            case FaceValidationState::TOO_CLOSE: val_str = "TOO_CLOSE"; break;
+            case FaceValidationState::TOO_FAR: val_str = "TOO_FAR"; break;
+            case FaceValidationState::EXTREME_ROTATION: val_str = "EXTREME_ROT"; break;
+        }
+        std::cout << "📡 Tracking sent: X:" << screen_x << " Y:" << screen_y 
+                  << " P:" << static_cast<int>(progress * 100) << "% C:" << (is_valid ? 1 : 0)
+                  << " [" << val_str << " dist=" << static_cast<int>(motion_tracker_.estimated_distance_cm) << "cm]" << std::endl;
+    }
                 
     // Send detailed progress to mobile app via WebSocket periodically
                 static int mobile_update_skip = 0;
@@ -1200,6 +1308,10 @@ float SystemController::calculate_circular_motion_progress(const cv::Point2f& no
 void SystemController::handle_processing() {
     std::cout << "🔬 Starting Batch Processing..." << std::endl;
     
+    // Switch camera to low power mode during processing (don't need live feed)
+    std::cout << "📹 Switching camera to low power mode for processing..." << std::endl;
+    configure_camera_for_state(SystemState::IDLE);
+    
     std::vector<FrameBox*> recording = ring_buffer_->get_all_valid_frames();
     
     if (recording.empty()) {
@@ -1429,12 +1541,35 @@ void SystemController::on_websocket_message(const std::string& message) {
             std::cout << "📍 WebSocket authenticated → READY state" << std::endl;
             set_state(SystemState::READY);
         }
+        else if (msg_type == "auth_failed") {
+            // Authentication failed - clear token and stop reconnecting
+            std::string error_msg = msg_json.value("error", "Authentication failed");
+            std::cerr << "❌ WebSocket auth failed: " << error_msg << std::endl;
+            
+            // Clear the pending token to stop reconnect loop
+            {
+                std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                pending_ws_token_.clear();
+            }
+            
+            // Disconnect and go to error state
+            network_mgr_->disconnect();
+            serial_comm_->send_error("Auth failed");
+            serial_comm_->send_state(12); // Screen 12: Error Animation
+            
+            // Return to IDLE after 3 seconds
+            state_timer_start_ = std::chrono::steady_clock::now();
+            state_timer_target_ = SystemState::IDLE;
+            state_timer_duration_ms_ = 3000;
+            state_timer_active_ = true;
+        }
         else if (msg_type == "mobile_disconnected") {
             // Mobile app disconnected - show error and go back to IDLE
+            // NOTE: Do NOT call network_mgr_->disconnect() here - we're inside the WS callback!
+            // The ERROR state handler will clean up the connection
             std::cout << "⚠️  Mobile app disconnected during session" << std::endl;
             serial_comm_->send_error("Mobile disconnected");
-            network_mgr_->disconnect();
-            // Set state to ERROR so the ERROR handler can manage the timer and return to IDLE
+            // Set state to ERROR - the state handler will disconnect WebSocket asynchronously
             set_state(SystemState::ERROR);
         }
         else if (msg_type == "to_device") {
@@ -1980,8 +2115,8 @@ void SystemController::handle_hardware_error(const std::string& component, const
                 CameraConfig config;
                 config.enable_ir = false;
                 config.enable_depth = false;
-                config.color_width = 1280;
-                config.color_height = 720;
+                config.color_width = 848;    // Same as FULL mode for consistency
+                config.color_height = 480;
                 config.color_fps = 30;
                 
                 producer_ = std::make_unique<Producer>(config, ring_buffer_.get());

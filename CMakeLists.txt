@@ -17,11 +17,17 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json 3.2.0 QUIET)
 
-# MediaPipe Configuration
+# MediaPipe Configuration (legacy - kept for fallback)
 set(MEDIAPIPE_AVAILABLE TRUE)
 set(MEDIAPIPE_WRAPPER_LIB "${CMAKE_SOURCE_DIR}/lib/mediapipe/libface_mesh_wrapper.so")
 set(MEDIAPIPE_WRAPPER_INCLUDE "${CMAKE_SOURCE_DIR}/include/mediapipe")
 message(STATUS "Face detection: MediaPipe Face Mesh (468 points with GPU acceleration)")
+
+# BPU Configuration (Horizon RDK X5)
+set(BPU_AVAILABLE TRUE)
+set(BPU_INCLUDE_DIR "/usr/include")
+set(BPU_LIB "/usr/lib/libdnn.so")
+message(STATUS "BPU acceleration: Horizon RDK X5 hbDNN (face landmarks ~1ms)")
 
 if(OpenCV_FOUND)
     message(STATUS "OpenCV found: ${OpenCV_VERSION}")
@@ -44,6 +50,7 @@ include_directories(
     ${OpenCV_INCLUDE_DIRS}
     ${MEDIAPIPE_WRAPPER_INCLUDE}
     ${OPENSSL_INCLUDE_DIR}
+    ${BPU_INCLUDE_DIR}
 )
 
 # CORE SOURCES
@@ -54,6 +61,7 @@ set(SOURCES
     src/CameraInitializer.cpp
     src/AntiSpoofing.cpp
     src/FaceDetector.cpp
+    src/BPUFaceLandmark.cpp
     src/SerialCommunicator.cpp
     src/NetworkManager.cpp
     src/CryptoUtils.cpp
@@ -68,6 +76,7 @@ target_link_libraries(mdai_realsense
     ${realsense2_LIBRARY}
     Threads::Threads
     ${MEDIAPIPE_WRAPPER_LIB}
+    ${BPU_LIB}
     OpenSSL::SSL 
     OpenSSL::Crypto
     -Wl,--no-as-needed

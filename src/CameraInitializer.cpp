@@ -245,18 +245,22 @@ rs2::device CameraInitializer::get_locked_device(const std::string& phase) {
 }
 
 bool CameraInitializer::execute_sensor_warmup() {
-    report_status("Sensor warm-up phase (2 seconds)...");
-    return wait_with_progress(SENSOR_WARMUP_TIME, "Sensor warm-up");
+    int warmup_time = quick_mode_ ? QUICK_SENSOR_WARMUP_TIME : SENSOR_WARMUP_TIME;
+    report_status(quick_mode_ ? "Sensor warm-up phase (0.5 seconds - quick mode)..." 
+                              : "Sensor warm-up phase (2 seconds)...");
+    return wait_with_progress(warmup_time, "Sensor warm-up");
 }
 
 bool CameraInitializer::execute_autofocus_stabilization() {
-    report_status("Autofocus stabilization phase (3 seconds)...");
+    int af_time = quick_mode_ ? QUICK_AUTOFOCUS_TIME : AUTOFOCUS_STABILIZATION_TIME;
+    report_status(quick_mode_ ? "Autofocus stabilization phase (0.5 seconds - quick mode)..." 
+                              : "Autofocus stabilization phase (3 seconds)...");
     
     try {
         rs2::device device = get_locked_device("autofocus stabilization");
         if (!device) {
             report_status("No devices found for autofocus stabilization");
-            return wait_with_progress(AUTOFOCUS_STABILIZATION_TIME, "Autofocus stabilization");
+            return wait_with_progress(af_time, "Autofocus stabilization");
         }
         auto sensors = device.query_sensors();
         
@@ -269,28 +273,30 @@ bool CameraInitializer::execute_autofocus_stabilization() {
         }
         
         // Wait for stabilization
-        return wait_with_progress(AUTOFOCUS_STABILIZATION_TIME, "Autofocus stabilization");
+        return wait_with_progress(af_time, "Autofocus stabilization");
         
     } catch (const rs2::error& e) {
         report_status("Autofocus setup warning: " + std::string(e.what()));
         // Continue with time-based stabilization even if autofocus setup fails
-        return wait_with_progress(AUTOFOCUS_STABILIZATION_TIME, "Autofocus stabilization");
+        return wait_with_progress(af_time, "Autofocus stabilization");
     }
 }
 
 bool CameraInitializer::execute_exposure_stabilization() {
-    report_status("Exposure stabilization phase (2 seconds)...");
+    int exp_time = quick_mode_ ? QUICK_EXPOSURE_TIME : EXPOSURE_STABILIZATION_TIME;
+    report_status(quick_mode_ ? "Exposure stabilization phase (0.5 seconds - quick mode)..." 
+                              : "Exposure stabilization phase (2 seconds)...");
     
     try {
         rs2::device device = get_locked_device("exposure stabilization");
         if (!device) {
             report_status("No devices found for exposure stabilization");
-            return wait_with_progress(EXPOSURE_STABILIZATION_TIME, "Exposure stabilization");
+            return wait_with_progress(exp_time, "Exposure stabilization");
         }
         auto sensors = device.query_sensors();
         
         // Wait for auto-exposure to stabilize first
-        wait_with_progress(EXPOSURE_STABILIZATION_TIME, "Exposure stabilization");
+        wait_with_progress(exp_time, "Exposure stabilization");
         
         // DO NOT LOCK EXPOSURE - keep auto-exposure enabled for adaptive lighting
         // The previous implementation locked exposure which broke QR scanning in varying light
@@ -306,13 +312,15 @@ bool CameraInitializer::execute_exposure_stabilization() {
 }
 
 bool CameraInitializer::execute_final_calibration() {
-    report_status("Final calibration phase (1 second)...");
+    int cal_time = quick_mode_ ? QUICK_CALIBRATION_TIME : FINAL_CALIBRATION_TIME;
+    report_status(quick_mode_ ? "Final calibration phase (0.5 seconds - quick mode)..." 
+                              : "Final calibration phase (1 second)...");
     
     try {
         rs2::device device = get_locked_device("final calibration");
         if (!device) {
             report_status("No devices found for final calibration");
-            return wait_with_progress(FINAL_CALIBRATION_TIME, "Final calibration");
+            return wait_with_progress(cal_time, "Final calibration");
         }
         
         // Validate device is ready
@@ -323,12 +331,12 @@ bool CameraInitializer::execute_final_calibration() {
         report_status("Available sensors: " + std::to_string(sensors.size()));
         
         // Wait for final stabilization
-        return wait_with_progress(FINAL_CALIBRATION_TIME, "Final calibration");
+        return wait_with_progress(cal_time, "Final calibration");
         
     } catch (const rs2::error& e) {
         report_status("Final calibration warning: " + std::string(e.what()));
         // Continue with time-based stabilization
-        return wait_with_progress(FINAL_CALIBRATION_TIME, "Final calibration");
+        return wait_with_progress(cal_time, "Final calibration");
     }
 }
 

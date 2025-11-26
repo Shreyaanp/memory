@@ -1,6 +1,7 @@
 #include "SystemController.hpp"
 #include <iostream>
 #include <csignal>
+#include <filesystem>
 
 std::unique_ptr<mdai::SystemController> controller;
 
@@ -14,10 +15,19 @@ void signal_handler(int signum) {
 
 // VERSION: RDK v1.0.0 - Initial production release with error recovery
 const char* RDK_VERSION = "1.0.0";
-const char* RDK_LOG_FILE = "/tmp/mdai/rdk.log";
+// Persist logs outside of /tmp so they survive reboots
+const char* RDK_LOG_FILE = "/home/mercleDev/mdai_logs/rdk.log";
 
 // Redirect stdout/stderr to log file
 void setup_logging() {
+    // Ensure log directory exists before redirecting
+    try {
+        std::filesystem::path log_path(RDK_LOG_FILE);
+        std::filesystem::create_directories(log_path.parent_path());
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to create log directory: " << e.what() << std::endl;
+    }
+
     FILE* result = freopen(RDK_LOG_FILE, "a", stdout);
     if (!result) {
         // Log redirection failed, but continue anyway
@@ -59,4 +69,3 @@ int main() {
 
     return 0;
 }
-
