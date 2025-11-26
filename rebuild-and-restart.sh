@@ -13,7 +13,7 @@ set -e
 PROJECT_ROOT="/home/mercleDev/codebase"
 BUILD_DIR="$PROJECT_ROOT/build"
 BINARY_NAME="mdai_system"
-LOG_FILE="/tmp/mdai_live.log"
+LOG_FILE="/home/mercleDev/mdai_logs/rdk.log"
 
 # Colors for output
 RED='\033[0;31m'
@@ -57,26 +57,45 @@ echo -e "${GREEN}✅ Build complete${NC}"
 echo ""
 
 # ==============================================================================
-# Step 2: Kill existing server
+# Step 2: Kill ALL existing mdai_system instances
 # ==============================================================================
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Step 2: Stopping existing mdai_system${NC}"
+echo -e "${GREEN}Step 2: Stopping ALL mdai_system instances${NC}"
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
+# First, stop any systemd service that might auto-restart it
+echo -e "${BLUE}🛑 Stopping systemd service (if any)...${NC}"
+sudo systemctl stop mdai-system 2>/dev/null || true
+sudo systemctl disable mdai-system 2>/dev/null || true
+
+# Kill ALL processes matching mdai_system (handles multiple instances)
 if pgrep -f mdai_system > /dev/null; then
-    echo -e "${BLUE}🛑 Stopping mdai_system...${NC}"
-    sudo pkill -9 mdai_system
+    echo -e "${BLUE}🛑 Killing all mdai_system processes...${NC}"
+    
+    # Show what we're killing
+    echo -e "${YELLOW}Found processes:${NC}"
+    ps aux | grep mdai_system | grep -v grep || true
+    
+    # Kill all instances forcefully
+    sudo pkill -9 -f mdai_system 2>/dev/null || true
     sleep 2
     
-    # Verify it's stopped
+    # Double-check and force kill any remaining
     if pgrep -f mdai_system > /dev/null; then
-        echo -e "${RED}❌ Failed to stop mdai_system${NC}"
-        exit 1
+        echo -e "${YELLOW}⚠️  Some processes still running, force killing...${NC}"
+        sudo killall -9 mdai_system 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # Final verification
+    if pgrep -f mdai_system > /dev/null; then
+        echo -e "${RED}❌ WARNING: Could not stop all mdai_system processes${NC}"
+        ps aux | grep mdai_system | grep -v grep
     else
-        echo -e "${GREEN}✅ mdai_system stopped${NC}"
+        echo -e "${GREEN}✅ All mdai_system processes stopped${NC}"
     fi
 else
-    echo -e "${YELLOW}⚠️  mdai_system not running${NC}"
+    echo -e "${YELLOW}⚠️  No mdai_system processes running${NC}"
 fi
 echo ""
 
@@ -94,6 +113,9 @@ if [ ! -f "./build/$BINARY_NAME" ]; then
     echo -e "${RED}❌ Binary not found: ./build/$BINARY_NAME${NC}"
     exit 1
 fi
+
+# Ensure log directory exists
+mkdir -p "$(dirname $LOG_FILE)"
 
 # Start in background
 echo -e "${BLUE}🚀 Starting mdai_system in background...${NC}"

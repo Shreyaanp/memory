@@ -59,6 +59,12 @@ struct CameraConfig {
     
     // Quick initialization (for mode switches when camera is already warm)
     bool quick_init = false;
+    
+    // Camera/Display orientation
+    // Display uses LVGL software rotation 270° (LV_DISP_ROT_270)
+    // Camera coordinates need matching transform: 90° CCW
+    // Options: 0=NORMAL, 1=90CW, 2=90CCW, 3=UPSIDE_DOWN
+    int orientation = 2;  // 90° CCW to match display
 };
 
 /**

@@ -129,9 +129,11 @@ private:
     // =========================================================================
     static constexpr float REFERENCE_FACE_WIDTH = 100.0f;  // pixels at 40cm for 848x480 resolution
     static constexpr float REFERENCE_DISTANCE = 40.0f;     // cm (reference measurement distance)
-    static constexpr float MIN_DISTANCE_CM = 25.0f;        // Too close threshold
+    static constexpr float MIN_DISTANCE_CM = 12.0f;        // Too close threshold
     static constexpr float MAX_DISTANCE_CM = 60.0f;        // Too far threshold
-    static constexpr float EXTREME_YAW_THRESHOLD = 0.75f;  // 75% toward eye = extreme rotation
+    // Note: With camera rotated 90° CCW, the landmark coordinates swap X/Y
+    // So this threshold may need adjustment. For now, keep high to avoid false extremes.
+    static constexpr float EXTREME_YAW_THRESHOLD = 0.90f;  // 90% toward eye = extreme rotation
     static constexpr float SPIRAL_COMPLETE_ANGLE = 2.0f * 3.14159f;  // 360 degrees in radians
     static constexpr float MOTION_PAUSE_THRESHOLD = 0.005f; // Min angular velocity to count
     

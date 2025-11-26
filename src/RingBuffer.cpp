@@ -18,17 +18,29 @@ DynamicRingBuffer::~DynamicRingBuffer() {
 }
 
 bool DynamicRingBuffer::write(FrameBox&& frame) {
-    // Estimate size and check if we need to grow
+    // Debug logging for frame writes
+    static int write_call_count = 0;
+    write_call_count++;
+    
     size_t frame_size = estimate_frame_size(frame);
     size_t current_mem = get_memory_usage();
+    size_t current_usage = get_usage();
+    
+    // Log every 30th write attempt
+    if (write_call_count % 30 == 1) {
+        std::cout << "📝 [RingBuffer] write() called #" << write_call_count 
+                  << " recording=" << recording_active_ 
+                  << " usage=" << current_usage << "/" << capacity_
+                  << " mem=" << current_mem / 1024 << "KB" << std::endl;
+    }
     
     // If recording is active and we are full, try to grow
-    if (recording_active_ && get_usage() >= capacity_) {
+    if (recording_active_ && current_usage >= capacity_) {
         if (current_mem + frame_size < max_memory_bytes_) {
             grow_buffer();
         } else {
-            // OOM Protection: Drop if we can't grow anymore
             total_frames_dropped_++;
+            std::cout << "⚠️  [RingBuffer] DROPPED frame (OOM)" << std::endl;
             return false; 
         }
     }
@@ -36,12 +48,14 @@ bool DynamicRingBuffer::write(FrameBox&& frame) {
     size_t slot_idx = find_available_slot();
     
     if (slot_idx >= capacity_) {
-        // Should not happen if logic is correct, but safety check
         if (!recording_active_) {
-            // Force overwrite oldest if not recording
-             slot_idx = write_index_ % capacity_;
+            slot_idx = write_index_ % capacity_;
+            if (write_call_count % 30 == 1) {
+                std::cout << "📝 [RingBuffer] Overwriting slot " << slot_idx << " (not recording)" << std::endl;
+            }
         } else {
-             return false;
+            std::cout << "⚠️  [RingBuffer] NO SLOT AVAILABLE (recording active, all slots full)" << std::endl;
+            return false;
         }
     }
 

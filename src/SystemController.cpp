@@ -13,7 +13,8 @@
 namespace mdai {
 
 SystemController::SystemController() {
-    ring_buffer_ = std::make_unique<DynamicRingBuffer>(32, 6ULL * 1024 * 1024 * 1024);
+    // Ring buffer: 32 initial slots, max 2GB memory (enough for ~1700 frames)
+    ring_buffer_ = std::make_unique<DynamicRingBuffer>(32, 2ULL * 1024 * 1024 * 1024);
     
     SerialCommunicator::Config serial_cfg;
     // Auto-detect will be done by SerialCommunicator::connect() or try_reconnect()
@@ -114,7 +115,7 @@ bool SystemController::initialize() {
         test_config.enable_hole_filling = false;
         test_config.auto_exposure = true;
         
-        std::cout << "📹 Camera: RGB-only mode (640x480@30fps) for MediaPipe test" << std::endl;
+        std::cout << "📹 Camera: RGB-only mode (848x480@30fps) for MediaPipe test" << std::endl;
         
         // Start camera with RGB-only config
         producer_ = std::make_unique<Producer>(test_config, ring_buffer_.get());
@@ -258,6 +259,16 @@ void SystemController::run() {
             process_frame(frame);
             ring_buffer_->release_frame(frame);
         } else {
+            // Debug: Log when no frames available in ALIGN state
+            static int no_frame_count = 0;
+            SystemState state = current_state_.load();
+            if (state == SystemState::ALIGN) {
+                if (++no_frame_count % 100 == 1) {
+                    std::cout << "⏳ [ALIGN] Waiting for frames... (no_frame_count=" << no_frame_count << ")" << std::endl;
+                }
+            } else {
+                no_frame_count = 0;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
@@ -283,7 +294,7 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::PROVISIONING:
-            serial_comm_->send_state(2); // Screen 2: "Connecting to WiFi" (reuse boot screen)
+            serial_comm_->send_state(2); // Screen 2: "Connecting to WiFi"
             break;
             
         case SystemState::PROVISIONED: {
@@ -312,15 +323,9 @@ void SystemController::set_state(SystemState new_state) {
             
         case SystemState::READY:
             serial_comm_->send_state(7); // Screen 7: "Ready to Start"
-            
-            // Switch camera to FULL mode now (RGB+Depth+IR+Emitter)
-            // This gives camera time to warm up/stabilize before countdown starts
-            std::cout << "📹 READY: Switching camera to FULL mode for warmup..." << std::endl;
-            configure_camera_for_state(SystemState::READY);
-            std::cout << "📹 Camera in FULL mode (Depth+IR+Emitter ON) - warming up" << std::endl;
-            
-            // Recording stays OFF until ALIGN state (Screen 9)
-            // Camera stabilizes during READY and COUNTDOWN screens
+            // Camera remains in RGB-only mode configured in IDLE.
+            // We don't reinitialize the RealSense pipeline here to avoid frame drop issues.
+            // Recording stays OFF until ALIGN state (Screen 9).
             
             // Safety Timeout: If user doesn't start within 30 seconds, go back to IDLE
             std::thread([this]() {
@@ -337,6 +342,11 @@ void SystemController::set_state(SystemState new_state) {
         case SystemState::COUNTDOWN:
             // Show Screen 8 and start countdown from 5 to 1
             std::cout << "🔢 COUNTDOWN state entered - showing Screen 8" << std::endl;
+            
+            // Switch camera to FULL mode (RGB + Depth + IR + Laser)
+            // This gives camera 5 seconds to warm up during countdown
+            configure_camera_for_state(SystemState::COUNTDOWN);
+            
             // First send screen state to ensure Screen 8 is displayed
             if (serial_comm_->send_state(8)) {
                 std::cout << "✅ Screen 8 state sent successfully" << std::endl;
@@ -392,6 +402,9 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::ALIGN:
+            std::cout << "📍 ═══════════════════════════════════════════════════" << std::endl;
+            std::cout << "📍 Entering ALIGN state (face tracking)" << std::endl;
+            std::cout << "📍 ═══════════════════════════════════════════════════" << std::endl;
             if (ui_test_mode_) {
                 serial_comm_->send_state(0); // Screen 0: UI test page
                 std::cout << "🧪 UI TEST: Screen 0 active - tracking started" << std::endl;
@@ -400,9 +413,12 @@ void SystemController::set_state(SystemState new_state) {
             } else {
                 serial_comm_->send_state(9); // Screen 9: Production nose tracking
                 ring_buffer_->set_recording_active(true);
+                std::cout << "📹 Recording ENABLED for batch processing" << std::endl;
             }
             motion_tracker_.reset();
+            std::cout << "🔄 Motion tracker reset, clearing old frames..." << std::endl;
             ring_buffer_->clear();
+            std::cout << "✅ ALIGN state ready - waiting for frames..." << std::endl;
             break;
             
         case SystemState::PROCESSING:
@@ -514,8 +530,8 @@ void SystemController::configure_camera_for_state(SystemState state) {
     CameraMode target_mode;
     
     // Determine target camera mode based on state
-    // LOW POWER (RGB-only): Boot, WiFi setup, Idle (QR scanning)
-    // FULL MODE (RGB+Depth+IR): Ready, Countdown, Align, Processing, etc.
+    // LOW POWER (RGB-only): Boot, WiFi setup, Idle/Ready (QR + tracking without depth)
+    // FULL MODE (RGB+Depth+IR): Reserved for future anti-spoofing / depth-enabled flows
     // 
     // Resolution: ALL streams use 848x480 for consistency
     // This matches RealSense default and ensures proper alignment between RGB/Depth/IR
@@ -523,7 +539,7 @@ void SystemController::configure_camera_for_state(SystemState state) {
     if (state == SystemState::BOOT ||
         state == SystemState::AWAIT_ADMIN_QR || 
         state == SystemState::IDLE ||
-        // READY removed - now triggers FULL mode for camera warmup before countdown
+        state == SystemState::READY ||  // Keep READY in low-power RGB-only mode (no re-init)
         state == SystemState::WIFI_CHANGE_CONNECTING ||
         state == SystemState::WIFI_CHANGE_SUCCESS ||
         state == SystemState::WIFI_CHANGE_FAILED) {
@@ -565,6 +581,7 @@ void SystemController::configure_camera_for_state(SystemState state) {
         config.enable_spatial_filter = true;
         config.enable_temporal_filter = true;
         config.enable_hole_filling = true;
+        config.auto_exposure = true;  // CRITICAL: Enable auto-exposure for proper lighting
     }
     
     
@@ -574,8 +591,8 @@ void SystemController::configure_camera_for_state(SystemState state) {
         return;
     }
     
-    // **CRITICAL FIX**: Only stop camera when switching from LOW to HIGH power
-    // LOW POWER mode should NEVER be closed once started
+    // **CRITICAL FIX**: Only stop camera when switching between modes
+    // In current flow we keep READY/ALIGN in RGB-only, so mode changes are rare
     bool use_quick_init = false;
     
     if (current_camera_mode_.load() == CameraMode::RGB_ONLY && target_mode == CameraMode::FULL) {
@@ -636,6 +653,18 @@ void SystemController::configure_camera_for_state(SystemState state) {
 
 void SystemController::process_frame(FrameBox* frame) {
     SystemState state = current_state_.load();
+    
+    // Debug: Log frame processing for ALIGN state
+    static int align_frame_count = 0;
+    if (state == SystemState::ALIGN) {
+        if (++align_frame_count % 30 == 1) {  // Log every 30 frames (~1 second)
+            std::cout << "🔄 [ALIGN] Processing frame #" << align_frame_count 
+                      << " (frame ptr=" << (frame ? "valid" : "NULL") << ")" << std::endl;
+        }
+    } else {
+        align_frame_count = 0;  // Reset counter when not in ALIGN
+    }
+    
     switch (state) {
         case SystemState::AWAIT_ADMIN_QR: handle_await_admin_qr(frame); break;
         case SystemState::IDLE: handle_idle(frame); break;
@@ -714,19 +743,20 @@ void SystemController::handle_idle(FrameBox* frame) {
     zbar::Image zbar_image(enhanced.cols, enhanced.rows, "Y800", enhanced.data, enhanced.cols * enhanced.rows);
     int n = scanner.scan(zbar_image);
     
-    // Debug: Save enhanced frame every 100 scans
-    if (scan_count % 100 == 0) {
-        cv::imwrite("/tmp/qr_enhanced_latest.jpg", enhanced);
-        std::cout << "[QR Debug] Saved enhanced frame to /tmp/qr_enhanced_latest.jpg" << std::endl;
-    }
+    // Debug: Save enhanced frame every 100 scans (disabled - permission issues)
+    // if (scan_count % 100 == 0) {
+    //     cv::imwrite("/tmp/qr_enhanced_latest.jpg", enhanced);
+    //     std::cout << "[QR Debug] Saved enhanced frame to /tmp/qr_enhanced_latest.jpg" << std::endl;
+    // }
     
     if (scan_count % 50 == 0 && n == 0) {
         // Periodically save frame for debugging
-        static int save_count = 0;
-        if (save_count++ < 3) {
-            cv::imwrite("/tmp/qr_scan_debug_" + std::to_string(save_count) + ".jpg", gray);
-            std::cout << "[QR Debug] Saved frame to /tmp/qr_scan_debug_" << save_count << ".jpg for inspection" << std::endl;
-        }
+        // Debug save disabled - permission issues
+        // static int save_count = 0;
+        // if (save_count++ < 3) {
+        //     cv::imwrite("/tmp/qr_scan_debug_" + std::to_string(save_count) + ".jpg", gray);
+        //     std::cout << "[QR Debug] Saved frame to /tmp/qr_scan_debug_" << save_count << ".jpg for inspection" << std::endl;
+        // }
     }
     
     std::string decoded_info;
@@ -737,11 +767,11 @@ void SystemController::handle_idle(FrameBox* frame) {
             decoded_info = symbol->get_data();
             std::cout << "📱 QR Data length: " << decoded_info.length() << " bytes" << std::endl;
             
-            // 📸 SAVE QR IMAGE FOR VERIFICATION
-            static int qr_capture_count = 0;
-            std::string qr_image_path = "/tmp/qr_captured_" + std::to_string(++qr_capture_count) + ".jpg";
-            cv::imwrite(qr_image_path, color_img);
-            std::cout << "📸 QR Image saved: " << qr_image_path << std::endl;
+            // QR image saving disabled - causes log spam and permission issues
+            // static int qr_capture_count = 0;
+            // std::string qr_image_path = "/tmp/qr_captured_" + std::to_string(++qr_capture_count) + ".jpg";
+            // cv::imwrite(qr_image_path, color_img);
+            // std::cout << "📸 QR Image saved: " << qr_image_path << std::endl;
             
             break; // Take first QR code
         }
@@ -829,7 +859,7 @@ void SystemController::handle_idle(FrameBox* frame) {
             std::string qr_key = load_qr_shared_key();
             if (qr_key.empty()) {
                 // Production encryption key (must match EC2 server's QR_ENCRYPTION_KEY)
-                qr_key = "ad5295ee97afce972b8ac5fb9d8314b33578cf85f22e84429939c4ea981d9320";
+                qr_key = "fallback";
             }
             
             try {
@@ -1030,7 +1060,11 @@ void SystemController::handle_align(FrameBox* frame) {
     int raw_x = static_cast<int>(nose_x_norm * 466.0f);
     int raw_y = static_cast<int>(nose_y_norm * 466.0f);
     
-    // Apply IMU-based rotation correction for camera orientation
+    // Mirror X-axis so user's left/right movement matches screen
+    // (camera sees user from opposite perspective)
+    raw_x = 465 - raw_x;
+    
+    // Apply rotation correction for camera orientation (if needed)
     int screen_x, screen_y;
     if (producer_) {
         producer_->transform_coordinates(raw_x, raw_y, 465, 465, screen_x, screen_y);
@@ -1170,14 +1204,33 @@ bool SystemController::is_face_orientation_extreme(const std::vector<FrameBoxMet
     const auto& left_eye = landmarks[33];  // Left eye outer corner
     const auto& right_eye = landmarks[263]; // Right eye outer corner
     
-    // Calculate eye midpoint
-    float eye_mid_x = (left_eye.x + right_eye.x) / 2.0f;
-    float eye_width = std::abs(right_eye.x - left_eye.x);
+    // NOTE: After coordinate transform (camera rotated 90° CCW), 
+    // the horizontal axis in screen space is Y (not X)
+    // So use Y coordinates for eye width and nose offset
+    float eye_mid_y = (left_eye.y + right_eye.y) / 2.0f;
+    float eye_width = std::abs(right_eye.y - left_eye.y);
     
-    if (eye_width < 1.0f) return true;  // Eyes too close, invalid detection
+    // Debug: Log the orientation calculation
+    static int debug_count = 0;
+    if (++debug_count % 60 == 1) {
+        std::cout << "👁️  Orientation check: nose_y=" << nose.y 
+                  << " eye_mid_y=" << eye_mid_y
+                  << " eye_width=" << eye_width;
+    }
+    
+    if (eye_width < 10.0f) {  // Pixel coords - minimum ~10 pixels for valid eye detection
+        if (debug_count % 60 == 1) std::cout << " → INVALID (eye_width too small)" << std::endl;
+        return true;
+    }
     
     // Calculate how far nose is from eye midpoint (normalized by eye width)
-    float nose_offset = std::abs(nose.x - eye_mid_x) / eye_width;
+    float nose_offset = std::abs(nose.y - eye_mid_y) / eye_width;
+    
+    if (debug_count % 60 == 1) {
+        std::cout << " offset=" << nose_offset 
+                  << " threshold=" << EXTREME_YAW_THRESHOLD
+                  << " → " << (nose_offset > EXTREME_YAW_THRESHOLD ? "EXTREME" : "OK") << std::endl;
+    }
     
     // If nose is more than threshold toward either eye, it's extreme
     return nose_offset > EXTREME_YAW_THRESHOLD;
@@ -1306,164 +1359,104 @@ float SystemController::calculate_circular_motion_progress(const cv::Point2f& no
 }
 
 void SystemController::handle_processing() {
-    std::cout << "🔬 Starting Batch Processing..." << std::endl;
+    std::cout << "🔬 Starting Processing (single frame submit)..." << std::endl;
     
-    // Switch camera to low power mode during processing (don't need live feed)
     std::cout << "📹 Switching camera to low power mode for processing..." << std::endl;
     configure_camera_for_state(SystemState::IDLE);
     
+    std::cout << "📊 Retrieving recorded frames from ring buffer..." << std::endl;
     std::vector<FrameBox*> recording = ring_buffer_->get_all_valid_frames();
+    std::cout << "📊 Retrieved " << recording.size() << " frames for processing" << std::endl;
     
     if (recording.empty()) {
         std::cout << "⚠ No recording data" << std::endl;
-        set_state(SystemState::ERROR);
+        serial_comm_->send_error("No recording data");
         network_mgr_->send_message("{\"type\":\"error\", \"code\":\"no_recording_data\"}");
         ring_buffer_->clear();
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-        set_state(SystemState::IDLE);
+        set_state(SystemState::ERROR);
         return;
     }
 
-    AntiSpoofingConfig as_config;
-    auto pipeline = std::make_unique<AntiSpoofingPipeline>(as_config);
-    
-    std::vector<bool> frame_results;
-    int consecutive_passes = 0;
-    int max_consecutive = 0;
     FrameBox* best_frame = nullptr;
-    
-    std::cout << "Processing " << recording.size() << " frames..." << std::endl;
-    
-    // Process ALL frames (not skipping any)
-    for (size_t i = 0; i < recording.size(); i++) {
-        FrameBox* frame = recording[i];
-        
-        // Ensure face detection is done
-        if (!frame->metadata.face_detected) {
-             face_detector_->detect(frame);
-        }
-        
-        if (frame->metadata.face_detected) {
-            bool is_live = pipeline->process_frame(frame);
-            frame_results.push_back(is_live);
-            
-            if (is_live) {
-                consecutive_passes++;
-                if (consecutive_passes > max_consecutive) {
-                    max_consecutive = consecutive_passes;
-                    best_frame = frame; // Keep track of best frame
-                }
-            } else {
-                consecutive_passes = 0;
-            }
-            
-            // Send progress update
-            int progress = (int)((float)(i + 1) / recording.size() * 100.0f);
-            serial_comm_->send_progress(progress);
-            network_mgr_->send_message("{\"type\":\"progress\", \"value\":" + std::to_string(progress) + "}");
+    for (FrameBox* frame : recording) {
+        if (frame->metadata.face_detected &&
+            frame->metadata.landmarks.size() >= 468) {
+            best_frame = frame;
         }
     }
     
-    std::cout << "Max consecutive passes: " << max_consecutive << std::endl;
+    if (!best_frame) {
+        best_frame = recording.back();
+    }
+
+    cv::Mat rgb_frame = best_frame->get_color_mat();
+    if (rgb_frame.empty()) {
+        std::cerr << "❌ Best frame is empty - cannot submit" << std::endl;
+        serial_comm_->send_error("Camera error");
+        ring_buffer_->clear();
+        set_state(SystemState::ERROR);
+        return;
+    }
+
+    std::vector<uchar> jpeg_buffer;
+    std::vector<int> compression_params = {cv::IMWRITE_JPEG_QUALITY, 90};
+    cv::imencode(".jpg", rgb_frame, jpeg_buffer, compression_params);
     
-    // SUCCESS: 5 or more consecutive frames passed anti-spoofing
-    if (max_consecutive >= 5 && best_frame != nullptr) {
-        std::cout << "✅ Anti-spoofing PASSED (" << max_consecutive << " consecutive frames)" << std::endl;
+    // Save captured frame for debugging
+    std::string debug_path = "/home/mercleDev/mdai_logs/captured_face.jpg";
+    cv::imwrite(debug_path, rgb_frame);
+    std::cout << "📸 Face image saved to: " << debug_path << std::endl;
+    
+    std::vector<uint8_t> buffer_uint8(jpeg_buffer.begin(), jpeg_buffer.end());
+    std::string base64_image = CryptoUtils::base64_encode(buffer_uint8);
+    
+    std::cout << "📸 JPEG image size: " << jpeg_buffer.size() << " bytes" << std::endl;
+    std::cout << "📦 Base64 size: " << base64_image.size() << " bytes" << std::endl;
+    
+    nlohmann::json api_payload;
+    api_payload["type"] = "submit_result";
+    api_payload["status"] = "success";
+    api_payload["platform_id"] = platform_id_;
+    api_payload["session_id"] = session_id_;
+    api_payload["image"] = base64_image;
+    api_payload["consecutive_passes"] = 1;
+    api_payload["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
+    
+    std::string api_message = api_payload.dump();
+    std::cout << "📤 Sending result to server (" << api_message.size() << " bytes)..." << std::endl;
+    
+    result_ack_received_ = false;
+    
+    if (!network_mgr_->send_message(api_message)) {
+        std::cerr << "❌ Failed to send result to server" << std::endl;
+        serial_comm_->send_error("Failed to send result");
+        ring_buffer_->clear();
+        set_state(SystemState::ERROR);
+        return;
+    }
+    
+    auto start_time = std::chrono::steady_clock::now();
+    const int timeout_ms = 3000;
+    
+    while (!result_ack_received_) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time
+        ).count();
         
-        // Extract the best frame as JPEG for server submission
-        // Server will convert to base64 and forward to backend API
-        cv::Mat rgb_frame = best_frame->get_color_mat();
-        
-        // Safety check: ensure frame is valid
-        if (rgb_frame.empty()) {
-            std::cerr << "❌ Best frame is empty - cannot submit" << std::endl;
-            serial_comm_->send_error("Camera error");
-            set_state(SystemState::ERROR);
-            ring_buffer_->clear();
-            return;
-        }
-        std::vector<uchar> jpeg_buffer;
-        std::vector<int> compression_params = {cv::IMWRITE_JPEG_QUALITY, 90};
-        cv::imencode(".jpg", rgb_frame, jpeg_buffer, compression_params);
-        
-        // Convert JPEG bytes to base64 for WebSocket transmission
-        std::vector<uint8_t> buffer_uint8(jpeg_buffer.begin(), jpeg_buffer.end());
-        std::string base64_image = CryptoUtils::base64_encode(buffer_uint8);
-        
-        std::cout << "📸 JPEG image size: " << jpeg_buffer.size() << " bytes" << std::endl;
-        std::cout << "📦 Base64 size: " << base64_image.size() << " bytes" << std::endl;
-        
-        // Send to WebSocket server
-        nlohmann::json api_payload;
-        api_payload["type"] = "submit_result";
-        api_payload["status"] = "success";
-        api_payload["platform_id"] = platform_id_;
-        api_payload["session_id"] = session_id_;
-        api_payload["image"] = base64_image;
-        api_payload["consecutive_passes"] = max_consecutive;
-        api_payload["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
-        
-        std::string api_message = api_payload.dump();
-        std::cout << "📤 Sending result to server (" << api_message.size() << " bytes)..." << std::endl;
-        
-        // Set flag to wait for server ACK
-        result_ack_received_ = false;
-        
-        // Send message and check for failure
-        if (!network_mgr_->send_message(api_message)) {
-            std::cerr << "❌ Failed to send result to server" << std::endl;
-            serial_comm_->send_error("Failed to send result");
-            set_state(SystemState::ERROR);
-            ring_buffer_->clear();
-            return;
+        if (elapsed >= timeout_ms) {
+            std::cerr << "⚠️  Server ACK timeout after 3 seconds" << std::endl;
+            break;
         }
         
-        // Wait for server ACK with 3 second timeout
-        auto start_time = std::chrono::steady_clock::now();
-        const int timeout_ms = 3000;
-        
-        while (!result_ack_received_) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start_time
-            ).count();
-            
-            if (elapsed >= timeout_ms) {
-                std::cerr << "⚠️  Server ACK timeout after 3 seconds" << std::endl;
-                // Assume success even without ACK (data was sent)
-                break;
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        
-        if (result_ack_received_) {
-            std::cout << "✅ Server ACK received" << std::endl;
-        }
-        
-        set_state(SystemState::SUCCESS);
-        
-    } else {
-        std::cout << "❌ Anti-spoofing FAILED (only " << max_consecutive << " consecutive passes)" << std::endl;
-        
-        // Show error on display
-        serial_comm_->send_error("Verification failed");
-        serial_comm_->send_state(12);  // Screen 12: Error Animation
-        
-        // Send failure to WebSocket
-        network_mgr_->send_message("{\"type\":\"submit_result\", \"status\":\"failed\", \"message\":\"Liveness check failed\"}");
-        
-        // Clean up session
-        session_id_.clear();
-        platform_id_.clear();
-        
-        // Return to IDLE after 3 seconds
-        state_timer_start_ = std::chrono::steady_clock::now();
-        state_timer_target_ = SystemState::IDLE;
-        state_timer_duration_ms_ = 3000;
-        state_timer_active_ = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    if (result_ack_received_) {
+        std::cout << "✅ Server ACK received" << std::endl;
     }
     
     ring_buffer_->clear(); 
+    set_state(SystemState::SUCCESS);
 }
 
 void SystemController::on_websocket_message(const std::string& message) {

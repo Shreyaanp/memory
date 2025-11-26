@@ -81,15 +81,52 @@ bool Producer::start() {
         profile_ = camera_initializer_->get_profile();
         pipe_ = std::move(camera_initializer_->get_pipeline());
         
-        // Detect camera orientation using IMU (before starting main pipeline)
-        report_status("Checking camera orientation via IMU...");
-        detect_camera_orientation();
+        // Try IMU-based orientation detection first (D435I has IMU)
+        // This runs BEFORE main pipeline starts to avoid conflicts
+        CameraOrientation imu_orientation = detect_camera_orientation();
+        
+        if (imu_orientation != CameraOrientation::UNKNOWN) {
+            // IMU detected orientation successfully
+            detected_orientation_ = imu_orientation;
+            has_imu_ = true;
+            report_status("📐 IMU orientation detected: " + orientation_to_string(detected_orientation_));
+        } else {
+            // Fall back to config value
+            switch (config_.orientation) {
+                case 0: detected_orientation_ = CameraOrientation::NORMAL; break;
+                case 1: detected_orientation_ = CameraOrientation::ROTATED_90_CW; break;
+                case 2: detected_orientation_ = CameraOrientation::ROTATED_90_CCW; break;
+                case 3: detected_orientation_ = CameraOrientation::UPSIDE_DOWN; break;
+                default: detected_orientation_ = CameraOrientation::ROTATED_90_CCW; break;
+            }
+            has_imu_ = false;
+            report_status("📐 Using config orientation (no IMU): " + orientation_to_string(detected_orientation_));
+        }
         
         // Now start the pipeline with callback
         report_status("Starting camera pipeline...");
         auto callback = [this](const rs2::frame& frame) {
+            // Debug: Log EVERY callback invocation to diagnose frame delivery issue
+            static int callback_count = 0;
+            static auto last_log_time = std::chrono::steady_clock::now();
+            callback_count++;
+            
+            // Log every second regardless of callback count
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
+            if (elapsed_ms > 1000) {
+                std::cout << "📹 [Producer] Callback alive - total=" << callback_count << " callbacks" << std::endl;
+                last_log_time = now;
+            }
+            
             try {
-                if (rs2::frameset fs = frame.as<rs2::frameset>()) {
+                rs2::frameset fs = frame.as<rs2::frameset>();
+                if (!fs) {
+                    // Not a frameset - skip (this happens for single stream modes)
+                    return;
+                }
+                
+                {
                     // Apply post-processing filters for better data quality
                     rs2::frameset processed = fs;
                     
@@ -125,11 +162,17 @@ bool Producer::start() {
                     first_frame_received_.store(true);
                     
                     // Write to ring buffer (non-blocking)
-                    // Ring buffer internally handles recording_active flag
-                    if (ring_buffer_->write(std::move(framebox))) {
-                        // Update statistics only on successful write
+                    bool write_success = ring_buffer_->write(std::move(framebox));
+                    if (write_success) {
                         total_frames_captured_.fetch_add(1);
                         frames_since_last_calc_++;
+                    }
+                    
+                    // Log write attempts
+                    static int write_log_count = 0;
+                    if (++write_log_count % 30 == 1) {
+                        std::cout << "📝 [Producer->RingBuffer] write " << (write_success ? "SUCCESS" : "FAILED") 
+                                  << " (total_captured=" << total_frames_captured_.load() << ")" << std::endl;
                     }
                 }
             } catch (const std::exception& e) {
@@ -743,24 +786,34 @@ Producer::CameraOrientation Producer::detect_camera_orientation() {
         // - Rotated 90° CCW: gravity in +X
         // - Upside down: gravity in +Y
         
-        const float GRAVITY_THRESHOLD = 7.0f;  // ~70% of 9.8 m/s²
+        // Use dominant axis approach - which axis has the strongest gravity component?
+        float abs_x = std::abs(accel_x);
+        float abs_y = std::abs(accel_y);
         
-        if (accel_y < -GRAVITY_THRESHOLD) {
-            detected_orientation_ = CameraOrientation::NORMAL;
-            report_status("📷 Camera orientation: NORMAL (correct)");
-        } else if (accel_y > GRAVITY_THRESHOLD) {
-            detected_orientation_ = CameraOrientation::UPSIDE_DOWN;
-            report_status("⚠️  Camera orientation: UPSIDE DOWN (180° rotation applied)");
-        } else if (accel_x < -GRAVITY_THRESHOLD) {
-            detected_orientation_ = CameraOrientation::ROTATED_90_CW;
-            report_status("⚠️  Camera orientation: ROTATED 90° CW (rotation applied)");
-        } else if (accel_x > GRAVITY_THRESHOLD) {
-            detected_orientation_ = CameraOrientation::ROTATED_90_CCW;
-            report_status("⚠️  Camera orientation: ROTATED 90° CCW (rotation applied)");
+        const float MIN_THRESHOLD = 3.0f;  // Minimum to consider valid
+        
+        if (abs_y > abs_x && abs_y > MIN_THRESHOLD) {
+            // Y-axis dominant - normal or upside down
+            if (accel_y < 0) {
+                detected_orientation_ = CameraOrientation::NORMAL;
+                report_status("📷 Camera orientation: NORMAL (Y=-" + std::to_string(abs_y) + ")");
+            } else {
+                detected_orientation_ = CameraOrientation::UPSIDE_DOWN;
+                report_status("⚠️  Camera orientation: UPSIDE DOWN (Y=+" + std::to_string(abs_y) + ")");
+            }
+        } else if (abs_x > MIN_THRESHOLD) {
+            // X-axis dominant - rotated 90°
+            if (accel_x < 0) {
+                detected_orientation_ = CameraOrientation::ROTATED_90_CW;
+                report_status("📷 Camera orientation: ROTATED 90° CW (X=-" + std::to_string(abs_x) + ")");
+            } else {
+                detected_orientation_ = CameraOrientation::ROTATED_90_CCW;
+                report_status("📷 Camera orientation: ROTATED 90° CCW (X=+" + std::to_string(abs_x) + ")");
+            }
         } else {
-            // Camera might be tilted or pointing up/down
+            // Camera pointing mostly up/down (Z dominant) - fall back to config
             detected_orientation_ = CameraOrientation::NORMAL;
-            report_status("📷 Camera orientation: Could not determine precisely, assuming NORMAL");
+            report_status("📷 Camera orientation: Z-dominant (tilted), using config fallback");
         }
         
         return detected_orientation_;

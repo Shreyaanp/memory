@@ -218,15 +218,24 @@ private:
         }
         
         Py_ssize_t num_landmarks = PyList_Size(landmarks_list);
-        if (num_landmarks <= 0) {
+        
+        // CRITICAL: Check for valid landmark count
+        // PyList_Size returns -1 on error, and we need reasonable bounds
+        if (num_landmarks < 0 || num_landmarks > 1000) {
+            last_error_ = "Invalid landmarks count: " + std::to_string(num_landmarks);
+            std::cerr << "⚠️  [MediaPipe] Invalid landmarks count: " << num_landmarks << " (expected 468)" << std::endl;
+            return true;  // No valid face
+        }
+        
+        if (num_landmarks == 0) {
             last_error_ = "Empty landmarks list";
             return true;
         }
         
-        // Reserve space
-        result.landmarks.reserve(num_landmarks);
-        result.visibility.reserve(num_landmarks);
-        result.presence.reserve(num_landmarks);
+        // Reserve space - now safe because we validated num_landmarks
+        result.landmarks.reserve(static_cast<size_t>(num_landmarks));
+        result.visibility.reserve(static_cast<size_t>(num_landmarks));
+        result.presence.reserve(static_cast<size_t>(num_landmarks));
         
         float min_x = 1.0f, min_y = 1.0f, max_x = 0.0f, max_y = 0.0f;
         
