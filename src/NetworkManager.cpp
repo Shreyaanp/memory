@@ -154,6 +154,14 @@ void NetworkManager::disconnect() {
     }
 }
 
+void NetworkManager::stop_reconnect() {
+    // Stop the reconnection loop without blocking
+    // Use this after delete/logout to prevent auto-reconnect
+    running_ = false;
+    connected_ = false;
+    std::cout << "🔌 WebSocket reconnection disabled" << std::endl;
+}
+
 bool NetworkManager::is_connected() const {
     return connected_;
 }
@@ -230,7 +238,7 @@ void NetworkManager::client_loop(std::string host, int port, std::string path, s
         // 6. Read Loop
         std::string msg = receive_frame();
         if (msg.empty()) {
-            std::cout << "⚠️  receive_frame returned empty - connection issue" << std::endl;
+            std::cout << "🔌 WebSocket disconnected" << std::endl;
             connected_ = false;
             if (ssl_) {
                 SSL_shutdown((SSL*)ssl_);
@@ -318,7 +326,7 @@ std::string NetworkManager::receive_frame() {
     if (!connected_ || !ssl_) return "";
     
     while (true) {  // Loop to handle control frames
-        uint8_t header[2];
+    uint8_t header[2];
         int read_result = SSL_read((SSL*)ssl_, header, 2);
         if (read_result <= 0) {
             int ssl_error = SSL_get_error((SSL*)ssl_, read_result);
@@ -331,13 +339,13 @@ std::string NetworkManager::receive_frame() {
         
         uint8_t opcode = header[0] & 0x0F;
         bool is_fin = (header[0] & 0x80) != 0;
-        uint64_t payload_len = header[1] & 0x7F;
+    uint64_t payload_len = header[1] & 0x7F;
         
         // Handle extended payload length
-        if (payload_len == 126) {
-            uint8_t len_bytes[2];
-            if (SSL_read((SSL*)ssl_, len_bytes, 2) <= 0) return "";
-            payload_len = (len_bytes[0] << 8) | len_bytes[1];
+    if (payload_len == 126) {
+        uint8_t len_bytes[2];
+        if (SSL_read((SSL*)ssl_, len_bytes, 2) <= 0) return "";
+        payload_len = (len_bytes[0] << 8) | len_bytes[1];
         } else if (payload_len == 127) {
             uint8_t len_bytes[8];
             if (SSL_read((SSL*)ssl_, len_bytes, 8) <= 0) return "";
@@ -348,19 +356,19 @@ std::string NetworkManager::receive_frame() {
         }
         
         // Read payload
-        std::vector<uint8_t> buffer(payload_len);
-        size_t total_read = 0;
-        while (total_read < payload_len) {
-            int r = SSL_read((SSL*)ssl_, buffer.data() + total_read, payload_len - total_read);
-            if (r <= 0) return "";
-            total_read += r;
-        }
-        
+    std::vector<uint8_t> buffer(payload_len);
+    size_t total_read = 0;
+    while (total_read < payload_len) {
+        int r = SSL_read((SSL*)ssl_, buffer.data() + total_read, payload_len - total_read);
+        if (r <= 0) return "";
+        total_read += r;
+    }
+    
         // Handle different frame types
         switch (opcode) {
             case 0x01:  // Text frame
             case 0x02:  // Binary frame
-                return std::string(buffer.begin(), buffer.end());
+    return std::string(buffer.begin(), buffer.end());
                 
             case 0x08:  // Close frame
                 {

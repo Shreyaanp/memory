@@ -18,21 +18,9 @@ DynamicRingBuffer::~DynamicRingBuffer() {
 }
 
 bool DynamicRingBuffer::write(FrameBox&& frame) {
-    // Debug logging for frame writes
-    static int write_call_count = 0;
-    write_call_count++;
-    
     size_t frame_size = estimate_frame_size(frame);
     size_t current_mem = get_memory_usage();
     size_t current_usage = get_usage();
-    
-    // Log every 30th write attempt
-    if (write_call_count % 30 == 1) {
-        std::cout << "📝 [RingBuffer] write() called #" << write_call_count 
-                  << " recording=" << recording_active_ 
-                  << " usage=" << current_usage << "/" << capacity_
-                  << " mem=" << current_mem / 1024 << "KB" << std::endl;
-    }
     
     // If recording is active and we are full, try to grow
     if (recording_active_ && current_usage >= capacity_) {
@@ -40,7 +28,6 @@ bool DynamicRingBuffer::write(FrameBox&& frame) {
             grow_buffer();
         } else {
             total_frames_dropped_++;
-            std::cout << "⚠️  [RingBuffer] DROPPED frame (OOM)" << std::endl;
             return false; 
         }
     }
@@ -50,11 +37,7 @@ bool DynamicRingBuffer::write(FrameBox&& frame) {
     if (slot_idx >= capacity_) {
         if (!recording_active_) {
             slot_idx = write_index_ % capacity_;
-            if (write_call_count % 30 == 1) {
-                std::cout << "📝 [RingBuffer] Overwriting slot " << slot_idx << " (not recording)" << std::endl;
-            }
         } else {
-            std::cout << "⚠️  [RingBuffer] NO SLOT AVAILABLE (recording active, all slots full)" << std::endl;
             return false;
         }
     }

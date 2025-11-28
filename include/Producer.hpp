@@ -59,12 +59,6 @@ struct CameraConfig {
     
     // Quick initialization (for mode switches when camera is already warm)
     bool quick_init = false;
-    
-    // Camera/Display orientation
-    // Display uses LVGL software rotation 270° (LV_DISP_ROT_270)
-    // Camera coordinates need matching transform: 90° CCW
-    // Options: 0=NORMAL, 1=90CW, 2=90CCW, 3=UPSIDE_DOWN
-    int orientation = 2;  // 90° CCW to match display
 };
 
 /**
@@ -172,57 +166,6 @@ public:
      */
     void set_status_callback(std::function<void(const std::string&)> callback);
     
-    /**
-     * @brief Camera orientation detected from IMU
-     */
-    enum class CameraOrientation {
-        NORMAL,           // Correct orientation (gravity pointing down)
-        ROTATED_90_CW,    // Rotated 90° clockwise
-        ROTATED_90_CCW,   // Rotated 90° counter-clockwise  
-        UPSIDE_DOWN,      // Rotated 180°
-        UNKNOWN           // Could not determine
-    };
-    
-    /**
-     * @brief Check camera orientation using IMU accelerometer
-     * @return Detected camera orientation
-     */
-    CameraOrientation detect_camera_orientation();
-    
-    /**
-     * @brief Get the detected orientation
-     */
-    CameraOrientation get_orientation() const { return detected_orientation_; }
-    
-    /**
-     * @brief Get rotation angle in degrees for coordinate transform
-     * @return Rotation angle (0, 90, 180, 270) based on detected orientation
-     */
-    int get_rotation_degrees() const;
-    
-    /**
-     * @brief Transform coordinates based on camera orientation
-     * Applies rotation transform to correct for camera mounting angle
-     * @param x Input X coordinate (0 to max_x)
-     * @param y Input Y coordinate (0 to max_y)
-     * @param max_x Maximum X value (e.g., 466 for display)
-     * @param max_y Maximum Y value (e.g., 466 for display)
-     * @param out_x Output corrected X
-     * @param out_y Output corrected Y
-     */
-    void transform_coordinates(int x, int y, int max_x, int max_y, int& out_x, int& out_y) const;
-    
-    /**
-     * @brief Get string description of orientation
-     */
-    static std::string orientation_to_string(CameraOrientation orientation);
-    
-    /**
-     * @brief Check if camera has IMU (D435I has it, D435 doesn't)
-     * @return true if IMU is available
-     */
-    bool has_imu() const { return has_imu_; }
-
 private:
     CameraConfig config_;
     DynamicRingBuffer* ring_buffer_;
@@ -265,9 +208,9 @@ private:
     std::function<void(const std::string&)> status_callback_;
     std::mutex callback_mutex_;
     
-    // IMU for orientation detection
-    bool has_imu_ = false;
-    CameraOrientation detected_orientation_ = CameraOrientation::UNKNOWN;
+    
+    // Polling mode flag (for multi-stream capture)
+    bool use_polling_mode_ = false;
     
     // Camera intrinsics/extrinsics (queried once at startup)
     rs2_intrinsics depth_intrinsics_;

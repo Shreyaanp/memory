@@ -91,46 +91,6 @@ bool SystemController::initialize() {
         }
     });
     
-    // UI Test Mode: Skip all screens, go directly to Screen 0 for tracking test
-    if (ui_test_mode_) {
-        std::cout << "🧪 UI TEST MODE: Starting Screen 0 (nose tracking test)" << std::endl;
-        std::cout << "   - Screen 0: Tracking test" << std::endl;
-        std::cout << "   - Screen 11: Success (spiral complete)" << std::endl;
-        std::cout << "   - Screen 12: Error (5s no face) → 3s display → back to Screen 0" << std::endl;
-        
-        // Configure camera for RGB-ONLY mode (MediaPipe only needs RGB, no depth/IR needed)
-        CameraConfig test_config;
-        test_config.enable_depth = false;
-        test_config.enable_ir = false;
-        test_config.emitter_enabled = 0;
-        test_config.laser_power = 0.0f;
-        test_config.align_to_color = false;
-        test_config.color_width = 848;   // Same as production FULL mode for consistency
-        test_config.color_height = 480;
-        test_config.color_fps = 30;
-        test_config.depth_width = 0;
-        test_config.depth_height = 0;
-        test_config.enable_spatial_filter = false;
-        test_config.enable_temporal_filter = false;
-        test_config.enable_hole_filling = false;
-        test_config.auto_exposure = true;
-        
-        std::cout << "📹 Camera: RGB-only mode (848x480@30fps) for MediaPipe test" << std::endl;
-        
-        // Start camera with RGB-only config
-        producer_ = std::make_unique<Producer>(test_config, ring_buffer_.get());
-        producer_->start();
-        
-        // Disable recording in ring buffer (not needed for tracking test)
-        ring_buffer_->set_recording_active(false);
-        
-        current_camera_mode_.store(CameraMode::RGB_ONLY);
-        
-        // Go directly to ALIGN state with Screen 0
-        set_state(SystemState::ALIGN);
-        return true;
-    }
-    
     // Normal boot sequence: Show logo, then check WiFi
     set_state(SystemState::BOOT);
     
@@ -145,91 +105,73 @@ void SystemController::run() {
             continue;
         }
 
-        // HIGHEST PRIORITY: Check WiFi connectivity
-        // If WiFi disconnects during ANY state, immediately go to Screen 3 (WiFi QR scan)
-        // If WiFi connects while in AWAIT_ADMIN_QR state, transition to PROVISIONED
+        // WiFi connectivity check (every ~1 second)
         static int wifi_check_counter = 0;
-        static int wifi_fail_count = 0;  // Track consecutive failures to avoid false positives
-        const int WIFI_FAIL_THRESHOLD = 3;  // Require 3 consecutive failures (~1.5s) before aborting
+        static int wifi_fail_count = 0;
+        static bool wifi_was_connected = true;  // Assume connected initially
         
-        if (++wifi_check_counter >= 100) {  // Check every ~500ms (100 * 5ms) for faster detection
+        if (++wifi_check_counter >= 200) {  // Check every ~1s (200 * 5ms)
             wifi_check_counter = 0;
             
-            if (network_mgr_->is_connected_to_internet()) {
-                // WiFi is connected - reset failure counter
+            bool wifi_connected = network_mgr_->is_connected_to_internet();
+            
+            if (wifi_connected) {
                 if (wifi_fail_count > 0) {
-                    std::cout << "✅ WiFi recovered after " << wifi_fail_count << " failed check(s)" << std::endl;
+                    std::cout << "✅ WiFi connected" << std::endl;
                 }
                 wifi_fail_count = 0;
+                wifi_was_connected = true;
                 
-                // Check if we need to transition from AWAIT_ADMIN_QR
+                // If we were waiting for WiFi, transition to PROVISIONED
                 if (current_state_ == SystemState::AWAIT_ADMIN_QR) {
-                    std::string ssid = network_mgr_->get_current_ssid();
                     std::string ip = network_mgr_->get_ip_address();
-                    std::cout << "✅ WiFi connected while in AWAIT_ADMIN_QR: " << ssid << " (" << ip << ")" << std::endl;
-                    std::cout << "🔄 Transitioning to PROVISIONED state" << std::endl;
-                    // Transition to PROVISIONED state which will show Screen 4 → Screen 5 → Screen 6
+                    std::cout << "✅ WiFi connected (" << ip << ") → PROVISIONED" << std::endl;
                     set_state(SystemState::PROVISIONED);
                 }
             } else {
-                // WiFi check failed - increment counter
                 wifi_fail_count++;
-                if (wifi_fail_count < WIFI_FAIL_THRESHOLD) {
-                    std::cout << "⚠️  WiFi check failed (" << wifi_fail_count << "/" << WIFI_FAIL_THRESHOLD << ") - waiting..." << std::endl;
-                }
                 
-                // Only abort after multiple consecutive failures
-                if (wifi_fail_count >= WIFI_FAIL_THRESHOLD &&
-                    current_state_ != SystemState::AWAIT_ADMIN_QR && 
-                    current_state_ != SystemState::BOOT &&
-                    current_state_ != SystemState::ERROR &&
-                    current_state_ != SystemState::LOGOUT) {
-                    // WiFi truly disconnected - ABORT
-                    std::cerr << "⚠️  CRITICAL: WiFi LOST (" << wifi_fail_count << " consecutive failures) - ABORTING" << std::endl;
-                    wifi_fail_count = 0;  // Reset for next time
+                // After 3 consecutive failures (~3s), show "Looking for WiFi"
+                if (wifi_fail_count >= 3 && wifi_was_connected) {
+                    wifi_was_connected = false;
+                    std::cout << "📡 WiFi disconnected - showing Screen 3" << std::endl;
                     
-                    // Clean up current session
-                    session_id_.clear();
-                    platform_id_.clear();
-                    motion_tracker_.reset();
-                    ring_buffer_->set_recording_active(false);
-                    ring_buffer_->clear();
-                    
-                    // Disconnect WebSocket if active
-                    if (network_mgr_->is_connected()) {
-                        network_mgr_->disconnect();
+                    // Clean up any active session
+                    if (current_state_ != SystemState::AWAIT_ADMIN_QR && 
+                        current_state_ != SystemState::BOOT) {
+                        session_id_.clear();
+                        platform_id_.clear();
+                        motion_tracker_.reset();
+                        ring_buffer_->set_recording_active(false);
+                        ring_buffer_->clear();
+                        if (network_mgr_->is_connected()) {
+                            network_mgr_->disconnect();
+                        }
                     }
                     
-                    // Go directly to Screen 3 (Looking for WiFi)
-                    serial_comm_->send_state(3);
-                    
-                    // Go to AWAIT_ADMIN_QR state
+                    serial_comm_->send_state(3);  // Screen 3: Looking for WiFi
                     set_state(SystemState::AWAIT_ADMIN_QR);
-                    std::cout << "📡 WiFi lost - showing Screen 3 (Looking for WiFi)" << std::endl;
                 }
             }
         }
 
         // Check state timer (for automatic transitions like ERROR -> IDLE, LOGOUT -> IDLE)
-        if (state_timer_active_) {
+        if (state_timer_active_.load()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - state_timer_start_
             ).count();
             
+            // Debug: log timer status periodically
+            static int timer_debug = 0;
+            if (++timer_debug % 200 == 0) {
+                std::cout << "⏱️ Timer check: elapsed=" << elapsed << "ms target=" << state_timer_duration_ms_ << "ms" << std::endl;
+            }
+            
             if (elapsed >= state_timer_duration_ms_) {
-                state_timer_active_ = false;
-                std::cout << "🔄 Timer expired (" << elapsed << "ms) - transitioning from " 
-                          << static_cast<int>(current_state_.load()) << " to " 
-                          << static_cast<int>(state_timer_target_) << std::endl;
+                state_timer_active_.store(false);
+                std::cout << "🔄 Timer fired! Transitioning to IDLE" << std::endl;
+                std::cout.flush();
                 set_state(state_timer_target_);
-            } else {
-                // Debug: Log timer progress every second
-                static int timer_log_counter = 0;
-                if (++timer_log_counter >= 200) {  // Every ~1 second
-                    timer_log_counter = 0;
-                    std::cout << "⏳ Timer active: " << elapsed << "/" << state_timer_duration_ms_ 
-                              << "ms elapsed (state: " << static_cast<int>(current_state_.load()) << ")" << std::endl;
-                }
             }
         }
 
@@ -254,21 +196,96 @@ void SystemController::run() {
             }
         }
 
+        // =====================================================================
+        // ESP32 DISPLAY HEALTH MONITORING
+        // Check heartbeats from ESP32, detect crashes/disconnects
+        // =====================================================================
+        static int esp32_check_counter = 0;
+        static int esp32_fail_count = 0;
+        static bool esp32_was_alive = true;
+        
+        if (++esp32_check_counter >= 100) {  // Check every ~500ms (100 * 5ms)
+            esp32_check_counter = 0;
+            
+            // Read any pending messages from ESP32 (heartbeats, status, ACKs)
+            if (serial_comm_ && serial_comm_->is_connected()) {
+                serial_comm_->check_esp32_status();
+                
+                // Check if ESP32 is alive (received heartbeat within 5 seconds)
+                bool esp32_alive = serial_comm_->is_esp32_alive(5000);
+                
+                if (esp32_alive) {
+                    if (!esp32_was_alive) {
+                        std::cout << "✅ ESP32 display reconnected" << std::endl;
+                    }
+                    esp32_fail_count = 0;
+                    esp32_was_alive = true;
+                    
+                    // Verify screen synchronization (only during stable states)
+                    if (current_state_ == SystemState::IDLE || 
+                        current_state_ == SystemState::READY ||
+                        current_state_ == SystemState::AWAIT_ADMIN_QR) {
+                        
+                        int expected_screen = serial_comm_->get_last_state();
+                        int actual_screen = serial_comm_->get_esp32_screen();
+                        
+                        // If there's a mismatch and we've sent a state, resync
+                        if (expected_screen >= 0 && actual_screen >= 0 && 
+                            expected_screen != actual_screen) {
+                            std::cout << "⚠️ ESP32 screen mismatch: expected " << expected_screen 
+                                      << ", got " << actual_screen << " - resyncing" << std::endl;
+                            serial_comm_->send_state(expected_screen);
+                        }
+                    }
+                    
+                    // Log ESP32 memory status periodically (every ~30 seconds)
+                    static int esp32_mem_log_counter = 0;
+                    if (++esp32_mem_log_counter >= 60) {  // 60 * 500ms = 30s
+                        esp32_mem_log_counter = 0;
+                        uint32_t esp32_heap = serial_comm_->get_esp32_heap();
+                        if (esp32_heap > 0) {
+                            std::cout << "📊 ESP32 Heap: " << esp32_heap << " bytes free" << std::endl;
+                            if (esp32_heap < 30000) {
+                                std::cerr << "⚠️ ESP32 LOW MEMORY WARNING!" << std::endl;
+                            }
+                        }
+                    }
+                } else {
+                    // ESP32 not responding
+                    esp32_fail_count++;
+                    
+                    if (esp32_was_alive && esp32_fail_count >= 2) {
+                        esp32_was_alive = false;
+                        std::cerr << "⚠️ ESP32 display not responding (no heartbeat for 5+ seconds)" << std::endl;
+                        
+                        // Try to reconnect serial
+                        std::cout << "🔄 Attempting ESP32 reconnection..." << std::endl;
+                        if (serial_comm_->try_reconnect()) {
+                            std::cout << "✅ ESP32 serial reconnected, resending state..." << std::endl;
+                            // Resend current state
+                            int last_state = serial_comm_->get_last_state();
+                            if (last_state >= 0) {
+                                serial_comm_->send_state(last_state);
+                            }
+                        } else {
+                            std::cerr << "❌ ESP32 reconnection failed" << std::endl;
+                        }
+                    }
+                    
+                    // After 10 consecutive failures (~5 seconds), log critical error
+                    if (esp32_fail_count >= 10 && esp32_fail_count % 10 == 0) {
+                        std::cerr << "❌ CRITICAL: ESP32 display unresponsive for " 
+                                  << (esp32_fail_count / 2) << " seconds!" << std::endl;
+                    }
+                }
+            }
+        }
+
         FrameBox* frame = ring_buffer_->get_latest_frame();
         if (frame) {
             process_frame(frame);
             ring_buffer_->release_frame(frame);
         } else {
-            // Debug: Log when no frames available in ALIGN state
-            static int no_frame_count = 0;
-            SystemState state = current_state_.load();
-            if (state == SystemState::ALIGN) {
-                if (++no_frame_count % 100 == 1) {
-                    std::cout << "⏳ [ALIGN] Waiting for frames... (no_frame_count=" << no_frame_count << ")" << std::endl;
-                }
-            } else {
-                no_frame_count = 0;
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
@@ -340,49 +357,37 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::COUNTDOWN:
-            // Show Screen 8 and start countdown from 5 to 1
-            std::cout << "🔢 COUNTDOWN state entered - showing Screen 8" << std::endl;
+            std::cout << "🔢 COUNTDOWN: Starting camera switch + countdown" << std::endl;
+            serial_comm_->send_state(8);
+            serial_comm_->send_state_with_text(8, "...");  // Show "preparing"
             
-            // Switch camera to FULL mode (RGB + Depth + IR + Laser)
-            // This gives camera 5 seconds to warm up during countdown
-            configure_camera_for_state(SystemState::COUNTDOWN);
-            
-            // First send screen state to ensure Screen 8 is displayed
-            if (serial_comm_->send_state(8)) {
-                std::cout << "✅ Screen 8 state sent successfully" << std::endl;
-            } else {
-                std::cerr << "❌ Failed to send Screen 8 state" << std::endl;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Small delay for screen to initialize
-            if (serial_comm_->send_state_with_text(8, "5")) {
-                std::cout << "✅ Screen 8 text '5' sent successfully" << std::endl;
-            } else {
-                std::cerr << "❌ Failed to send Screen 8 text" << std::endl;
-            }
-            std::cout << "🔢 Starting countdown: 5..." << std::endl;
-            
-            // Countdown thread: 5, 4, 3, 2, 1
+            // Run camera switch + countdown in thread
             std::thread([this]() {
+                // STEP 1: Switch to FULL mode (Color + Depth + IR)
+                std::cout << "📹 Switching to FULL mode (Color + Depth + IR)..." << std::endl;
+                configure_camera_for_state(SystemState::ALIGN);
+                
+                // Verify camera is ready
+                if (!producer_ || !producer_->is_running()) {
+                    std::cerr << "❌ Camera failed to start in FULL mode" << std::endl;
+                    serial_comm_->send_error("Camera error");
+                    set_state(SystemState::ERROR);
+                    return;
+                }
+                std::cout << "✅ Camera ready in FULL mode" << std::endl;
+                
+                // STEP 2: Countdown 5,4,3,2,1
                 for (int count = 5; count >= 1; count--) {
                     if (current_state_ != SystemState::COUNTDOWN) {
-                        std::cout << "⚠️  Countdown interrupted (state changed)" << std::endl;
+                        std::cout << "⚠️ Countdown interrupted" << std::endl;
                         return;
                     }
-                    
-                    // Update screen with current countdown number
-                    std::string count_str = std::to_string(count);
-                    serial_comm_->send_state_with_text(8, count_str);
-                    std::cout << "🔢 Countdown: " << count << std::endl;
-                    
-                    // Wait 1 second before next number (except after showing "1")
-                    if (count > 1) {
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
-                    }
+                    serial_comm_->send_state_with_text(8, std::to_string(count));
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
                 
-                // After countdown completes, transition directly to ALIGN (Screen 9)
+                // STEP 3: Transition to ALIGN
                 if (current_state_ == SystemState::COUNTDOWN) {
-                    std::cout << "✅ Countdown complete → ALIGN" << std::endl;
                     set_state(SystemState::ALIGN);
                 }
             }).detach();
@@ -402,122 +407,129 @@ void SystemController::set_state(SystemState new_state) {
             break;
             
         case SystemState::ALIGN:
-            std::cout << "📍 ═══════════════════════════════════════════════════" << std::endl;
-            std::cout << "📍 Entering ALIGN state (face tracking)" << std::endl;
-            std::cout << "📍 ═══════════════════════════════════════════════════" << std::endl;
-            if (ui_test_mode_) {
-                serial_comm_->send_state(0); // Screen 0: UI test page
-                std::cout << "🧪 UI TEST: Screen 0 active - tracking started" << std::endl;
-                // In test mode, don't enable recording (we just want to test tracking)
-                ring_buffer_->set_recording_active(false);
-            } else {
-                serial_comm_->send_state(9); // Screen 9: Production nose tracking
-                ring_buffer_->set_recording_active(true);
-                std::cout << "📹 Recording ENABLED for batch processing" << std::endl;
-            }
-            motion_tracker_.reset();
-            std::cout << "🔄 Motion tracker reset, clearing old frames..." << std::endl;
+            std::cout << "📍 ALIGN: Recording enabled (Color + Depth + IR)" << std::endl;
+            serial_comm_->send_state(9); // Screen 9: Nose tracking
+            serial_comm_->send_tracking_data(233, 233, 0, true);
+            
+            // ROBUST RECORDING FIX: Stop → Clear → Start
+            // Prevents race condition where frames written during clear
+            ring_buffer_->set_recording_active(false);
             ring_buffer_->clear();
-            std::cout << "✅ ALIGN state ready - waiting for frames..." << std::endl;
+            motion_tracker_.reset();
+            ring_buffer_->set_recording_active(true);
+            std::cout << "📼 Recording active - frames being stored" << std::endl;
             break;
             
         case SystemState::PROCESSING:
-            ring_buffer_->set_recording_active(false); 
+            std::cout << "⚙️ PROCESSING: Recording stopped, sending to server" << std::endl;
+            ring_buffer_->set_recording_active(false);
             serial_comm_->send_state(10); // Screen 10: "Processing" screen
             std::thread([this]() { handle_processing(); }).detach();
             break;
             
         case SystemState::SUCCESS:
-            serial_comm_->send_state(11); // Screen 11: "Success Animation" (green, 3 seconds)
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                if (ui_test_mode_) {
-                    std::cout << "🧪 UI TEST: Success complete → back to Screen 0" << std::endl;
-                    set_state(SystemState::ALIGN); // Return to Screen 0 for more testing
-                } else {
-                set_state(SystemState::LOGOUT);
-                }
-            }).detach();
+            std::cout << "✅ SUCCESS: Switching back to RGB_ONLY mode" << std::endl;
+            serial_comm_->send_state(11); // Screen 11: "Success Animation"
+            
+            // Switch back to low-power RGB-only mode
+            configure_camera_for_state(SystemState::IDLE);
+            
+            // Wait for "delete" message from mobile via WebSocket
             break;
             
         case SystemState::ERROR:
-            if (ui_test_mode_) {
-                // In UI test mode, skip error screen and go directly back to Screen 0
-                std::cout << "🧪 UI TEST: Error occurred - resetting to Screen 0" << std::endl;
-                motion_tracker_.reset();
-                set_state(SystemState::ALIGN); // Return to Screen 0 immediately
-                break;
-            }
-            
-            serial_comm_->send_state(12); // Screen 12: "Error Animation" (red, 3 seconds, returns to IDLE)
-            std::cout << "❌ ERROR state entered - showing error for 3 seconds..." << std::endl;
-            // Error message should already be sent via send_error() before entering ERROR state
-            
-            // Clean up session on error
-            session_id_.clear();
-            platform_id_.clear();
-            motion_tracker_.reset();
-            
-            // Disconnect WebSocket if connected and clear auth token
-            {
-                std::lock_guard<std::mutex> lock(ws_auth_mutex_);
-                pending_ws_token_.clear();
-            }
-            if (network_mgr_ && network_mgr_->is_connected()) {
-                network_mgr_->disconnect();
-                std::cout << "✅ WebSocket disconnected due to error" << std::endl;
-            }
-            
-            configure_camera_for_state(SystemState::IDLE);
-            
-            // Start timer for automatic return (3 seconds)
-            state_timer_start_ = std::chrono::steady_clock::now();
-            state_timer_target_ = SystemState::IDLE;
-            state_timer_duration_ms_ = 3000; // 3 seconds
-            state_timer_active_ = true;
-            std::cout << "⏰ Timer set: will return to IDLE in 3 seconds" << std::endl;
-            std::cout.flush();  // Force immediate log write
-            break;
-            
-        case SystemState::LOGOUT:
-            serial_comm_->send_state(15); // Screen 15: "Deleting Data / Thank You"
-            std::cout << "👋 Showing Thank You screen - returning to IDLE in 4 seconds..." << std::endl;
-            std::cout.flush();  // Force immediate write
-            
-            // TODO: Sync mobile and device (lasts 4 seconds)
-            // TODO: After sync, send ping to WebSocket to trigger server→mobile data transfer
-            // TODO: When we receive confirmation message, return to IDLE screen (Screen 6)
+            serial_comm_->send_state(12); // Screen 12: "Error Animation"
+            std::cout << "❌ ERROR state - cleaning up..." << std::endl;
             
             // Clean up session
             session_id_.clear();
             platform_id_.clear();
             motion_tracker_.reset();
-            
-            // Close WebSocket connection and clear auth token
             {
                 std::lock_guard<std::mutex> lock(ws_auth_mutex_);
                 pending_ws_token_.clear();
             }
-            if (network_mgr_) {
-            network_mgr_->disconnect();
-                std::cout << "✅ WebSocket disconnected" << std::endl;
-                std::cout.flush();
+            
+            // Switch camera back to RGB_ONLY
+            configure_camera_for_state(SystemState::IDLE);
+            
+            // Disconnect WebSocket in a separate thread (avoids deadlock if called from WS callback)
+            if (network_mgr_ && network_mgr_->is_connected()) {
+                std::thread([this]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (network_mgr_) {
+                        network_mgr_->disconnect();
+                        std::cout << "✅ WebSocket disconnected" << std::endl;
+                    }
+                }).detach();
             }
             
-            // Switch camera back: Full → RGB-only (low power mode for QR scanning)
-            configure_camera_for_state(SystemState::IDLE);
-            std::cout << "🔄 Camera mode: Full → RGB-only (QR scanning mode)" << std::endl;
-            std::cout.flush();
-            
-            // Start timer for automatic return to IDLE (4 seconds for data sync)
-            std::cout << "⏰ Setting timer..." << std::endl;
-            std::cout.flush();
+            // Start timer to return to IDLE after 3 seconds
             state_timer_start_ = std::chrono::steady_clock::now();
             state_timer_target_ = SystemState::IDLE;
-            state_timer_duration_ms_ = 4000; // 4 seconds
+            state_timer_duration_ms_ = 3000;
             state_timer_active_ = true;
-            std::cout << "⏰ Timer ACTIVE - will return to IDLE in 4 seconds" << std::endl;
+            std::cout << "⏰ Returning to IDLE in 3 seconds..." << std::endl;
+            break;
+            
+        case SystemState::LOGOUT:
+            serial_comm_->send_state(15); // Screen 15: "Deleting Data / Thank You"
+            std::cout << "🗑️ DELETE: Showing Screen 15 for 3 seconds..." << std::endl;
             std::cout.flush();
+            
+            // Clean up session data
+            {
+                std::string saved_session = session_id_;  // Save for delete_ack
+                session_id_.clear();
+                platform_id_.clear();
+                motion_tracker_.reset();
+                
+                // Use a thread to handle the 3 second animation then send ack
+                std::thread([this, saved_session]() {
+                    // Wait 3 seconds for delete animation
+                    std::cout << "⏳ Waiting 3 seconds for delete animation..." << std::endl;
+                    std::cout.flush();
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    
+                    // AFTER 3 seconds, send delete_ack to server
+                    std::cout << "📤 Sending delete_ack to server..." << std::endl;
+                    std::cout.flush();
+                    
+                    bool ack_sent = false;
+                    if (network_mgr_ && network_mgr_->is_connected()) {
+                        nlohmann::json delete_ack = {
+                            {"type", "delete_ack"},
+                            {"session_id", saved_session},
+                            {"status", "complete"}
+                        };
+                        ack_sent = network_mgr_->send_message(delete_ack.dump());
+                        std::cout << "✅ delete_ack sent to server (success=" << ack_sent << ")" << std::endl;
+                        std::cout.flush();
+                    } else {
+                        std::cout << "⚠️ WebSocket not connected, skipping delete_ack" << std::endl;
+                        std::cout.flush();
+                    }
+                    
+                    std::cout << "🔄 Cleaning up auth token..." << std::endl;
+                    std::cout.flush();
+                    
+                    // Clear auth token
+                    {
+                        std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                        pending_ws_token_.clear();
+                    }
+                    
+                    // Stop WebSocket reconnection (non-blocking)
+                    network_mgr_->stop_reconnect();
+                    std::cout.flush();
+                    
+                    std::cout << "✅ Delete complete → Going to IDLE..." << std::endl;
+                    std::cout.flush();
+                    set_state(SystemState::IDLE);
+                    std::cout << "🔄 IDLE state set - main loop restarted (Screen 6)" << std::endl;
+                    std::cout.flush();
+                }).detach();
+            }
             break;
             
         default:
@@ -561,15 +573,13 @@ void SystemController::configure_camera_for_state(SystemState state) {
         config.auto_exposure = true;  // Let the camera adapt lighting for QR readability
         
     } else {
-        // FULL MODE: READY, COUNTDOWN, WARMUP, ALIGN, PROCESSING
-        // Camera switches to full mode at READY so it can warm up during "Ready?" screen
-        // All streams at 848x480 for proper alignment
+        // FULL MODE: Color + Depth + IR (for anti-spoofing)
         target_mode = CameraMode::FULL;
         config.enable_ir = true;
         config.enable_depth = true;
         config.depth_width = 848;
         config.depth_height = 480;
-        config.color_width = 848;    // Same as Depth/IR for proper alignment
+        config.color_width = 848;
         config.color_height = 480;
         config.color_fps = 30;
         config.ir_width = 848;
@@ -581,7 +591,7 @@ void SystemController::configure_camera_for_state(SystemState state) {
         config.enable_spatial_filter = true;
         config.enable_temporal_filter = true;
         config.enable_hole_filling = true;
-        config.auto_exposure = true;  // CRITICAL: Enable auto-exposure for proper lighting
+        config.auto_exposure = true;
     }
     
     
@@ -654,15 +664,12 @@ void SystemController::configure_camera_for_state(SystemState state) {
 void SystemController::process_frame(FrameBox* frame) {
     SystemState state = current_state_.load();
     
-    // Debug: Log frame processing for ALIGN state
+    // Reset frame counter when not in ALIGN
     static int align_frame_count = 0;
-    if (state == SystemState::ALIGN) {
-        if (++align_frame_count % 30 == 1) {  // Log every 30 frames (~1 second)
-            std::cout << "🔄 [ALIGN] Processing frame #" << align_frame_count 
-                      << " (frame ptr=" << (frame ? "valid" : "NULL") << ")" << std::endl;
-        }
+    if (state != SystemState::ALIGN) {
+        align_frame_count = 0;
     } else {
-        align_frame_count = 0;  // Reset counter when not in ALIGN
+        align_frame_count++;
     }
     
     switch (state) {
@@ -702,94 +709,76 @@ void SystemController::handle_await_admin_qr(FrameBox* frame) {
 
 void SystemController::handle_idle(FrameBox* frame) {
 #ifdef HAVE_OPENCV
-    // IMPORTANT: Re-check state before processing - state might have changed
+    // Re-check state before processing
     SystemState current = current_state_.load();
     if (current != SystemState::IDLE && current != SystemState::READY) {
-        return;  // Don't process QR codes if we're not in IDLE/READY
+        return;
     }
     
-    // Debounce: Don't process QR if we recently processed one
+    // Static scanner - reuse across calls (much more efficient)
+    static zbar::ImageScanner scanner;
+    static bool scanner_initialized = false;
+    if (!scanner_initialized) {
+        scanner.set_config(zbar::ZBAR_NONE, zbar::ZBAR_CFG_ENABLE, 0);  // Disable all
+        scanner.set_config(zbar::ZBAR_QRCODE, zbar::ZBAR_CFG_ENABLE, 1);  // Enable QR only
+        scanner.set_config(zbar::ZBAR_NONE, zbar::ZBAR_CFG_X_DENSITY, 1);
+        scanner.set_config(zbar::ZBAR_NONE, zbar::ZBAR_CFG_Y_DENSITY, 1);
+        scanner_initialized = true;
+        std::cout << "📷 ZBar scanner initialized" << std::endl;
+    }
+    
+    // Debounce
     static auto last_qr_time = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_qr_time).count();
     
-    static int frame_skip = 0;
-    static int scan_count = 0;
-    if (frame_skip++ % 5 != 0) return; // Process every 5th frame
-
-    scan_count++;
-    if (scan_count % 50 == 0) {
-        std::cout << "[QR Scanner] Active - scan #" << scan_count << " (ZBar ready)" << std::endl;
-    }
+    // Process every 3rd frame for better detection
+    static int frame_count = 0;
+    if (++frame_count % 3 != 0) return;
 
     cv::Mat color_img = frame->get_color_mat();
     if (color_img.empty()) {
         return;
     }
     
+    // Convert to grayscale
     cv::Mat gray;
     cv::cvtColor(color_img, gray, cv::COLOR_BGR2GRAY);
     
-    // Use ZBar with enhanced settings for better QR detection
-    zbar::ImageScanner scanner;
-    scanner.set_config(zbar::ZBAR_QRCODE, zbar::ZBAR_CFG_ENABLE, 1);
-    scanner.set_config(zbar::ZBAR_NONE, zbar::ZBAR_CFG_X_DENSITY, 1);  // Scan every pixel
-    scanner.set_config(zbar::ZBAR_NONE, zbar::ZBAR_CFG_Y_DENSITY, 1);  // Scan every line
+    // Create ZBar image from raw grayscale data
+    zbar::Image zbar_image(gray.cols, gray.rows, "Y800", gray.data, gray.cols * gray.rows);
     
-    // Try to enhance contrast for better QR detection
-    cv::Mat enhanced;
-    cv::equalizeHist(gray, enhanced);  // Improve contrast
-    
-    zbar::Image zbar_image(enhanced.cols, enhanced.rows, "Y800", enhanced.data, enhanced.cols * enhanced.rows);
+    // Scan for QR codes
     int n = scanner.scan(zbar_image);
-    
-    // Debug: Save enhanced frame every 100 scans (disabled - permission issues)
-    // if (scan_count % 100 == 0) {
-    //     cv::imwrite("/tmp/qr_enhanced_latest.jpg", enhanced);
-    //     std::cout << "[QR Debug] Saved enhanced frame to /tmp/qr_enhanced_latest.jpg" << std::endl;
-    // }
-    
-    if (scan_count % 50 == 0 && n == 0) {
-        // Periodically save frame for debugging
-        // Debug save disabled - permission issues
-        // static int save_count = 0;
-        // if (save_count++ < 3) {
-        //     cv::imwrite("/tmp/qr_scan_debug_" + std::to_string(save_count) + ".jpg", gray);
-        //     std::cout << "[QR Debug] Saved frame to /tmp/qr_scan_debug_" << save_count << ".jpg for inspection" << std::endl;
-        // }
-    }
     
     std::string decoded_info;
     if (n > 0) {
-        std::cout << "🎯 ZBar detected " << n << " QR code(s)!" << std::endl;
         for (zbar::Image::SymbolIterator symbol = zbar_image.symbol_begin();
              symbol != zbar_image.symbol_end(); ++symbol) {
             decoded_info = symbol->get_data();
-            std::cout << "📱 QR Data length: " << decoded_info.length() << " bytes" << std::endl;
             
-            // QR image saving disabled - causes log spam and permission issues
-            // static int qr_capture_count = 0;
-            // std::string qr_image_path = "/tmp/qr_captured_" + std::to_string(++qr_capture_count) + ".jpg";
-            // cv::imwrite(qr_image_path, color_img);
-            // std::cout << "📸 QR Image saved: " << qr_image_path << std::endl;
-            
-            break; // Take first QR code
+            // Log detected QR
+            std::string preview = decoded_info.length() > 40 
+                ? decoded_info.substr(0, 40) + "..." 
+                : decoded_info;
+            std::cout << "📱 QR[" << decoded_info.length() << "]: " << preview << std::endl;
+            break;
         }
     }
     
+    // Clean up zbar image
+    zbar_image.set_data(NULL, 0);
+    
     if (!decoded_info.empty()) {
-        // Debounce: Ignore QR if we processed one in the last 5 seconds
-        if (elapsed < 5000) {
-            return;  // Too soon after last QR, skip
+        // Debounce: 2 second cooldown after valid QR
+        if (elapsed < 2000) {
+            return;
         }
         last_qr_time = std::chrono::steady_clock::now();
         
-        std::cout << "📱 QR Code Detected (Idle State)" << std::endl;
-        
-        // FILTER: Ignore tiny QR codes (false positives from ZBar)
-        if (decoded_info.length() < 20) {
-            std::cout << "⚠️  Ignoring tiny QR code (" << decoded_info.length() << " bytes) - likely false positive" << std::endl;
-            return; // Skip processing
+        // Filter noise (QR codes should be at least 10 chars)
+        if (decoded_info.length() < 10) {
+            return;
         }
         
         // STEP 1: Detect QR type by prefix or structure
@@ -982,29 +971,18 @@ void SystemController::handle_align(FrameBox* frame) {
     startup_frames++;
     bool in_grace_period = (startup_frames < STARTUP_GRACE_PERIOD);
     
-    // Debug: Log frame info periodically
     static int frame_count = 0;
-    if (++frame_count % 60 == 0) {
-        std::cout << "📷 Frame #" << frame_count 
-                  << " size=" << frame->color_width << "x" << frame->color_height;
-        if (in_grace_period) {
-            std::cout << " [STARTUP: " << (STARTUP_GRACE_PERIOD - startup_frames) / 30 << "s remaining]";
-        }
-        std::cout << std::endl;
-    }
+    frame_count++;
     
     // Run face detection
     if (!face_detector_->detect(frame)) {
         motion_tracker_.no_face_counter++;
         motion_tracker_.validation_state = FaceValidationState::NO_FACE;
         
-        // Debug: Log no face periodically
-        if (motion_tracker_.no_face_counter % 30 == 0) {
-            std::cout << "👤 No face detected (count=" << motion_tracker_.no_face_counter << ")";
-            if (in_grace_period) {
-                std::cout << " [grace period - no timeout]";
-            }
-            std::cout << std::endl;
+        // Log no-face periodically
+        static int no_face_log = 0;
+        if (++no_face_log % 60 == 0) {
+            std::cout << "👤 No face detected (count: " << motion_tracker_.no_face_counter << ")" << std::endl;
         }
         
         // Send grey target (no face)
@@ -1025,23 +1003,16 @@ void SystemController::handle_align(FrameBox* frame) {
         motion_tracker_.no_face_counter++;
         motion_tracker_.validation_state = FaceValidationState::NO_FACE;
         
-        // Debug: Log landmark count issue
-        if (motion_tracker_.no_face_counter % 30 == 0) {
-            std::cout << "⚠️ Face detected but only " << landmarks.size() << " landmarks (need 468)" << std::endl;
-        }
         
         serial_comm_->send_tracking_data(233, 233, 
             static_cast<int>(motion_tracker_.progress * 100), false);
         return;
     }
     
-    // Debug: Log successful face detection
     static int face_detect_count = 0;
-    if (++face_detect_count % 60 == 0) {
-        std::cout << "✅ Face detected with " << landmarks.size() << " landmarks" << std::endl;
-    }
+    face_detect_count++;
     
-    // Validate face position (distance + orientation) - now safe to access landmarks
+    // Validate face position - simplified (gates disabled for testing)
     motion_tracker_.validation_state = validate_face_position(frame);
     bool is_valid = (motion_tracker_.validation_state == FaceValidationState::VALID);
     
@@ -1052,26 +1023,31 @@ void SystemController::handle_align(FrameBox* frame) {
         motion_tracker_.no_face_counter++;
     }
     
-    // Extract normalized nose position (0.0-1.0)
-    float nose_x_norm = landmarks[4].x / frame->color_width;
-    float nose_y_norm = landmarks[4].y / frame->color_height;
-                
-    // Convert to screen coordinates (466x466 display)
-    int raw_x = static_cast<int>(nose_x_norm * 466.0f);
-    int raw_y = static_cast<int>(nose_y_norm * 466.0f);
+    // Extract nose position (frame is portrait 480x848, rotated at source)
+    float nose_x_rot = landmarks[4].x;  // X in rotated space (0-480)
+    float nose_y_rot = landmarks[4].y;  // Y in rotated space (0-848)
     
-    // Mirror X-axis so user's left/right movement matches screen
-    // (camera sees user from opposite perspective)
-    raw_x = 465 - raw_x;
+    // Normalize to 0.0-1.0 using rotated dimensions
+    float nose_x_norm = nose_x_rot / frame->metadata.rotated_width;   // /480
+    float nose_y_norm = nose_y_rot / frame->metadata.rotated_height;  // /848
     
-    // Apply rotation correction for camera orientation (if needed)
-    int screen_x, screen_y;
-    if (producer_) {
-        producer_->transform_coordinates(raw_x, raw_y, 465, 465, screen_x, screen_y);
-    } else {
-        screen_x = raw_x;
-        screen_y = raw_y;
-    }
+    // Map to 466x466 display with ASPECT RATIO CORRECTION
+    // The Y axis (848px) has more range than X (480px), so we use center crop logic
+    // to make vertical movement feel as responsive as horizontal
+    
+    // For X: full range 0-480 maps to 0-466 (with mirror)
+    int screen_x = static_cast<int>(nose_x_norm * 466.0f);
+    
+    // For Y: use center 480px of the 848px range for 1:1 feel
+    // Center of 848 = 424, so usable range is 424±240 = 184 to 664
+    float y_center = 0.5f;  // Normalized center
+    float y_range = 480.0f / 848.0f;  // ~0.566 of the full range
+    float y_adjusted = (nose_y_norm - (y_center - y_range/2)) / y_range;  // Remap to 0-1
+    y_adjusted = std::max(0.0f, std::min(1.0f, y_adjusted));  // Clamp
+    int screen_y = static_cast<int>(y_adjusted * 466.0f);
+    
+    // Mirror X-axis (camera sees mirror image of user)
+    screen_x = 465 - screen_x;
     
     // Clamp to display bounds
     screen_x = std::max(0, std::min(465, screen_x));
@@ -1081,37 +1057,13 @@ void SystemController::handle_align(FrameBox* frame) {
     float progress = motion_tracker_.progress;
     if (is_valid) {
         progress = calculate_circular_motion_progress(cv::Point2f(nose_x_norm, nose_y_norm));
-        
-        // Debug logging every 30 frames (~1 second)
-        static int debug_counter = 0;
-        if (++debug_counter % 30 == 0) {
-            std::cout << "🎯 Tracking: x=" << screen_x << " y=" << screen_y 
-                      << " progress=" << static_cast<int>(progress * 100) << "%"
-                      << " angle=" << static_cast<int>(motion_tracker_.cumulative_angle * 180.0f / 3.14159f) << "°"
-                      << " dist=" << static_cast<int>(motion_tracker_.estimated_distance_cm) << "cm"
-                      << " valid=" << (is_valid ? "YES" : "NO") << std::endl;
-        }
     }
     
     // Send combined tracking data to display
     serial_comm_->send_tracking_data(screen_x, screen_y, 
         static_cast<int>(progress * 100), is_valid);
     
-    // Debug: Log tracking even when invalid (every 60 frames)
-    static int track_debug = 0;
-    if (++track_debug % 60 == 0) {
-        std::string val_str;
-        switch (motion_tracker_.validation_state) {
-            case FaceValidationState::VALID: val_str = "VALID"; break;
-            case FaceValidationState::NO_FACE: val_str = "NO_FACE"; break;
-            case FaceValidationState::TOO_CLOSE: val_str = "TOO_CLOSE"; break;
-            case FaceValidationState::TOO_FAR: val_str = "TOO_FAR"; break;
-            case FaceValidationState::EXTREME_ROTATION: val_str = "EXTREME_ROT"; break;
-        }
-        std::cout << "📡 Tracking sent: X:" << screen_x << " Y:" << screen_y 
-                  << " P:" << static_cast<int>(progress * 100) << "% C:" << (is_valid ? 1 : 0)
-                  << " [" << val_str << " dist=" << static_cast<int>(motion_tracker_.estimated_distance_cm) << "cm]" << std::endl;
-    }
+    
                 
     // Send detailed progress to mobile app via WebSocket periodically
                 static int mobile_update_skip = 0;
@@ -1141,23 +1093,23 @@ void SystemController::handle_align(FrameBox* frame) {
                     network_mgr_->send_message(progress_msg.dump());
                 }
                 
-    // Check for completion
-                if (progress >= 1.0f) {
-        std::cout << "✅ Spiral motion complete!" << std::endl;
-        if (ui_test_mode_) {
-            // UI test mode: Skip processing, go directly to success
-            set_state(SystemState::SUCCESS);
-        } else {
-                    set_state(SystemState::PROCESSING);
-                }
-            }
-    
-    // Check timeout (150 frames = ~5 seconds without valid face)
-    if (motion_tracker_.no_face_counter > 150) {
-        handle_face_timeout();
+    // Check for spiral completion (real spiral motion required)
+    if (progress >= 1.0f) {
+        // Send 100% progress to display to ensure ring is fully filled
+        serial_comm_->send_tracking_data(screen_x, screen_y, 100, true);
+        
+        std::cout << "🎉 Spiral complete! Celebrating for 1 second..." << std::endl;
+        std::cout.flush();
+        
+        // Wait 1 second to let user see the completed ring
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        
+        std::cout << "✅ Celebration done → PROCESSING" << std::endl;
+        set_state(SystemState::PROCESSING);
+        return;
     }
-}
-
+    }
+    
 void SystemController::handle_face_timeout() {
         std::cout << "Face Timeout!" << std::endl;
         nlohmann::json error_msg = {
@@ -1169,14 +1121,6 @@ void SystemController::handle_face_timeout() {
         
         ring_buffer_->set_recording_active(false);
         ring_buffer_->clear(); 
-        
-    // In UI test mode, just reset and stay on Screen 0
-    if (ui_test_mode_) {
-        std::cout << "🧪 UI TEST: Face timeout - resetting to Screen 0" << std::endl;
-        motion_tracker_.reset();
-        set_state(SystemState::ALIGN); // Return to Screen 0
-        return;
-    }
         
     // Send error message before entering ERROR state
     serial_comm_->send_error("Face not detected");
@@ -1195,75 +1139,22 @@ float SystemController::estimate_face_distance(float face_width_pixels) {
     return (REFERENCE_FACE_WIDTH * REFERENCE_DISTANCE) / face_width_pixels;
 }
 
-bool SystemController::is_face_orientation_extreme(const std::vector<FrameBoxMetadata::Landmark>& landmarks) {
-    // Check if face is rotated too far to complete spiral motion
-    // Key landmarks: nose tip (4), left eye outer (33), right eye outer (263)
-    if (landmarks.size() < 264) return true;  // Not enough landmarks
-    
-    const auto& nose = landmarks[4];       // Nose tip (MediaPipe index 4)
-    const auto& left_eye = landmarks[33];  // Left eye outer corner
-    const auto& right_eye = landmarks[263]; // Right eye outer corner
-    
-    // NOTE: After coordinate transform (camera rotated 90° CCW), 
-    // the horizontal axis in screen space is Y (not X)
-    // So use Y coordinates for eye width and nose offset
-    float eye_mid_y = (left_eye.y + right_eye.y) / 2.0f;
-    float eye_width = std::abs(right_eye.y - left_eye.y);
-    
-    // Debug: Log the orientation calculation
-    static int debug_count = 0;
-    if (++debug_count % 60 == 1) {
-        std::cout << "👁️  Orientation check: nose_y=" << nose.y 
-                  << " eye_mid_y=" << eye_mid_y
-                  << " eye_width=" << eye_width;
-    }
-    
-    if (eye_width < 10.0f) {  // Pixel coords - minimum ~10 pixels for valid eye detection
-        if (debug_count % 60 == 1) std::cout << " → INVALID (eye_width too small)" << std::endl;
-        return true;
-    }
-    
-    // Calculate how far nose is from eye midpoint (normalized by eye width)
-    float nose_offset = std::abs(nose.y - eye_mid_y) / eye_width;
-    
-    if (debug_count % 60 == 1) {
-        std::cout << " offset=" << nose_offset 
-                  << " threshold=" << EXTREME_YAW_THRESHOLD
-                  << " → " << (nose_offset > EXTREME_YAW_THRESHOLD ? "EXTREME" : "OK") << std::endl;
-    }
-    
-    // If nose is more than threshold toward either eye, it's extreme
-    return nose_offset > EXTREME_YAW_THRESHOLD;
+bool SystemController::is_face_orientation_extreme(const std::vector<FrameBoxMetadata::Landmark>& /*landmarks*/) {
+    // DISABLED FOR TESTING - always allow face
+    return false;
 }
 
 SystemController::FaceValidationState SystemController::validate_face_position(FrameBox* frame) {
+    // SIMPLIFIED FOR TESTING - just check if face is detected
     if (!frame || !frame->metadata.face_detected) {
         return FaceValidationState::NO_FACE;
     }
     
-    // Safety check: ensure we have enough landmarks
     if (frame->metadata.landmarks.size() < 468) {
         return FaceValidationState::NO_FACE;
     }
     
-    // Estimate distance from face bounding box width
-    float face_width = static_cast<float>(frame->metadata.face_w);
-    float distance = estimate_face_distance(face_width);
-    motion_tracker_.estimated_distance_cm = distance;
-    
-    // Check distance bounds
-    if (distance < MIN_DISTANCE_CM) {
-        return FaceValidationState::TOO_CLOSE;
-    }
-    if (distance > MAX_DISTANCE_CM) {
-        return FaceValidationState::TOO_FAR;
-    }
-    
-    // Check orientation
-    if (is_face_orientation_extreme(frame->metadata.landmarks)) {
-        return FaceValidationState::EXTREME_ROTATION;
-    }
-    
+    // Always valid if face detected - no distance/orientation gates
     return FaceValidationState::VALID;
 }
 
@@ -1282,12 +1173,6 @@ float SystemController::calculate_circular_motion_progress(const cv::Point2f& no
     
     // Need at least 10 positions to start tracking
     if (motion_tracker_.nose_positions.size() < 10) {
-        // Debug: log when we're collecting initial positions
-        static int init_counter = 0;
-        if (++init_counter % 30 == 0) {
-            std::cout << "📊 Collecting initial positions: " 
-                      << motion_tracker_.nose_positions.size() << "/10" << std::endl;
-        }
         return motion_tracker_.progress;
     }
     
@@ -1326,14 +1211,18 @@ float SystemController::calculate_circular_motion_progress(const cv::Point2f& no
     while (delta > 3.14159f) delta -= 2.0f * 3.14159f;
     while (delta < -3.14159f) delta += 2.0f * 3.14159f;
     
-    // Check if user is actually moving (velocity threshold)
+    // Filter out noise: ignore very large jumps (face rotation/landmark shift)
     float velocity = std::abs(delta);
-    if (velocity < MOTION_PAUSE_THRESHOLD) {
-        // User stopped or moving too slowly - pause progress
+    if (velocity > 0.8f) {  // Jump > ~45 degrees in one frame = noise
         return motion_tracker_.progress;
     }
     
-    // Accumulate angle (only positive direction for spiral)
+    // Minimum movement threshold to count as progress
+    if (velocity < 0.01f) {
+        return motion_tracker_.progress;
+    }
+    
+    // Accumulate angular displacement (no boost, no assist - real movement only)
     motion_tracker_.cumulative_angle += std::abs(delta);
     motion_tracker_.last_angle = current_angle;
     
@@ -1359,24 +1248,31 @@ float SystemController::calculate_circular_motion_progress(const cv::Point2f& no
 }
 
 void SystemController::handle_processing() {
-    std::cout << "🔬 Starting Processing (single frame submit)..." << std::endl;
+    std::cout << "🔬 Starting Processing..." << std::endl;
     
-    std::cout << "📹 Switching camera to low power mode for processing..." << std::endl;
-    configure_camera_for_state(SystemState::IDLE);
+    // ============================================
+    // STEP 1: Retrieve recorded frames
+    // ============================================
+    serial_comm_->send_batch_progress(10);
     
     std::cout << "📊 Retrieving recorded frames from ring buffer..." << std::endl;
     std::vector<FrameBox*> recording = ring_buffer_->get_all_valid_frames();
     std::cout << "📊 Retrieved " << recording.size() << " frames for processing" << std::endl;
     
     if (recording.empty()) {
-        std::cout << "⚠ No recording data" << std::endl;
+        std::cerr << "⚠ No recording data" << std::endl;
         serial_comm_->send_error("No recording data");
         network_mgr_->send_message("{\"type\":\"error\", \"code\":\"no_recording_data\"}");
         ring_buffer_->clear();
         set_state(SystemState::ERROR);
         return;
     }
+    
+    serial_comm_->send_batch_progress(20);
 
+    // ============================================
+    // STEP 2: Find best frame with face
+    // ============================================
     FrameBox* best_frame = nullptr;
     for (FrameBox* frame : recording) {
         if (frame->metadata.face_detected &&
@@ -1388,7 +1284,12 @@ void SystemController::handle_processing() {
     if (!best_frame) {
         best_frame = recording.back();
     }
+    
+    serial_comm_->send_batch_progress(40);
 
+    // ============================================
+    // STEP 3: Encode image
+    // ============================================
     cv::Mat rgb_frame = best_frame->get_color_mat();
     if (rgb_frame.empty()) {
         std::cerr << "❌ Best frame is empty - cannot submit" << std::endl;
@@ -1397,10 +1298,12 @@ void SystemController::handle_processing() {
         set_state(SystemState::ERROR);
         return;
     }
-
+    
     std::vector<uchar> jpeg_buffer;
     std::vector<int> compression_params = {cv::IMWRITE_JPEG_QUALITY, 90};
     cv::imencode(".jpg", rgb_frame, jpeg_buffer, compression_params);
+    
+    serial_comm_->send_batch_progress(60);
     
     // Save captured frame for debugging
     std::string debug_path = "/home/mercleDev/mdai_logs/captured_face.jpg";
@@ -1410,8 +1313,17 @@ void SystemController::handle_processing() {
     std::vector<uint8_t> buffer_uint8(jpeg_buffer.begin(), jpeg_buffer.end());
     std::string base64_image = CryptoUtils::base64_encode(buffer_uint8);
     
-    std::cout << "📸 JPEG image size: " << jpeg_buffer.size() << " bytes" << std::endl;
-    std::cout << "📦 Base64 size: " << base64_image.size() << " bytes" << std::endl;
+    std::cout << "📸 JPEG size: " << jpeg_buffer.size() << " bytes, Base64: " << base64_image.size() << " bytes" << std::endl;
+    
+    // Clear ring buffer now that we have the image
+    ring_buffer_->clear();
+    
+    serial_comm_->send_batch_progress(80);
+    
+    // ============================================
+    // STEP 4: Send to API server
+    // ============================================
+    std::cout << "📤 Sending result to API server..." << std::endl;
     
     nlohmann::json api_payload;
     api_payload["type"] = "submit_result";
@@ -1421,42 +1333,50 @@ void SystemController::handle_processing() {
     api_payload["image"] = base64_image;
     api_payload["consecutive_passes"] = 1;
     api_payload["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
-    
+        
     std::string api_message = api_payload.dump();
-    std::cout << "📤 Sending result to server (" << api_message.size() << " bytes)..." << std::endl;
+    std::cout << "📤 Sending " << api_message.size() << " bytes to server..." << std::endl;
     
     result_ack_received_ = false;
     
     if (!network_mgr_->send_message(api_message)) {
         std::cerr << "❌ Failed to send result to server" << std::endl;
         serial_comm_->send_error("Failed to send result");
-        ring_buffer_->clear();
         set_state(SystemState::ERROR);
         return;
     }
     
-    auto start_time = std::chrono::steady_clock::now();
-    const int timeout_ms = 3000;
+    // Wait for server ACK (up to 10 seconds)
+    auto send_time = std::chrono::steady_clock::now();
+    const int ack_timeout_ms = 10000;
     
     while (!result_ack_received_) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start_time
+            std::chrono::steady_clock::now() - send_time
         ).count();
         
-        if (elapsed >= timeout_ms) {
-            std::cerr << "⚠️  Server ACK timeout after 3 seconds" << std::endl;
+        if (elapsed >= ack_timeout_ms) {
+            std::cerr << "⚠️  Server ACK timeout after 10 seconds" << std::endl;
             break;
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     
     if (result_ack_received_) {
-        std::cout << "✅ Server ACK received" << std::endl;
+        std::cout << "✅ Server ACK received!" << std::endl;
     }
     
-    ring_buffer_->clear(); 
-    set_state(SystemState::SUCCESS);
+    serial_comm_->send_batch_progress(100);
+    
+    // ============================================
+    // STEP 5: Go to SUCCESS
+    // ============================================
+    if (current_state_ == SystemState::PROCESSING) {
+        set_state(SystemState::SUCCESS);
+    } else {
+        std::cout << "⚠️ State changed during processing - not overriding to SUCCESS" << std::endl;
+    }
 }
 
 void SystemController::on_websocket_message(const std::string& message) {
@@ -1481,19 +1401,19 @@ void SystemController::on_websocket_message(const std::string& message) {
             std::cerr << "❌ WebSocket connection failed after " << retries << " retries" << std::endl;
             serial_comm_->send_error("Connection failed");
             serial_comm_->send_state(12);  // Screen 12: Error
-            
+        
             // Clean up session
             session_id_.clear();
             platform_id_.clear();
             
             // Return to IDLE after 3 seconds
-            state_timer_start_ = std::chrono::steady_clock::now();
-            state_timer_target_ = SystemState::IDLE;
-            state_timer_duration_ms_ = 3000;
-            state_timer_active_ = true;
-            return;
-        }
-        
+        state_timer_start_ = std::chrono::steady_clock::now();
+        state_timer_target_ = SystemState::IDLE;
+        state_timer_duration_ms_ = 3000;
+        state_timer_active_ = true;
+        return;
+    }
+    
         // Handle WebSocket disconnection during session
         if (msg_type == "disconnected") {
             std::cerr << "⚠️  WebSocket disconnected unexpectedly" << std::endl;
@@ -1578,28 +1498,8 @@ void SystemController::on_websocket_message(const std::string& message) {
                         std::cout << "▶️  Processing start verification command" << std::endl;
                         
                         if (current_state_ == SystemState::READY) {
-                            if (test_mode_) {
-                                // 🧪 TEST MODE: Skip verification, show success immediately
-                                std::cout << "🧪 TEST MODE: Bypassing verification flow → SUCCESS" << std::endl;
-                                serial_comm_->send_state(11); // Screen 11: Success Animation
-                                
-                                // Send success message to mobile
-                                nlohmann::json success_msg = {
-                                    {"type", "to_mobile"},
-                                    {"data", {
-                                        {"type", "result"},
-                                        {"status", "success"},
-                                        {"message", "TEST MODE: Verification bypassed"}
-                                    }}
-                                };
-                                network_mgr_->send_message(success_msg.dump());
-                                
-                                set_state(SystemState::SUCCESS);
-                            } else {
-                                // REAL MODE: Start countdown, then verification
-                                std::cout << "🔢 Starting COUNTDOWN phase" << std::endl;
-                                set_state(SystemState::COUNTDOWN);
-                            }
+                            std::cout << "🔢 Starting COUNTDOWN phase" << std::endl;
+                            set_state(SystemState::COUNTDOWN);
                         } else {
                             std::cerr << "⚠️  Received start command but not in READY state (current: " 
                                       << static_cast<int>(current_state_.load()) << ")" << std::endl;
@@ -1616,28 +1516,8 @@ void SystemController::on_websocket_message(const std::string& message) {
                 std::cout << "▶️  Received start command from mobile" << std::endl;
                 
                 if (current_state_ == SystemState::READY) {
-                    if (test_mode_) {
-                        // 🧪 TEST MODE: Skip verification, show success immediately
-                        std::cout << "🧪 TEST MODE: Bypassing verification flow → SUCCESS" << std::endl;
-                        serial_comm_->send_state(11); // Screen 11: Success Animation
-                        
-                        // Send success message to mobile
-                        nlohmann::json success_msg = {
-                            {"type", "to_mobile"},
-                            {"data", {
-                                {"type", "result"},
-                                {"status", "success"},
-                                {"message", "TEST MODE: Verification bypassed"}
-                            }}
-                        };
-                        network_mgr_->send_message(success_msg.dump());
-                        
-                        set_state(SystemState::SUCCESS);
-                    } else {
-                        // REAL MODE: Start countdown, then verification
-                        std::cout << "🔢 Starting COUNTDOWN phase" << std::endl;
-                        set_state(SystemState::COUNTDOWN);
-                    }
+                    std::cout << "🔢 Starting COUNTDOWN phase" << std::endl;
+                    set_state(SystemState::COUNTDOWN);
                 } else {
                     std::cerr << "⚠️  Received start command but not in READY state (current: " 
                               << static_cast<int>(current_state_.load()) << ")" << std::endl;
@@ -1707,6 +1587,34 @@ void SystemController::on_websocket_message(const std::string& message) {
             std::string error_msg = msg_json.value("message", "Unknown error");
             std::cerr << "⚠ Server Error: " << error_msg << std::endl;
             serial_comm_->send_error(error_msg);
+        }
+        else if (msg_type == "ping") {
+            // Server keepalive ping - respond with pong
+            nlohmann::json pong_msg = {{"type", "pong"}};
+            network_mgr_->send_message(pong_msg.dump());
+        }
+        else if (msg_type == "session_closed") {
+            // Server is closing the session (e.g., expired, server shutdown)
+            std::string reason = msg_json.value("reason", "Session closed");
+            std::cout << "⚠️ Session closed by server: " << reason << std::endl;
+            serial_comm_->send_error(reason);
+            set_state(SystemState::ERROR);
+        }
+        else if (msg_type == "delete") {
+            // Delete/cleanup request from mobile via server
+            std::cout << "🗑️ Delete request received from mobile" << std::endl;
+            
+            // Go to LOGOUT if we're in SUCCESS state (waiting for delete)
+            // Also handle if we're in other active states
+            if (current_state_ == SystemState::SUCCESS) {
+                std::cout << "📱 SUCCESS → LOGOUT (delete received)" << std::endl;
+                set_state(SystemState::LOGOUT);
+            }
+            else if (current_state_ != SystemState::LOGOUT &&
+                     current_state_ != SystemState::IDLE) {
+                std::cout << "📱 Active state → LOGOUT (delete received)" << std::endl;
+                set_state(SystemState::LOGOUT);
+            }
         }
         else {
             std::cout << "ℹ️ Unknown message type: " << msg_type << std::endl;
@@ -2130,10 +2038,10 @@ void SystemController::handle_hardware_error(const std::string& component, const
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     
                     if (producer_->is_running()) {
-                        std::cout << "✅ Camera recovered after " << retry_count << " attempt(s)" << std::endl;
-                        recovered = true;
+                    std::cout << "✅ Camera recovered after " << retry_count << " attempt(s)" << std::endl;
+                    recovered = true;
                         current_camera_mode_.store(CameraMode::RGB_ONLY);
-                        break;
+                    break;
                     } else {
                         std::cerr << "⚠️  Camera started but stopped immediately" << std::endl;
                         producer_.reset();

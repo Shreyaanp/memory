@@ -51,7 +51,6 @@ private:
     std::unique_ptr<FaceDetector> face_detector_;
     std::unique_ptr<SerialCommunicator> serial_comm_;
     std::unique_ptr<NetworkManager> network_mgr_;
-    std::unique_ptr<AntiSpoofingPipeline> anti_spoofing_;
 
     // State Management
     std::atomic<SystemState> current_state_{SystemState::BOOT};
@@ -81,13 +80,6 @@ private:
     
     // Middleware Config
     std::string middleware_host_ = "mdai.mercle.ai"; // EC2 instance
-    
-    // Test Mode Flag (set to false for real verification)
-    bool test_mode_ = false;  // Set to false to enable full verification flow (including countdown)
-    
-    // UI Test Mode - For testing Screen 0 (nose tracking UI)
-    // When true: Skips all screens except Screen 0, Screen 11 (success), Screen 12 (error)
-    bool ui_test_mode_ = false;  // PRODUCTION MODE
     
     // Result ACK tracking
     std::atomic<bool> result_ack_received_{false};
@@ -129,10 +121,9 @@ private:
     // =========================================================================
     static constexpr float REFERENCE_FACE_WIDTH = 100.0f;  // pixels at 40cm for 848x480 resolution
     static constexpr float REFERENCE_DISTANCE = 40.0f;     // cm (reference measurement distance)
-    static constexpr float MIN_DISTANCE_CM = 12.0f;        // Too close threshold
+    static constexpr float MIN_DISTANCE_CM = 1.0f;        // Too close threshold
     static constexpr float MAX_DISTANCE_CM = 60.0f;        // Too far threshold
-    // Note: With camera rotated 90° CCW, the landmark coordinates swap X/Y
-    // So this threshold may need adjustment. For now, keep high to avoid false extremes.
+    // Note: Frame is rotated 90° CW at source (Producer) for portrait orientation.
     static constexpr float EXTREME_YAW_THRESHOLD = 0.90f;  // 90% toward eye = extreme rotation
     static constexpr float SPIRAL_COMPLETE_ANGLE = 2.0f * 3.14159f;  // 360 degrees in radians
     static constexpr float MOTION_PAUSE_THRESHOLD = 0.005f; // Min angular velocity to count

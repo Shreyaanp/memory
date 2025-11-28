@@ -1,41 +1,36 @@
 [Unit]
 Description=MDai Liveness Detection System
-Documentation=https://github.com/yourusername/mdai
-After=network-online.target
-Wants=network-online.target
+After=local-fs.target
+After=NetworkManager.service
+After=wifi-always-on.service
+After=tailscaled.service
+After=ssh.service
+
+Wants=wifi-always-on.service
+Wants=tailscaled.service
+
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
-Type=simple
-User=root
-Group=root
-WorkingDirectory=/home/mercleDev/codebase
-ExecStart=/home/mercleDev/codebase/build/mdai_system
+Type=forking
+User=mercleDev
+Group=mercleDev
+
+# Start EXACTLY like rebuild-and-restart.sh does
+ExecStartPre=-/usr/bin/pkill -9 -x mdai_system
+ExecStartPre=/bin/sleep 2
+
+ExecStart=/bin/bash -c 'cd /home/mercleDev/codebase && nohup ./build/mdai_system >> /home/mercleDev/mdai_logs/rdk.log 2>&1 &'
+
+# Give it time to fork
+ExecStartPost=/bin/sleep 3
+
 Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
+RestartSec=5
 
-# Peripheral requirements
-Environment="DISPLAY=:0"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-# Wait for USB devices
-ExecStartPre=/bin/sleep 5
-
-# Ensure permissions for all ttyACM devices
-ExecStartPre=/bin/bash -c 'for dev in /dev/ttyACM*; do [ -e "$dev" ] && chmod 666 "$dev"; done || true'
-
-# Resource limits
-LimitNOFILE=65536
-LimitNPROC=4096
-
-# Watchdog (restart if unresponsive)
-WatchdogSec=60
-
-# Kill everything on stop
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=30
+KillMode=process
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target

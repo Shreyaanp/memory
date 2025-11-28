@@ -69,6 +69,7 @@ struct FrameBoxMetadata {
     // Face landmarks (468 points from MediaPipe Face Mesh)
     // Each landmark is (x, y, z) where x, y are pixel coordinates
     // and z is relative depth
+    // NOTE: Landmarks are stored in ROTATED space (portrait orientation)
     struct Landmark {
         float x, y, z;
         float visibility;  // MediaPipe visibility score (0-1, >0.5 = visible)
@@ -77,6 +78,11 @@ struct FrameBoxMetadata {
             : x(x_), y(y_), z(z_), visibility(v), presence(p) {}
     };
     std::vector<Landmark> landmarks;
+    
+    // Frame dimensions (for landmark normalization)
+    // Frame is rotated 90° CW at source (Producer) - portrait 480x848
+    int rotated_width = 480;   // Default for 848x480 → 480x848
+    int rotated_height = 848;
     
     // Anti-Spoofing Results
     struct AntiSpoofingResults {

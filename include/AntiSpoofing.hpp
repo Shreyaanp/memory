@@ -184,7 +184,6 @@ private:
     // Core detection algorithms (now ROI-driven)
     float analyze_depth_geometry(const FrameBox* frame, const FaceROI& face);
     float analyze_ir_texture(const FrameBox* frame, const FaceROI& face);  // Now includes stereo consistency
-    float analyze_temporal_consistency(const FaceROI& face);
     float analyze_cross_modal_consistency(const FrameBox* frame, const FaceROI& face);
     
     // rPPG pulse detection (mask detection) - ROBUST VERSION
@@ -192,13 +191,11 @@ private:
     
     // Robust rPPG helper methods
     bool extract_rppg_signal_chrom(std::vector<float>& chrom_signal, float& estimated_fps);
-    void apply_bandpass_filter(std::vector<float>& signal, float fps, float low_hz, float high_hz);
     float calculate_snr_at_frequency(const std::vector<float>& signal, float fps, float target_hz);
     bool detect_pulse_fft(const std::vector<float>& signal, float fps, float& detected_bpm, float& confidence);
     float calculate_motion_compensation_weight(const RPPGSample& sample);
     
     // Temporal liveness checks
-    bool detect_blink(const std::vector<cv::Point2f>& landmarks);
     float calculate_micro_motion();
     float analyze_depth_breathing(const FrameBox* frame, const FaceROI& face);
     
@@ -207,7 +204,6 @@ private:
     
     // Occlusion and obstacle detection
     float analyze_occlusion(const FrameBox* frame, const FaceROI& face);
-    bool check_eyes_visible(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
     
     // Attack type detection
     std::string detect_attack_type(const FrameBox* frame, const FaceROI& face);
@@ -215,9 +211,6 @@ private:
     // Helper methods
     std::string generate_rejection_reason(const FrameBox* frame);
     float calculate_confidence(const FrameBox* frame, const FaceROI& face);
-    
-    // IMPROVED: Real blink detection using Eye Aspect Ratio
-    float detect_blink_ear(const std::vector<FrameBoxMetadata::Landmark>& landmarks);
     
     // IMPROVED: Comprehensive facial landmark analysis
     float analyze_facial_landmarks(const FrameBox* frame, const FaceROI& face);
@@ -329,109 +322,6 @@ private:
     float analyze_material_consistency(const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& face_roi);
     float analyze_material_correlation(const cv::Mat& depth, const cv::Mat& ir_left, const cv::Mat& ir_right, const cv::Rect& face_roi);
     float analyze_material_temporal_consistency(const std::vector<FrameBox*>& recent_frames, const FrameBox* current_frame, const FaceROI& face);
-};
-
-/**
- * @brief Combined Quality Gate + Anti-Spoofing Pipeline
- * 
- * Orchestrates the complete validation pipeline
- */
-class AntiSpoofingPipeline {
-public:
-    AntiSpoofingPipeline(const AntiSpoofingConfig& config);
-    
-    /**
-     * @brief Process complete pipeline (quality gates + anti-spoofing)
-     * @param frame Input frame to analyze
-     * @return true if frame passes all checks, false otherwise
-     */
-    bool process_frame(FrameBox* frame);
-    
-    /**
-     * @brief Process with temporal context
-     * @param frame Current frame
-     * @param recent_frames Recent frames for temporal analysis
-     * @return true if frame passes all checks
-     */
-    bool process_frame_with_temporal_context(FrameBox* frame, const std::vector<FrameBox*>& recent_frames);
-    
-    /**
-     * @brief Get pipeline statistics
-     */
-    struct PipelineStats {
-        uint64_t total_frames_processed = 0;
-        uint64_t quality_gate_passed = 0;
-        uint64_t quality_gate_failed = 0;
-        uint64_t anti_spoofing_passed = 0;
-        uint64_t anti_spoofing_failed = 0;
-        uint64_t overall_passed = 0;
-        uint64_t overall_failed = 0;
-        
-        float quality_gate_pass_rate = 0.0f;
-        float anti_spoofing_pass_rate = 0.0f;
-        float overall_pass_rate = 0.0f;
-    };
-    
-    PipelineStats get_stats() const { return stats_; }
-    void reset_stats() { stats_ = PipelineStats{}; }
-
-private:
-    AntiSpoofingConfig config_;
-    std::unique_ptr<QualityGate> quality_gate_;
-    std::unique_ptr<AntiSpoofingDetector> anti_spoofing_detector_;
-    PipelineStats stats_;
-    
-    // Statistics tracking
-    void update_stats(bool quality_passed, bool anti_spoofing_passed, bool overall_passed);
-};
-
-/**
- * @brief Adaptive threshold manager (placeholder for future implementation)
- * 
- * Will learn optimal thresholds based on environmental conditions and user behavior
- */
-class AdaptiveThresholdManager {
-public:
-    AdaptiveThresholdManager();
-    
-    /**
-     * @brief Get current adaptive thresholds
-     * @param base_config Base configuration
-     * @param environmental_factors Current environmental conditions
-     * @return Adapted configuration
-     */
-    AntiSpoofingConfig get_adaptive_config(
-        const AntiSpoofingConfig& base_config,
-        const std::map<std::string, float>& environmental_factors
-    );
-    
-    /**
-     * @brief Learn from processing results
-     * @param frame Processed frame
-     * @param success Whether processing was successful
-     */
-    void learn_from_result(const FrameBox* frame, bool success);
-    
-    /**
-     * @brief Get learning statistics
-     */
-    struct LearningStats {
-        uint64_t total_samples = 0;
-        uint64_t successful_samples = 0;
-        float success_rate = 0.0f;
-        std::map<std::string, float> environmental_correlations;
-    };
-    
-    LearningStats get_learning_stats() const { return learning_stats_; }
-
-private:
-    LearningStats learning_stats_;
-    
-    // Future implementation will include:
-    // - Machine learning models for threshold optimization
-    // - Environmental sensor integration
-    // - User behavior pattern recognition
-    // - Real-time threshold adjustment
 };
 
 } // namespace mdai

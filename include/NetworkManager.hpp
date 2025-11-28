@@ -29,6 +29,7 @@ public:
     // WebSocket Client (WSS)
     bool connect_to_middleware(const std::string& host, int port, const std::string& path, const std::string& device_id);
     void disconnect();
+    void stop_reconnect();  // Stop reconnection loop without blocking (use after delete/logout)
     bool send_message(const std::string& message);
     void set_message_callback(MsgCallback cb);
     void set_connect_callback(ConnectCallback cb);  // Called on (re)connect

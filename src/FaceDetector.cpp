@@ -52,14 +52,10 @@ public:
             return false;
         }
         
-        // Rotate image for MediaPipe (camera is mounted 90° CCW, so rotate 90° CW)
-        // MediaPipe expects upright faces for reliable detection
-        cv::Mat rotated;
-        cv::rotate(color_mat, rotated, cv::ROTATE_90_CLOCKWISE);
-        
-        // Detect face mesh on rotated image
+        // Frame is already rotated at source (Producer) - portrait 480x848
+        // Detect face mesh directly
         FaceMeshResult face_mesh;
-        bool success = detector_->Detect(rotated, face_mesh);
+        bool success = detector_->Detect(color_mat, face_mesh);
         
         // Reset face detection metadata
         frame->metadata.face_detected = false;
@@ -88,28 +84,27 @@ public:
         frame->metadata.face_detected = true;
         frame->metadata.face_detection_confidence = face_mesh.confidence;
         
-        // Transform coordinates back from rotated space to original frame
-        // Rotated image: 480x848 (original 848x480 rotated 90° CW)
-        // Both landmarks and bbox are in PIXEL coordinates of rotated image
-        // Inverse transform (90° CCW): (rx, ry) -> (ry, rotated_width - rx)
-        int rotated_width = rotated.cols;   // 480
+        // Frame is already in portrait orientation (480x848)
+        // Direct mapping to display (466x466)
+        int frame_width = color_mat.cols;
+        int frame_height = color_mat.rows;
         
-        // Transform bbox (pixel coords in rotated space 480x848)
-        // rotated (x, y, w, h) -> original (y, rotated_width - x - w, h, w)
-        frame->metadata.face_x = face_mesh.bbox.y;                              // orig_x = rotated_y
-        frame->metadata.face_y = rotated_width - face_mesh.bbox.x - face_mesh.bbox.width;  // orig_y
-        frame->metadata.face_w = face_mesh.bbox.height;                         // orig_w = rotated_h
-        frame->metadata.face_h = face_mesh.bbox.width;                          // orig_h = rotated_w
+        // Store bbox in frame space
+        frame->metadata.face_x = face_mesh.bbox.x;
+        frame->metadata.face_y = face_mesh.bbox.y;
+        frame->metadata.face_w = face_mesh.bbox.width;
+        frame->metadata.face_h = face_mesh.bbox.height;
         
-        // Store all 468 landmarks with coordinate transform
-        // Landmarks are in PIXEL coords of rotated image (480x848)
-        // Transform: orig_x = ry, orig_y = rotated_width - rx
+        // Store frame dimensions for proper normalization
+        frame->metadata.rotated_width = frame_width;
+        frame->metadata.rotated_height = frame_height;
+        
+        // Store all 468 landmarks in frame space (pixel coords)
         frame->metadata.landmarks.reserve(face_mesh.landmarks.size());
         for (const auto& lm : face_mesh.landmarks) {
-            float orig_x = lm.y;                        // rotated_y -> orig_x
-            float orig_y = rotated_width - lm.x;        // rotated_width - rotated_x -> orig_y
-            frame->metadata.landmarks.emplace_back(orig_x, orig_y, lm.z);
+            frame->metadata.landmarks.emplace_back(lm.x, lm.y, lm.z);
         }
+        
         
         return true;
     }

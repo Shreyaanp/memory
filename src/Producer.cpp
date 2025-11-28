@@ -1,6 +1,7 @@
 #include "Producer.hpp"
 #include <iostream>
 #include <chrono>
+#include <opencv2/opencv.hpp>
 
 namespace mdai {
 
@@ -32,156 +33,63 @@ bool Producer::start() {
             return false;
         }
         
-        // Initialize camera with proper stabilization
-        camera_initializer_ = std::make_unique<CameraInitializer>(rs_config_, config_.device_serial);
+        // CRITICAL: Create fresh pipeline - cannot reuse after stop()
+        pipe_ = rs2::pipeline();
         
-        // Set up callbacks for initialization progress
-        camera_initializer_->set_status_callback([this](const std::string& status) {
-            report_status(status);
-        });
+        // Determine if we should use polling mode (more reliable for multi-stream)
+        bool use_polling = config_.enable_depth || config_.enable_ir;
         
-        camera_initializer_->set_progress_callback([this](int progress) {
-            (void)progress; // Suppress unused parameter warning
-            // Could add progress reporting here if needed
-        });
-        
-        // Perform camera initialization with stabilization
-        if (config_.quick_init) {
-            report_status("Starting QUICK camera initialization (mode switch)...");
-            camera_initializer_->set_quick_mode(true);
-        } else {
-            report_status("Starting camera initialization with stabilization...");
-        }
-        auto init_result = camera_initializer_->initialize(30000); // 30 second timeout
-        
-        if (init_result != CameraInitializer::Result::SUCCESS) {
-            std::string error_msg;
-            switch (init_result) {
-                case CameraInitializer::Result::CONNECTION_FAILED:
-                    error_msg = "Camera connection failed";
-                    break;
-                case CameraInitializer::Result::SENSOR_ERROR:
-                    error_msg = "Camera sensor error during initialization";
-                    break;
-                case CameraInitializer::Result::TIMEOUT:
-                    error_msg = "Camera initialization timeout";
-                    break;
-                case CameraInitializer::Result::CANCELLED:
-                    error_msg = "Camera initialization cancelled";
-                    break;
-                default:
-                    error_msg = "Unknown camera initialization error";
-                    break;
-            }
-            report_error(error_msg);
-            return false;
-        }
-        
-        // Get the initialized profile and pipeline
-        profile_ = camera_initializer_->get_profile();
-        pipe_ = std::move(camera_initializer_->get_pipeline());
-        
-        // Try IMU-based orientation detection first (D435I has IMU)
-        // This runs BEFORE main pipeline starts to avoid conflicts
-        CameraOrientation imu_orientation = detect_camera_orientation();
-        
-        if (imu_orientation != CameraOrientation::UNKNOWN) {
-            // IMU detected orientation successfully
-            detected_orientation_ = imu_orientation;
-            has_imu_ = true;
-            report_status("📐 IMU orientation detected: " + orientation_to_string(detected_orientation_));
-        } else {
-            // Fall back to config value
-            switch (config_.orientation) {
-                case 0: detected_orientation_ = CameraOrientation::NORMAL; break;
-                case 1: detected_orientation_ = CameraOrientation::ROTATED_90_CW; break;
-                case 2: detected_orientation_ = CameraOrientation::ROTATED_90_CCW; break;
-                case 3: detected_orientation_ = CameraOrientation::UPSIDE_DOWN; break;
-                default: detected_orientation_ = CameraOrientation::ROTATED_90_CCW; break;
-            }
-            has_imu_ = false;
-            report_status("📐 Using config orientation (no IMU): " + orientation_to_string(detected_orientation_));
-        }
-        
-        // Now start the pipeline with callback
         report_status("Starting camera pipeline...");
-        auto callback = [this](const rs2::frame& frame) {
-            // Debug: Log EVERY callback invocation to diagnose frame delivery issue
-            static int callback_count = 0;
-            static auto last_log_time = std::chrono::steady_clock::now();
-            callback_count++;
+        
+        if (use_polling) {
+            // POLLING MODE: More reliable for multi-stream (Depth + Color + IR)
+            std::cout << "📹 Using POLLING mode for multi-stream capture" << std::endl;
+            profile_ = pipe_.start(rs_config_);  // No callback - polling mode
+            use_polling_mode_ = true;
+        } else {
+            // CALLBACK MODE: Single stream (RGB-only) - works reliably
+            std::cout << "📹 Using CALLBACK mode for single-stream capture" << std::endl;
             
-            // Log every second regardless of callback count
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
-            if (elapsed_ms > 1000) {
-                std::cout << "📹 [Producer] Callback alive - total=" << callback_count << " callbacks" << std::endl;
-                last_log_time = now;
-            }
-            
-            try {
-                rs2::frameset fs = frame.as<rs2::frameset>();
-                if (!fs) {
-                    // Not a frameset - skip (this happens for single stream modes)
-                    return;
-                }
+            auto callback = [this](const rs2::frame& frame) {
+                static thread_local int callback_count = 0;
+                static thread_local auto last_log_time = std::chrono::steady_clock::now();
+                callback_count++;
                 
-                {
-                    // Apply post-processing filters for better data quality
+                (void)callback_count;  // Suppress unused warning
+                
+                try {
+                    rs2::frameset fs = frame.as<rs2::frameset>();
+                    if (!fs) return;
+                    
                     rs2::frameset processed = fs;
-                    
-                    // Apply spatial filter for smooth depth surfaces
-                    if (config_.enable_spatial_filter) {
-                        processed = spatial_filter_.process(processed);
-                    }
-                    
-                    // Apply temporal filter for consistent depth over time
-                    if (config_.enable_temporal_filter) {
-                        processed = temporal_filter_.process(processed);
-                    }
-                    
-                    // Apply hole filling for complete depth data
-                    if (config_.enable_hole_filling) {
-                        processed = hole_filling_filter_.process(processed);
-                    }
-                    
-                    // Align/process frames if configured (ensure depth/color share same space)
                     if (config_.align_to_color && aligner_) {
                         processed = aligner_->process(processed);
                     }
                     
-                    // Process frameset and extract raw data (no rs2::frame references!)
                     FrameBox framebox = process_frameset(processed);
                     
-                    // Update frame health tracking BEFORE ring buffer write
-                    // This ensures we know frames are arriving even if buffer is full/disabled
                     {
                         std::lock_guard<std::mutex> lock(frame_time_mutex_);
                         last_frame_time_ = std::chrono::steady_clock::now();
                     }
                     first_frame_received_.store(true);
                     
-                    // Write to ring buffer (non-blocking)
-                    bool write_success = ring_buffer_->write(std::move(framebox));
-                    if (write_success) {
+                    if (ring_buffer_->write(std::move(framebox))) {
                         total_frames_captured_.fetch_add(1);
                         frames_since_last_calc_++;
                     }
-                    
-                    // Log write attempts
-                    static int write_log_count = 0;
-                    if (++write_log_count % 30 == 1) {
-                        std::cout << "📝 [Producer->RingBuffer] write " << (write_success ? "SUCCESS" : "FAILED") 
-                                  << " (total_captured=" << total_frames_captured_.load() << ")" << std::endl;
-                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "[Callback Error] " << e.what() << std::endl;
                 }
-            } catch (const std::exception& e) {
-                // Don't let exceptions kill the callback
-                std::cerr << "[Callback Error] " << e.what() << std::endl;
-            }
-        };
+            };
+            
+            profile_ = pipe_.start(rs_config_, callback);
+            use_polling_mode_ = false;
+        }
         
-        profile_ = pipe_.start(rs_config_, callback);
+        // Log active streams
+        auto streams = profile_.get_streams();
+        std::cout << "📹 Pipeline started with " << streams.size() << " stream(s)" << std::endl;
         
         configure_sensor_options();
         query_camera_parameters();
@@ -191,7 +99,25 @@ bool Producer::start() {
         
         capture_thread_ = std::make_unique<std::thread>(&Producer::capture_loop, this);
         
-        report_status("Producer started successfully");
+        // Wait for first frame to confirm camera is actually working
+        report_status("Waiting for first frame...");
+        auto start_wait = std::chrono::steady_clock::now();
+        const int FIRST_FRAME_TIMEOUT_MS = 5000;
+        
+        while (!first_frame_received_.load()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_wait
+            ).count();
+            
+            if (elapsed > FIRST_FRAME_TIMEOUT_MS) {
+                report_error("Camera timeout - no frames received in 5 seconds");
+                stop();
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        
+        report_status("Camera ready - frames flowing");
         return true;
         
     } catch (const rs2::error& e) {
@@ -232,6 +158,13 @@ void Producer::stop() {
     
     // Clear the camera initializer
     camera_initializer_.reset();
+    
+    // Reset state for clean restart
+    first_frame_received_.store(false);
+    rs_config_ = rs2::config();  // Fresh config object to avoid duplicate stream registration
+    frames_since_last_calc_ = 0;
+    last_fps_calc_time_ = std::chrono::steady_clock::now();
+    current_fps_.store(0.0f);
     
     report_status("Producer stopped");
 }
@@ -414,18 +347,22 @@ void Producer::configure_sensor_options() {
             }
         }
         
-        // Configure color sensor
+        // Configure color sensor with full auto settings
         auto sensors = device.query_sensors();
         for (auto& sensor : sensors) {
-            if (sensor.supports(RS2_OPTION_EXPOSURE)) {
-                if (config_.auto_exposure) {
-                    if (sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE)) {
-                        sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f);
-                    }
-                } else {
-                    sensor.set_option(RS2_OPTION_EXPOSURE, config_.manual_exposure);
+            // Auto exposure
+            if (config_.auto_exposure && sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE)) {
+                sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f);
+            } else if (!config_.auto_exposure && sensor.supports(RS2_OPTION_EXPOSURE)) {
+                sensor.set_option(RS2_OPTION_EXPOSURE, config_.manual_exposure);
+                if (sensor.supports(RS2_OPTION_GAIN)) {
                     sensor.set_option(RS2_OPTION_GAIN, config_.manual_gain);
                 }
+            }
+            
+            // Auto white balance (always enable for consistent color)
+            if (sensor.supports(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE)) {
+                sensor.set_option(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, 1.0f);
             }
         }
         
@@ -495,47 +432,66 @@ void Producer::query_camera_parameters() {
 }
 
 void Producer::capture_loop() {
-    // With callback mode, frames are delivered automatically
-    // This thread updates FPS and monitors camera health via frame timing only
-    // NOTE: Do NOT create rs2::context() here - it conflicts with running pipeline!
-    report_status("Capture loop started (callback mode)");
+    report_status("Capture loop started (" + std::string(use_polling_mode_ ? "polling" : "callback") + " mode)");
     
-    const int FRAME_TIMEOUT_MS = 5000;  // 5 seconds without frames = error
-    const int HEALTH_CHECK_INTERVAL = 20;  // Check every 2 seconds (20 * 100ms)
-    int health_check_counter = 0;
-    bool error_reported = false;
+    int poll_frame_count = 0;
     
     while (running_.load()) {
-        // Update FPS periodically
-        update_fps();
-        
-        // Check camera health periodically (frame timing only - safe)
-        if (++health_check_counter >= HEALTH_CHECK_INTERVAL) {
-            health_check_counter = 0;
-            
-            // Only check if we've received at least one frame
-            if (first_frame_received_.load()) {
-                int64_t ms_since_last = get_ms_since_last_frame();
-                
-                if (ms_since_last > FRAME_TIMEOUT_MS) {
-                    // Camera has stopped sending frames
-                    if (!error_reported) {
-                        std::cerr << "⚠️  Camera frame timeout! No frames for " << ms_since_last << "ms" << std::endl;
-                        camera_connected_.store(false);
-                        report_error("Camera disconnected - no frames for " + 
-                                     std::to_string(ms_since_last / 1000) + "s");
-                        error_reported = true;
+        // POLLING MODE: Actively fetch frames
+        if (use_polling_mode_) {
+            try {
+                rs2::frameset frames;
+                if (pipe_.poll_for_frames(&frames)) {
+                    poll_frame_count++;
+                    
+                    if (poll_frame_count <= 5) {
+                        std::cout << "📥 [POLL #" << poll_frame_count << "] Got frameset with " 
+                                  << frames.size() << " frames" << std::endl;
+                    } else if (poll_frame_count % 30 == 0) {
+                        std::cout << "📥 [POLL] Total polled: " << poll_frame_count << " framesets" << std::endl;
                     }
-                } else if (error_reported && ms_since_last < FRAME_TIMEOUT_MS) {
-                    // Frames started arriving again
-                    std::cout << "✅ Camera recovered - frames arriving again" << std::endl;
-                    camera_connected_.store(true);
-                    report_status("Camera recovered");
-                    error_reported = false;
+                    
+                    // Process the frameset
+                    rs2::frameset processed = frames;
+                    
+                    if (config_.enable_spatial_filter) {
+                        processed = spatial_filter_.process(processed);
+                    }
+                    if (config_.enable_temporal_filter) {
+                        processed = temporal_filter_.process(processed);
+                    }
+                    if (config_.enable_hole_filling) {
+                        processed = hole_filling_filter_.process(processed);
+                    }
+                    if (config_.align_to_color && aligner_) {
+                        processed = aligner_->process(processed);
+                    }
+                    
+                    FrameBox framebox = process_frameset(processed);
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(frame_time_mutex_);
+                        last_frame_time_ = std::chrono::steady_clock::now();
+                    }
+                    first_frame_received_.store(true);
+                    
+                    bool write_success = ring_buffer_->write(std::move(framebox));
+                    if (write_success) {
+                        total_frames_captured_.fetch_add(1);
+                        frames_since_last_calc_++;
+                    }
                 }
+            } catch (const std::exception& e) {
+                std::cerr << "[Poll Error] " << e.what() << std::endl;
             }
-            // Removed rs2::context() query - it conflicts with running pipeline!
+            
+            // Small sleep to not spin too fast
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
         }
+        
+        // CALLBACK MODE: Just monitor health
+        update_fps();
         
         // Sleep to avoid busy-waiting
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -567,14 +523,27 @@ FrameBox Producer::process_frameset(rs2::frameset& frames) {
     }
     
     if (color_frame) {
-        // Copy color data
-        fb.color_width = color_frame.get_width();
-        fb.color_height = color_frame.get_height();
-        size_t color_size = fb.color_width * fb.color_height * 3; // BGR8 = 3 bytes per pixel
-        fb.color_data.resize(color_size);
+        // Get raw frame dimensions
+        int raw_width = color_frame.get_width();
+        int raw_height = color_frame.get_height();
         
-        const uint8_t* color_data = reinterpret_cast<const uint8_t*>(color_frame.get_data());
-        std::copy(color_data, color_data + color_size, fb.color_data.begin());
+        // Create cv::Mat from raw frame data (no copy, just wraps pointer)
+        cv::Mat raw_mat(raw_height, raw_width, CV_8UC3, 
+                        const_cast<void*>(color_frame.get_data()));
+        
+        // Rotate 90° clockwise for portrait orientation
+        // Camera is mounted sideways (USB ports to right)
+        cv::Mat rotated;
+        cv::rotate(raw_mat, rotated, cv::ROTATE_90_CLOCKWISE);
+        
+        // Store rotated dimensions (848x480 -> 480x848)
+        fb.color_width = rotated.cols;
+        fb.color_height = rotated.rows;
+        
+        // Copy rotated data to FrameBox
+        size_t color_size = fb.color_width * fb.color_height * 3;
+        fb.color_data.resize(color_size);
+        std::memcpy(fb.color_data.data(), rotated.data, color_size);
         
         fb.time_color = color_frame.get_timestamp();
     }
@@ -582,13 +551,6 @@ FrameBox Producer::process_frameset(rs2::frameset& frames) {
     if (config_.enable_ir) {
         auto ir_left = frames.get_infrared_frame(1);
         auto ir_right = frames.get_infrared_frame(2);
-        
-        // Debug: Check if IR frames are being received
-        static int ir_frame_debug = 0;
-        if (++ir_frame_debug % 30 == 0) {
-            std::cout << "🔍 IR Frame Debug: ir_left=" << (ir_left ? "YES" : "NO") 
-                      << ", ir_right=" << (ir_right ? "YES" : "NO") << std::endl;
-        }
         
         if (ir_left) {
             fb.ir_width = ir_left.get_width();
@@ -687,194 +649,6 @@ void Producer::report_status(const std::string& status) {
     std::cout << "[Producer Status] " << status << std::endl;
     if (status_callback_) {
         status_callback_(status);
-    }
-}
-
-// ============================================================================
-// IMU-Based Camera Orientation Detection
-// ============================================================================
-
-Producer::CameraOrientation Producer::detect_camera_orientation() {
-    try {
-        // Check if device has IMU (D435I has it, D435 doesn't)
-        rs2::context ctx;
-        auto devices = ctx.query_devices();
-        if (devices.size() == 0) {
-            report_status("No RealSense device found for IMU check");
-            return CameraOrientation::UNKNOWN;
-        }
-        
-        rs2::device dev = devices[0];
-        
-        // Check for motion sensor
-        bool found_accel = false;
-        for (auto&& sensor : dev.query_sensors()) {
-            for (auto&& profile : sensor.get_stream_profiles()) {
-                if (profile.stream_type() == RS2_STREAM_ACCEL) {
-                    found_accel = true;
-                    break;
-                }
-            }
-        }
-        
-        if (!found_accel) {
-            report_status("⚠️  Camera does not have IMU (D435 vs D435I?) - orientation detection unavailable");
-            has_imu_ = false;
-            detected_orientation_ = CameraOrientation::UNKNOWN;  // Don't assume - unknown orientation
-            return detected_orientation_;
-        }
-        
-        has_imu_ = true;
-        report_status("IMU detected - reading accelerometer for orientation...");
-        
-        // Create a separate pipeline for IMU
-        rs2::pipeline imu_pipe;
-        rs2::config imu_config;
-        imu_config.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F, 200);
-        
-        imu_pipe.start(imu_config);
-        
-        // Collect accelerometer samples to average out noise
-        float accel_x = 0, accel_y = 0, accel_z = 0;
-        int sample_count = 0;
-        const int NUM_SAMPLES = 50;
-        
-        auto start_time = std::chrono::steady_clock::now();
-        while (sample_count < NUM_SAMPLES) {
-            rs2::frameset frames;
-            if (imu_pipe.poll_for_frames(&frames)) {
-                for (auto&& frame : frames) {
-                    if (auto motion = frame.as<rs2::motion_frame>()) {
-                        if (motion.get_profile().stream_type() == RS2_STREAM_ACCEL) {
-                            auto data = motion.get_motion_data();
-                            accel_x += data.x;
-                            accel_y += data.y;
-                            accel_z += data.z;
-                            sample_count++;
-                        }
-                    }
-                }
-            }
-            
-            // Timeout after 2 seconds
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start_time).count();
-            if (elapsed > 2000) break;
-        }
-        
-        imu_pipe.stop();
-        
-        if (sample_count == 0) {
-            report_status("Failed to read IMU data");
-            detected_orientation_ = CameraOrientation::NORMAL;
-            return detected_orientation_;
-        }
-        
-        // Average the samples
-        accel_x /= sample_count;
-        accel_y /= sample_count;
-        accel_z /= sample_count;
-        
-        report_status("IMU Accelerometer: X=" + std::to_string(accel_x) + 
-                     " Y=" + std::to_string(accel_y) + 
-                     " Z=" + std::to_string(accel_z));
-        
-        // Determine orientation from gravity vector
-        // In RealSense coordinate system:
-        // - Camera facing user horizontally: gravity should be mostly in -Y
-        // - Rotated 90° CW: gravity in -X
-        // - Rotated 90° CCW: gravity in +X
-        // - Upside down: gravity in +Y
-        
-        // Use dominant axis approach - which axis has the strongest gravity component?
-        float abs_x = std::abs(accel_x);
-        float abs_y = std::abs(accel_y);
-        
-        const float MIN_THRESHOLD = 3.0f;  // Minimum to consider valid
-        
-        if (abs_y > abs_x && abs_y > MIN_THRESHOLD) {
-            // Y-axis dominant - normal or upside down
-            if (accel_y < 0) {
-                detected_orientation_ = CameraOrientation::NORMAL;
-                report_status("📷 Camera orientation: NORMAL (Y=-" + std::to_string(abs_y) + ")");
-            } else {
-                detected_orientation_ = CameraOrientation::UPSIDE_DOWN;
-                report_status("⚠️  Camera orientation: UPSIDE DOWN (Y=+" + std::to_string(abs_y) + ")");
-            }
-        } else if (abs_x > MIN_THRESHOLD) {
-            // X-axis dominant - rotated 90°
-            if (accel_x < 0) {
-                detected_orientation_ = CameraOrientation::ROTATED_90_CW;
-                report_status("📷 Camera orientation: ROTATED 90° CW (X=-" + std::to_string(abs_x) + ")");
-            } else {
-                detected_orientation_ = CameraOrientation::ROTATED_90_CCW;
-                report_status("📷 Camera orientation: ROTATED 90° CCW (X=+" + std::to_string(abs_x) + ")");
-            }
-        } else {
-            // Camera pointing mostly up/down (Z dominant) - fall back to config
-            detected_orientation_ = CameraOrientation::NORMAL;
-            report_status("📷 Camera orientation: Z-dominant (tilted), using config fallback");
-        }
-        
-        return detected_orientation_;
-        
-    } catch (const rs2::error& e) {
-        report_status("IMU detection error: " + std::string(e.what()));
-        detected_orientation_ = CameraOrientation::NORMAL;
-        return detected_orientation_;
-    }
-}
-
-int Producer::get_rotation_degrees() const {
-    switch (detected_orientation_) {
-        case CameraOrientation::NORMAL:        return 0;
-        case CameraOrientation::ROTATED_90_CW: return 90;
-        case CameraOrientation::UPSIDE_DOWN:   return 180;
-        case CameraOrientation::ROTATED_90_CCW: return 270;
-        default:                               return 0;
-    }
-}
-
-void Producer::transform_coordinates(int x, int y, int max_x, int max_y, int& out_x, int& out_y) const {
-    switch (detected_orientation_) {
-        case CameraOrientation::NORMAL:
-            // No transformation needed
-            out_x = x;
-            out_y = y;
-            break;
-            
-        case CameraOrientation::ROTATED_90_CW:
-            // Rotate 90° clockwise: (x,y) -> (max_y - y, x)
-            out_x = max_y - y;
-            out_y = x;
-            break;
-            
-        case CameraOrientation::ROTATED_90_CCW:
-            // Rotate 90° counter-clockwise: (x,y) -> (y, max_x - x)
-            out_x = y;
-            out_y = max_x - x;
-            break;
-            
-        case CameraOrientation::UPSIDE_DOWN:
-            // Rotate 180°: (x,y) -> (max_x - x, max_y - y)
-            out_x = max_x - x;
-            out_y = max_y - y;
-            break;
-            
-        default:
-            out_x = x;
-            out_y = y;
-            break;
-    }
-}
-
-std::string Producer::orientation_to_string(CameraOrientation orientation) {
-    switch (orientation) {
-        case CameraOrientation::NORMAL:        return "NORMAL";
-        case CameraOrientation::ROTATED_90_CW: return "ROTATED_90_CW";
-        case CameraOrientation::ROTATED_90_CCW: return "ROTATED_90_CCW";
-        case CameraOrientation::UPSIDE_DOWN:   return "UPSIDE_DOWN";
-        default:                               return "UNKNOWN";
     }
 }
 
