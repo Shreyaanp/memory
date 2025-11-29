@@ -170,6 +170,10 @@ void NetworkManager::disconnect() {
 void NetworkManager::stop_reconnect() {
     // Stop the reconnection loop (non-blocking)
     // NOTE: Do NOT join thread here - may be called from within the thread (callback)
+    
+    bool was_connected = connected_;
+    bool was_running = running_;
+    
     running_ = false;
     connected_ = false;
     
@@ -178,7 +182,10 @@ void NetworkManager::stop_reconnect() {
         shutdown(socket_fd_, SHUT_RDWR);
     }
     
-    std::cout << "🔌 WebSocket reconnection disabled" << std::endl;
+    // Only log if there was an active connection/session
+    if (was_connected || was_running) {
+        std::cout << "🔌 WebSocket connection closed" << std::endl;
+    }
 }
 
 bool NetworkManager::is_connected() const {

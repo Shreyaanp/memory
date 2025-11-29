@@ -18,7 +18,8 @@
 namespace mdai {
 
 SystemController::SystemController() {
-    ring_buffer_ = std::make_unique<DynamicRingBuffer>(32, 2ULL * 1024 * 1024 * 1024);
+    // Ring buffer: 32 initial slots, 1GB max memory (reduced from 2GB)
+    ring_buffer_ = std::make_unique<DynamicRingBuffer>(32, 3ULL * 1024 * 1024 * 1024);
     
     SerialCommunicator::Config serial_cfg;
     serial_cfg.port_name = "/dev/ttyACM0";
@@ -152,6 +153,71 @@ void SystemController::run() {
             }
         }
 
+        // ============================================
+        // HEALTH CHECKS (run every ~10 seconds)
+        // ============================================
+        static int health_check_counter = 0;
+        if (++health_check_counter >= 3000) {  // ~30fps * 10 seconds = ~300, but main loop is faster
+            health_check_counter = 0;
+            
+            // 1. Heartbeat logging (for debugging)
+            last_heartbeat_ = std::chrono::steady_clock::now();
+            
+            // 2. Global state watchdog - reset to IDLE if stuck too long
+            SystemState current = current_state_.load();
+            if (current != SystemState::IDLE && 
+                current != SystemState::BOOT && 
+                current != SystemState::AWAIT_ADMIN_QR) {
+                
+                auto state_duration = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - state_entry_time_).count();
+                
+                // Check for stuck state (> 60 seconds in non-idle state)
+                if (state_duration > STATE_STUCK_TIMEOUT_SEC) {
+                    std::cerr << "⚠️ STATE WATCHDOG: Stuck in state for " << state_duration 
+                              << "s - forcing reset to IDLE" << std::endl;
+                    serial_comm_->queue_error("Session timeout");
+                    set_state(SystemState::ERROR);
+                }
+                
+                // Check for alignment timeout (> 45 seconds)
+                if (current == SystemState::ALIGN && state_duration > ALIGN_TIMEOUT_SEC) {
+                    std::cerr << "⚠️ ALIGN TIMEOUT: No progress for " << state_duration 
+                              << "s - resetting" << std::endl;
+                    serial_comm_->queue_error("Alignment timeout");
+                    set_state(SystemState::ERROR);
+                }
+            }
+            
+            // 3. Serial health check
+            if (serial_comm_ && !serial_comm_->is_connected()) {
+                serial_fail_count_++;
+                std::cerr << "⚠️ Serial disconnected (fail count: " << serial_fail_count_ << ")" << std::endl;
+                
+                if (serial_fail_count_ >= SERIAL_MAX_FAILS) {
+                    std::cerr << "🔄 Attempting serial reconnect..." << std::endl;
+                    if (serial_comm_->try_reconnect()) {
+                        std::cout << "✅ Serial reconnected" << std::endl;
+                    } else {
+                        std::cerr << "❌ Serial reconnect failed" << std::endl;
+                    }
+                    serial_fail_count_ = 0;
+                }
+            } else {
+                serial_fail_count_ = 0;
+            }
+            
+            // 4. Memory check - only log during active recording
+            // The ring buffer self-manages memory limits; this is just for monitoring
+            if (ring_buffer_ && ring_buffer_->is_recording_active()) {
+                size_t mem_usage = ring_buffer_->get_memory_usage();
+                size_t frame_count = ring_buffer_->get_usage();
+                std::cout << "📊 Recording buffer: " << frame_count << " frames, " 
+                          << mem_usage / (1024*1024) << "MB" << std::endl;
+            }
+        }
+        // ============================================
+
         try {
             FrameBox* frame = ring_buffer_->get_latest_frame();
             if (frame) {
@@ -192,8 +258,14 @@ void SystemController::stop() {
 
 void SystemController::clear_session() {
     // Clear all session data - call this when returning to IDLE
-    std::cout << "🧹 Clearing session data..." << std::endl;
+    bool had_session = !session_id_.empty();
+    bool was_connected = network_mgr_ && network_mgr_->is_connected();
     
+    if (had_session || was_connected) {
+        std::cout << "🧹 Clearing session data..." << std::endl;
+    }
+    
+    // Clear session identifiers
     session_id_.clear();
     {
         std::lock_guard<std::mutex> lock(ws_auth_mutex_);
@@ -211,20 +283,23 @@ void SystemController::clear_session() {
     
     // Disconnect WebSocket if connected
     if (network_mgr_) {
-        network_mgr_->stop_reconnect();
-        if (network_mgr_->is_connected()) {
+        if (was_connected) {
             network_mgr_->disconnect();
         }
+        network_mgr_->stop_reconnect();
     }
     
     // Reset result ACK flag
     result_ack_received_ = false;
     
-    std::cout << "   ✓ Session cleared" << std::endl;
+    if (had_session || was_connected) {
+        std::cout << "   ✓ Session cleared" << std::endl;
+    }
 }
 
 void SystemController::set_state(SystemState new_state) {
     current_state_ = new_state;
+    state_entry_time_ = std::chrono::steady_clock::now();  // Track when we entered this state
     
     switch (new_state) {
         case SystemState::BOOT:
@@ -464,39 +539,70 @@ void SystemController::handle_idle(FrameBox* frame) {
     cv::Mat enhanced;
     clahe->apply(gray, enhanced);
     
-    struct quirc *qr = quirc_new();
-    if (!qr) return;
+    // Try multiple preprocessing approaches for better QR detection
+    std::vector<cv::Mat> candidates;
+    candidates.push_back(enhanced);  // CLAHE enhanced
     
-    if (quirc_resize(qr, enhanced.cols, enhanced.rows) < 0) {
-        quirc_destroy(qr);
-        return;
-    }
+    // Also try adaptive threshold
+    cv::Mat thresh;
+    cv::adaptiveThreshold(gray, thresh, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, 
+                          cv::THRESH_BINARY, 51, 10);
+    candidates.push_back(thresh);
     
-    uint8_t *image = quirc_begin(qr, nullptr, nullptr);
-    memcpy(image, enhanced.data, enhanced.cols * enhanced.rows);
-    quirc_end(qr);
+    // Try original grayscale
+    candidates.push_back(gray);
     
     std::string decoded_info;
-    int num_codes = quirc_count(qr);
     
-    if (num_codes > 0) {
-        struct quirc_code code;
-        struct quirc_data data;
+    for (size_t i = 0; i < candidates.size() && decoded_info.empty(); i++) {
+        cv::Mat& img = candidates[i];
         
-        quirc_extract(qr, 0, &code);
-        quirc_decode_error_t err = quirc_decode(&code, &data);
+        struct quirc *qr = quirc_new();
+        if (!qr) continue;
         
-        if (err == QUIRC_SUCCESS) {
-            decoded_info = std::string(reinterpret_cast<char*>(data.payload), data.payload_len);
-            std::cout << "📱 QR DETECTED! Length: " << decoded_info.length() << " bytes" << std::endl;
+        if (quirc_resize(qr, img.cols, img.rows) < 0) {
+            quirc_destroy(qr);
+            continue;
         }
+        
+        uint8_t *image = quirc_begin(qr, nullptr, nullptr);
+        memcpy(image, img.data, img.cols * img.rows);
+        quirc_end(qr);
+        
+        int num_codes = quirc_count(qr);
+        
+        // Log periodically (every 100 scans)
+        static int total_scans = 0;
+        if (++total_scans % 100 == 0) {
+            std::cout << "📷 QR scan #" << total_scans << " - codes found: " << num_codes << " (method " << i << ")" << std::endl;
+        }
+        
+        if (num_codes > 0) {
+            struct quirc_code code;
+            struct quirc_data data;
+            
+            quirc_extract(qr, 0, &code);
+            quirc_decode_error_t err = quirc_decode(&code, &data);
+            
+            if (err == QUIRC_SUCCESS) {
+                decoded_info = std::string(reinterpret_cast<char*>(data.payload), data.payload_len);
+                std::cout << "📱 QR DETECTED! Method " << i << ", Length: " << decoded_info.length() << " bytes" << std::endl;
+            } else {
+                std::cout << "⚠️ QR found but decode failed: " << quirc_strerror(err) << std::endl;
+            }
+        }
+        
+        quirc_destroy(qr);
     }
     
-    quirc_destroy(qr);
-    
     if (!decoded_info.empty()) {
+        std::cout << "🔍 QR content preview: " << decoded_info.substr(0, std::min(size_t(50), decoded_info.length())) << "..." << std::endl;
+        
         // Minimum length check
-        if (decoded_info.length() < 20) return;
+        if (decoded_info.length() < 20) {
+            std::cout << "⚠️ QR too short (" << decoded_info.length() << " chars), ignoring" << std::endl;
+            return;
+        }
         
         bool is_session_qr = false;
         std::string encrypted_data;
@@ -504,22 +610,27 @@ void SystemController::handle_idle(FrameBox* frame) {
         if (decoded_info.length() > 2 && decoded_info.substr(0, 2) == "S:") {
             is_session_qr = true;
             encrypted_data = decoded_info.substr(2);
+            std::cout << "📦 Detected S: prefix format" << std::endl;
         } else {
             try {
                 nlohmann::json qr_json = nlohmann::json::parse(decoded_info);
                 if (qr_json.contains("qr_encrypted")) {
                     is_session_qr = true;
                     encrypted_data = qr_json["qr_encrypted"].get<std::string>();
+                    std::cout << "📦 Detected JSON format with qr_encrypted field" << std::endl;
                 }
             } catch (...) {
                 if (decoded_info.length() < 100 && decoded_info.length() > 20) {
                     is_session_qr = true;
                     encrypted_data = decoded_info;
+                    std::cout << "📦 Treating as raw encrypted data" << std::endl;
                 }
             }
         }
         
         if (is_session_qr) {
+            std::cout << "🔐 Attempting decryption..." << std::endl;
+            
             std::string qr_key = load_qr_shared_key();
             if (qr_key.empty()) {
                 std::cerr << "❌ QR decryption key not configured!" << std::endl;
@@ -530,6 +641,7 @@ void SystemController::handle_idle(FrameBox* frame) {
             
             try {
                 std::string decrypted_data = CryptoUtils::aes256_decrypt(encrypted_data, qr_key);
+                std::cout << "✅ Decryption successful! Token length: " << decrypted_data.length() << std::endl;
                 
                 std::string ws_token;
                 if (decrypted_data.length() > 2 && decrypted_data.substr(0, 2) == "S:") {
@@ -538,7 +650,12 @@ void SystemController::handle_idle(FrameBox* frame) {
                     ws_token = decrypted_data;
                 }
                 
-                if (ws_token.empty() || ws_token.length() != 8) return;
+                if (ws_token.empty() || ws_token.length() != 8) {
+                    std::cout << "⚠️ Invalid token length: " << ws_token.length() << " (expected 8)" << std::endl;
+                    return;
+                }
+                
+                std::cout << "🔗 Connecting to middleware with token..." << std::endl;
                 
                 {
                     std::lock_guard<std::mutex> lock(ws_auth_mutex_);
@@ -555,6 +672,7 @@ void SystemController::handle_idle(FrameBox* frame) {
                 }
                 
                 if (!network_mgr_->is_connected()) {
+                    std::cerr << "❌ WebSocket connection failed after " << wait_count * 100 << "ms" << std::endl;
                     serial_comm_->queue_error("Connection failed");
                     serial_comm_->queue_state(12);
                     network_mgr_->disconnect();
@@ -562,11 +680,17 @@ void SystemController::handle_idle(FrameBox* frame) {
                     state_timer_target_ = SystemState::IDLE;
                     state_timer_duration_ms_ = 3000;
                     state_timer_active_ = true;
+                } else {
+                    std::cout << "✅ WebSocket connected!" << std::endl;
                 }
                 
+            } catch (const std::exception& e) {
+                std::cerr << "❌ Decryption failed: " << e.what() << std::endl;
             } catch (...) {
-                // Silent ignore - not our QR
+                std::cerr << "❌ Decryption failed (unknown error)" << std::endl;
             }
+        } else {
+            std::cout << "⚠️ QR not recognized as session QR" << std::endl;
         }
     }
     } catch (const std::exception& e) {
@@ -998,9 +1122,16 @@ void SystemController::on_websocket_message(const std::string& message) {
         else if (msg_type == "verification_result" || msg_type == "api_response" || msg_type == "image_received") {
             result_ack_received_ = true;
             std::string status = msg_json.value("status", "ok");
-            if (status == "failed" || status == "error") {
+            
+            if (status == "success" || status == "ok") {
+                std::cout << "✅ Verification SUCCESS from server!" << std::endl;
+                // SUCCESS state transition happens in handle_processing() after result_ack_received_ is set
+            }
+            else if (status == "failed" || status == "error") {
                 std::string reason = msg_json.value("reason", "unknown");
                 std::string message = msg_json.value("message", "");
+                
+                std::cout << "❌ Verification FAILED: " << reason << " - " << message << std::endl;
                 
                 // Show user-friendly error message
                 if (reason == "spoof_detected") {
@@ -1023,6 +1154,34 @@ void SystemController::on_websocket_message(const std::string& message) {
             } else {
                 std::cout << "   → Ignored (current state doesn't allow)" << std::endl;
             }
+        }
+        else if (msg_type == "session_closed") {
+            // Server closed the session (timeout, etc.)
+            std::string reason = msg_json.value("reason", "Session closed");
+            std::cout << "⚠️ Session closed by server: " << reason << std::endl;
+            if (current_state_ != SystemState::IDLE && current_state_ != SystemState::ERROR) {
+                serial_comm_->queue_error("Session expired");
+                set_state(SystemState::ERROR);
+            }
+        }
+        else if (msg_type == "error") {
+            // Generic error from server
+            std::string error = msg_json.value("error", "Unknown error");
+            std::cout << "❌ Server error: " << error << std::endl;
+            if (current_state_ != SystemState::IDLE && current_state_ != SystemState::ERROR) {
+                serial_comm_->queue_error(error);
+                set_state(SystemState::ERROR);
+            }
+        }
+        else if (msg_type == "ping") {
+            // Server ping - respond with pong
+            if (network_mgr_ && network_mgr_->is_connected()) {
+                nlohmann::json pong = {{"type", "pong"}};
+                network_mgr_->send_message(pong.dump());
+            }
+        }
+        else if (msg_type == "pong" || msg_type == "ack") {
+            // Server acknowledgments - ignore silently
         }
         
     } catch (...) {}

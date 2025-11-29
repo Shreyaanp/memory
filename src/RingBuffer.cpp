@@ -36,8 +36,10 @@ bool DynamicRingBuffer::write(FrameBox&& frame) {
     
     if (slot_idx >= capacity_) {
         if (!recording_active_) {
+            // Circular mode: overwrite oldest slot
             slot_idx = write_index_ % capacity_;
         } else {
+            total_frames_dropped_++;
             return false;
         }
     }
@@ -46,6 +48,12 @@ bool DynamicRingBuffer::write(FrameBox&& frame) {
     
     {
         std::lock_guard<std::mutex> lock(slot.slot_mutex);
+        
+        // Clear old frame data before overwriting (important for memory management)
+        if (slot.state == SlotState::READY || slot.state == SlotState::READING) {
+            slot.frame = FrameBox();  // Clear old data first
+        }
+        
         slot.state = SlotState::WRITING;
         slot.frame = std::move(frame);
         slot.state = SlotState::READY;
@@ -154,20 +162,21 @@ bool DynamicRingBuffer::grow_buffer() {
 }
 
 size_t DynamicRingBuffer::find_available_slot() {
-    // Linear search for EMPTY slot
+    // In normal mode (not recording), always use circular overwrite
+    // This is more efficient than searching for EMPTY slots
+    if (!recording_active_) {
+        return write_index_ % capacity_;
+    }
+    
+    // Recording mode: try to find an EMPTY slot first
     for (size_t i = 0; i < capacity_; ++i) {
         if (slots_[i]->state == SlotState::EMPTY) {
             return i;
         }
     }
     
-    // If none empty and NOT recording, overwrite oldest
-    if (!recording_active_) {
-        // Simple circular overwrite
-        return write_index_ % capacity_;
-    }
-    
-    return capacity_; // Signal full
+    // No empty slots - signal full (caller will try to grow or drop)
+    return capacity_;
 }
 
 // Helper for Sequential Access (Batch Processing)

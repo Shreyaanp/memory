@@ -1,0 +1,21 @@
+[Unit]
+Description=MDAI Watchdog - Ensures mdai-system stays running
+After=mdai-system.service
+BindsTo=mdai-system.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/home/mercleDev/codebase/deployment/watchdog.sh
+Restart=always
+RestartSec=10
+
+# Lower priority than main service
+Nice=0
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
+
+
+

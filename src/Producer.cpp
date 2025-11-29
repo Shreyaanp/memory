@@ -157,13 +157,13 @@ void Producer::set_status_callback(std::function<void(const std::string&)> callb
 
 bool Producer::configure_pipeline() {
     // Enable ONLY the left IR stream (index 1)
-    rs_config_.enable_stream(
+        rs_config_.enable_stream(
         RS2_STREAM_INFRARED, 1,  // Left IR sensor
-        config_.ir_width,
-        config_.ir_height,
+            config_.ir_width,
+            config_.ir_height,
         RS2_FORMAT_Y8,          // 8-bit grayscale
-        config_.ir_fps
-    );
+            config_.ir_fps
+        );
     
     // Select specific device if serial provided
     if (!config_.device_serial.empty()) {
@@ -220,9 +220,9 @@ void Producer::configure_sensor_options() {
 
 void Producer::query_camera_parameters() {
     try {
-        auto ir_stream = profile_.get_stream(RS2_STREAM_INFRARED, 1)
-                                .as<rs2::video_stream_profile>();
-        ir_intrinsics_ = ir_stream.get_intrinsics();
+            auto ir_stream = profile_.get_stream(RS2_STREAM_INFRARED, 1)
+                                    .as<rs2::video_stream_profile>();
+            ir_intrinsics_ = ir_stream.get_intrinsics();
         
         std::cout << "📹 IR intrinsics: fx=" << ir_intrinsics_.fx 
                   << ", fy=" << ir_intrinsics_.fy << std::endl;
@@ -238,9 +238,9 @@ void Producer::capture_loop() {
     int frame_count = 0;
     
     while (running_.load()) {
-        try {
-            rs2::frameset frames;
-            if (pipe_.poll_for_frames(&frames)) {
+            try {
+                rs2::frameset frames;
+                if (pipe_.poll_for_frames(&frames)) {
                 frame_count++;
                 
                 // Get IR frame
@@ -263,7 +263,7 @@ void Producer::capture_loop() {
                 // Log progress occasionally
                 if (frame_count <= 5 || frame_count % 100 == 0) {
                     std::cout << "📹 IR frame #" << frame_count << std::endl;
-                }
+            }
             }
             
             // Update FPS
@@ -289,11 +289,11 @@ FrameBox Producer::process_ir_frame(rs2::video_frame& ir_frame) {
     // Get frame dimensions
     fb.ir_width = ir_frame.get_width();
     fb.ir_height = ir_frame.get_height();
-    
+        
     // Copy IR data
-    size_t ir_size = fb.ir_width * fb.ir_height;
+            size_t ir_size = fb.ir_width * fb.ir_height;
     fb.ir_data.resize(ir_size);
-    
+            
     const uint8_t* ir_data = reinterpret_cast<const uint8_t*>(ir_frame.get_data());
     std::copy(ir_data, ir_data + ir_size, fb.ir_data.begin());
     

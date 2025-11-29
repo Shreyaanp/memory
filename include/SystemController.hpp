@@ -103,6 +103,14 @@ private:
     static constexpr int MAX_HARDWARE_RETRIES = 3;
     static constexpr int HARDWARE_FAILURE_REBOOT_TIMEOUT_SEC = 30;
     
+    // Health monitoring
+    std::chrono::steady_clock::time_point state_entry_time_;  // When current state was entered
+    std::chrono::steady_clock::time_point last_heartbeat_;    // Last heartbeat time
+    int serial_fail_count_{0};                                 // Serial communication failures
+    static constexpr int STATE_STUCK_TIMEOUT_SEC = 60;        // Max time in non-IDLE state
+    static constexpr int ALIGN_TIMEOUT_SEC = 45;              // Max time for face alignment
+    static constexpr int SERIAL_MAX_FAILS = 5;                // Max serial failures before reconnect
+    
     // Face Validation States (simplified - no depth-based distance)
     enum class FaceValidationState {
         VALID,              // Face detected and OK

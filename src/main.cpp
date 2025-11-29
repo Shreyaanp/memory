@@ -8,22 +8,44 @@ std::unique_ptr<mdai::SystemController> controller;
 
 void signal_handler(int signum) {
     const char* sig_name = "UNKNOWN";
+    bool is_crash = false;
+    
     switch(signum) {
-        case SIGINT: sig_name = "SIGINT"; break;
-        case SIGTERM: sig_name = "SIGTERM"; break;
-        case SIGSEGV: sig_name = "SIGSEGV (Segmentation Fault)"; break;
-        case SIGABRT: sig_name = "SIGABRT (Abort)"; break;
-        case SIGFPE: sig_name = "SIGFPE (Floating Point Exception)"; break;
+        case SIGINT: 
+            sig_name = "SIGINT (Interrupt)"; 
+            break;
+        case SIGTERM: 
+            sig_name = "SIGTERM (Terminate)"; 
+            break;
+        case SIGSEGV: 
+            sig_name = "SIGSEGV (Segmentation Fault)"; 
+            is_crash = true;
+            break;
+        case SIGABRT: 
+            sig_name = "SIGABRT (Abort)"; 
+            is_crash = true;
+            break;
+        case SIGFPE: 
+            sig_name = "SIGFPE (Floating Point Exception)"; 
+            is_crash = true;
+            break;
     }
-    std::cerr << "\n❌ SIGNAL " << signum << " (" << sig_name << ") received!" << std::endl;
-    std::cerr << "   This is likely a crash. Check code for null pointers or memory issues." << std::endl;
-    std::cerr.flush();
     
     if (signum == SIGINT || signum == SIGTERM) {
+        // Normal shutdown - not a crash
+        std::cout << "\n🛑 Shutdown signal received (" << sig_name << ")" << std::endl;
+        std::cout << "   Stopping gracefully..." << std::endl;
+        std::cout.flush();
         if (controller) {
             controller->stop();
         }
+    } else {
+        // Actual crash
+        std::cerr << "\n❌ CRASH: SIGNAL " << signum << " (" << sig_name << ")" << std::endl;
+        std::cerr << "   Check code for null pointers or memory issues." << std::endl;
+        std::cerr.flush();
     }
+    
     exit(signum);
 }
 
