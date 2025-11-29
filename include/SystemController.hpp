@@ -97,6 +97,12 @@ private:
     std::atomic<bool> camera_error_detected_{false};
     std::string camera_error_message_;
     
+    // Hardware failure tracking (for reboot logic)
+    int hardware_failure_count_{0};
+    std::chrono::steady_clock::time_point first_failure_time_;
+    static constexpr int MAX_HARDWARE_RETRIES = 3;
+    static constexpr int HARDWARE_FAILURE_REBOOT_TIMEOUT_SEC = 30;
+    
     // Face Validation States (simplified - no depth-based distance)
     enum class FaceValidationState {
         VALID,              // Face detected and OK

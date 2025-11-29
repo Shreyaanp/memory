@@ -158,21 +158,21 @@ void SystemController::run() {
                 process_frame(frame);
                 ring_buffer_->release_frame(frame);
             } else {
-                // Debug: Log when no frames available in IDLE state
+                // Track no-frame count for stuck detection
                 static int no_frame_count = 0;
-                SystemState s = current_state_.load();
-                if (s == SystemState::IDLE || s == SystemState::READY) {
-                    no_frame_count++;
-                    if (no_frame_count % 200 == 1) {  // Log every ~1 second
-                        std::cout << "⚠️ No frame from ring buffer (state=IDLE, count=" 
-                                  << no_frame_count << ", buf_usage=" << ring_buffer_->get_usage() 
-                                  << ", producer_running=" << (producer_ ? producer_->is_running() : false) << ")" << std::endl;
-                    }
-                    // Camera stays running continuously - no restart needed in IR-only mode
-                } else {
+                no_frame_count++;
+                
+                // If no frames for extended period, try camera recovery
+                if (no_frame_count > 3000) {  // ~30 seconds at 10ms sleep
+                    std::cerr << "⚠️ No frames for extended period - attempting camera recovery" << std::endl;
                     no_frame_count = 0;
+                    
+                    if (producer_ && !producer_->is_running()) {
+                        handle_hardware_error("Camera", "No frames received");
+                    }
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         } catch (const std::exception& e) {
             std::cerr << "❌ Exception in main loop: " << e.what() << std::endl;
@@ -327,11 +327,14 @@ void SystemController::set_state(SystemState new_state) {
             std::cout << "❌ Entering ERROR state..." << std::endl;
             serial_comm_->queue_state(12);
             clear_session();  // Clear all session data immediately
-            // Timer: Go to IDLE after 3 seconds
-            state_timer_start_ = std::chrono::steady_clock::now();
-            state_timer_target_ = SystemState::IDLE;
-            state_timer_duration_ms_ = 3000;
-            state_timer_active_ = true;
+            // Go to IDLE after 3 seconds (use thread, not timer - more reliable)
+            std::thread([this]() {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                if (current_state_ == SystemState::ERROR) {
+                    std::cout << "   ⏰ ERROR timeout → IDLE" << std::endl;
+                    set_state(SystemState::IDLE);
+                }
+            }).detach();
             break;
             
         case SystemState::DELETE_SCREEN: {
@@ -397,17 +400,7 @@ void SystemController::initialize_camera() {
 void SystemController::process_frame(FrameBox* frame) {
     SystemState state = current_state_.load();
     
-    // Debug: Log frame processing for IDLE state
-    static int idle_frame_count = 0;
-    if (state == SystemState::IDLE || state == SystemState::READY) {
-        idle_frame_count++;
-        if (idle_frame_count % 100 == 1) {  // Log every 100 frames
-            std::cout << "📷 Processing frame in IDLE (count=" << idle_frame_count 
-                      << ", ir_valid=" << frame->is_valid() << ")" << std::endl;
-        }
-    } else {
-        idle_frame_count = 0;  // Reset counter when not in IDLE
-    }
+    // Frame counter for IDLE state (no logging - too verbose)
     
     switch (state) {
         case SystemState::AWAIT_ADMIN_QR: handle_await_admin_qr(frame); break;
@@ -455,12 +448,9 @@ void SystemController::handle_idle(FrameBox* frame) {
         static int frame_skip = 0;
         if (frame_skip++ % 5 != 0) return;
         
-        // Debug: Log QR scan activity periodically
+        // QR scan counter (no logging - too verbose)
         static int scan_count = 0;
         scan_count++;
-        if (scan_count % 60 == 0) {  // Log every ~2 seconds
-            std::cout << "🔍 QR scanning... (frame " << scan_count << ")" << std::endl;
-        }
 
     // Get raw IR grayscale directly for better QR detection
     cv::Mat gray = frame->get_ir_mat();
@@ -531,7 +521,12 @@ void SystemController::handle_idle(FrameBox* frame) {
         
         if (is_session_qr) {
             std::string qr_key = load_qr_shared_key();
-            if (qr_key.empty()) qr_key = "fallback";
+            if (qr_key.empty()) {
+                std::cerr << "❌ QR decryption key not configured!" << std::endl;
+                serial_comm_->queue_error("Device not configured");
+                set_state(SystemState::ERROR);
+                return;
+            }
             
             try {
                 std::string decrypted_data = CryptoUtils::aes256_decrypt(encrypted_data, qr_key);
@@ -811,7 +806,7 @@ float SystemController::calculate_circular_motion_progress(const cv::Point2f& no
 }
 
 void SystemController::handle_processing() {
-    std::cout << "🔬 Processing IR frames (simplified - no anti-spoofing)..." << std::endl;
+    std::cout << "🔬 Processing IR frames..." << std::endl;
     
     std::string current_session_id = session_id_;
     
@@ -973,8 +968,13 @@ void SystemController::on_websocket_message(const std::string& message) {
             set_state(SystemState::ERROR);
         }
         else if (msg_type == "mobile_disconnected") {
-            serial_comm_->queue_error("Mobile disconnected");
-            set_state(SystemState::ERROR);
+            // Ignore if in DELETE_SCREEN (disconnect is expected after delete_ack)
+            if (current_state_ != SystemState::DELETE_SCREEN && 
+                current_state_ != SystemState::IDLE &&
+                current_state_ != SystemState::ERROR) {
+                serial_comm_->queue_error("Mobile disconnected");
+                set_state(SystemState::ERROR);
+            }
         }
         else if (msg_type == "to_device") {
             if (msg_json.contains("data")) {
@@ -1000,7 +1000,17 @@ void SystemController::on_websocket_message(const std::string& message) {
             std::string status = msg_json.value("status", "ok");
             if (status == "failed" || status == "error") {
                 std::string reason = msg_json.value("reason", "unknown");
-                serial_comm_->queue_error(reason);
+                std::string message = msg_json.value("message", "");
+                
+                // Show user-friendly error message
+                if (reason == "spoof_detected") {
+                    std::cout << "🚨 SPOOF DETECTED by server!" << std::endl;
+                    serial_comm_->queue_error("Spoof detected");
+                } else if (!message.empty()) {
+                    serial_comm_->queue_error(message);
+                } else {
+                    serial_comm_->queue_error(reason);
+                }
                 set_state(SystemState::ERROR);
             }
         }
@@ -1150,23 +1160,67 @@ bool SystemController::check_camera_health() {
 }
 
 void SystemController::handle_hardware_error(const std::string& component, const std::string& error_msg) {
-    std::cerr << "❌ Hardware Error [" << component << "]: " << error_msg << std::endl;
+    std::cerr << "❌ Hardware FAILURE [" << component << "]: " << error_msg << std::endl;
     
+    // Track failure count and time
+    if (hardware_failure_count_ == 0) {
+        first_failure_time_ = std::chrono::steady_clock::now();
+    }
+    hardware_failure_count_++;
+    
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - first_failure_time_).count();
+    
+    // Stage 1: After MAX_RETRIES failures, restart the service
+    if (hardware_failure_count_ == MAX_HARDWARE_RETRIES) {
+        std::cerr << "🔄 Max retries reached - RESTARTING SERVICE..." << std::endl;
+        serial_comm_->queue_error("Restarting service...");
+        serial_comm_->queue_state(12);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        
+        // Kill this process - systemd will restart it
+        running_ = false;
+        std::exit(1);  // Exit with error code, systemd will restart
+        return;
+    }
+    
+    // Stage 2: If still failing after timeout, reboot device
+    if (elapsed > HARDWARE_FAILURE_REBOOT_TIMEOUT_SEC && hardware_failure_count_ > MAX_HARDWARE_RETRIES) {
+        std::cerr << "🔄 Hardware failure persists for " << elapsed << "s - REBOOTING DEVICE..." << std::endl;
+        serial_comm_->queue_error("Hardware failure - rebooting");
+        serial_comm_->queue_state(12);
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        
+        // Reboot the device
+        (void)std::system("sudo reboot");
+        return;
+    }
+    
+    // Try to recover the component
     if (component == "Camera") {
         serial_comm_->queue_error("Camera error - reconnecting...");
         
+        // Stop and reset camera
         if (producer_) {
+            try {
+                producer_->stop();
+            } catch (...) {}
             producer_.reset();
             std::this_thread::sleep_for(std::chrono::seconds(2));
         }
         
-        initialize_camera();
-        
-        if (producer_ && producer_->is_running()) {
-            std::cout << "✅ Camera recovered" << std::endl;
-        } else {
-            serial_comm_->queue_error("Camera recovery failed");
-            set_state(SystemState::ERROR);
+        // Try to reinitialize
+        try {
+            initialize_camera();
+            
+            if (producer_ && producer_->is_running()) {
+                std::cout << "✅ Camera recovered (attempt " << hardware_failure_count_ << ")" << std::endl;
+                hardware_failure_count_ = 0;  // Reset on success
+            } else {
+                std::cerr << "⚠️ Camera recovery failed (attempt " << hardware_failure_count_ << ")" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Camera init exception: " << e.what() << std::endl;
         }
     }
 }
