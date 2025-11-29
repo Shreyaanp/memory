@@ -6,6 +6,8 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <queue>
+#include <condition_variable>
 
 namespace mdai {
 
@@ -30,10 +32,19 @@ public:
     bool connect_to_middleware(const std::string& host, int port, const std::string& path, const std::string& device_id);
     void disconnect();
     void stop_reconnect();  // Stop reconnection loop without blocking (use after delete/logout)
-    bool send_message(const std::string& message);
+    bool send_message(const std::string& message);  // Synchronous send
+    void queue_message(const std::string& message); // Async send via queue (non-blocking)
     void set_message_callback(MsgCallback cb);
     void set_connect_callback(ConnectCallback cb);  // Called on (re)connect
     bool is_connected() const;
+    
+    // HTTP Image Upload
+    std::string upload_image(const std::string& host, const std::vector<uint8_t>& jpeg_data, 
+                             const std::string& session_id, const std::string& device_id);
+    
+    // Queue statistics
+    size_t get_send_queue_size() const;
+    uint64_t get_send_queue_dropped() const;
 
 private:
     std::atomic<bool> running_{false};
@@ -63,6 +74,14 @@ private:
     // SSL helpers
     bool init_ssl();
     void cleanup_ssl();
+    
+    // Send queue (for async non-blocking sends)
+    mutable std::mutex send_queue_mutex_;
+    std::queue<std::string> send_queue_;
+    static constexpr size_t MAX_SEND_QUEUE = 100;
+    std::atomic<uint64_t> send_queue_dropped_{0};
+    
+    void process_send_queue();  // Called from client_loop
 };
 
 } // namespace mdai

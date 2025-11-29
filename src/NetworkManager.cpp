@@ -128,6 +128,13 @@ std::string NetworkManager::get_current_ssid() {
 bool NetworkManager::connect_to_middleware(const std::string& host, int port, const std::string& path, const std::string& device_id) {
     if (running_) return false;
     
+    // CRITICAL: Join any previous thread before starting a new one
+    // Assigning to a joinable thread causes std::terminate
+    if (client_thread_.joinable()) {
+        std::cout << "🔌 Cleaning up previous WebSocket thread..." << std::endl;
+        client_thread_.join();
+    }
+    
     running_ = true;
     client_thread_ = std::thread(&NetworkManager::client_loop, this, host, port, path, device_id);
     return true;
@@ -135,7 +142,14 @@ bool NetworkManager::connect_to_middleware(const std::string& host, int port, co
 
 void NetworkManager::disconnect() {
     running_ = false;
+    connected_ = false;
     
+    // Shutdown socket FIRST to unblock any blocking reads in the thread
+    if (socket_fd_ != -1) {
+        shutdown(socket_fd_, SHUT_RDWR);  // Unblock SSL_read
+    }
+    
+    // Now cleanup SSL (after unblocking)
     if (ssl_) {
         SSL_shutdown((SSL*)ssl_);
         SSL_free((SSL*)ssl_);
@@ -147,18 +161,23 @@ void NetworkManager::disconnect() {
         socket_fd_ = -1;
     }
     
-    connected_ = false;
-    
+    // Join thread (should exit quickly now that socket is shutdown)
     if (client_thread_.joinable()) {
         client_thread_.join();
     }
 }
 
 void NetworkManager::stop_reconnect() {
-    // Stop the reconnection loop without blocking
-    // Use this after delete/logout to prevent auto-reconnect
+    // Stop the reconnection loop (non-blocking)
+    // NOTE: Do NOT join thread here - may be called from within the thread (callback)
     running_ = false;
     connected_ = false;
+    
+    // Close socket to unblock any pending read/write operations
+    if (socket_fd_ != -1) {
+        shutdown(socket_fd_, SHUT_RDWR);
+    }
+    
     std::cout << "🔌 WebSocket reconnection disabled" << std::endl;
 }
 
@@ -175,84 +194,118 @@ void NetworkManager::set_connect_callback(ConnectCallback cb) {
 }
 
 void NetworkManager::client_loop(std::string host, int port, std::string path, std::string device_id) {
-    while (running_) {
-        if (!connected_) {
-            // 1. Create Socket
-            socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-            if (socket_fd_ < 0) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                continue;
-            }
+    // ==========================================================================
+    // SINGLE CONNECTION - NO AUTO-RECONNECT
+    // ==========================================================================
+    // This function connects ONCE and processes messages until disconnect.
+    // When disconnected, it exits. A new QR scan will start a new connection.
+    // ==========================================================================
+    
+    // 1. Create Socket
+    socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd_ < 0) {
+        std::cerr << "❌ Failed to create socket" << std::endl;
+        running_ = false;
+        return;
+    }
 
-            // 2. Resolve Host
-            struct hostent* server = gethostbyname(host.c_str());
-            if (!server) {
-                std::cerr << "Could not resolve host: " << host << std::endl;
-                close(socket_fd_);
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                continue;
-            }
+    // 2. Resolve Host
+    struct hostent* server = gethostbyname(host.c_str());
+    if (!server) {
+        std::cerr << "❌ Could not resolve host: " << host << std::endl;
+        close(socket_fd_);
+        socket_fd_ = -1;
+        running_ = false;
+        return;
+    }
 
-            struct sockaddr_in serv_addr;
-            std::memset(&serv_addr, 0, sizeof(serv_addr));
-            serv_addr.sin_family = AF_INET;
-            std::memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
-            serv_addr.sin_port = htons(port);
+    struct sockaddr_in serv_addr;
+    std::memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    std::memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    serv_addr.sin_port = htons(port);
 
-            // 3. Connect TCP
-            if (connect(socket_fd_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-                std::cerr << "Connection failed" << std::endl;
-                close(socket_fd_);
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                continue;
-            }
+    // 3. Connect TCP
+    if (connect(socket_fd_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        std::cerr << "❌ TCP connection failed to " << host << ":" << port << std::endl;
+        close(socket_fd_);
+        socket_fd_ = -1;
+        running_ = false;
+        return;
+    }
 
-            // 4. Upgrade to SSL
-            ssl_ = SSL_new((SSL_CTX*)ssl_ctx_);
-            SSL_set_fd((SSL*)ssl_, socket_fd_);
-            if (SSL_connect((SSL*)ssl_) <= 0) {
-                std::cerr << "SSL handshake failed" << std::endl;
-                ERR_print_errors_fp(stderr);
-                close(socket_fd_);
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                continue;
-            }
+    // 4. Upgrade to SSL
+    ssl_ = SSL_new((SSL_CTX*)ssl_ctx_);
+    SSL_set_fd((SSL*)ssl_, socket_fd_);
+    if (SSL_connect((SSL*)ssl_) <= 0) {
+        std::cerr << "❌ SSL handshake failed" << std::endl;
+        ERR_print_errors_fp(stderr);
+        SSL_free((SSL*)ssl_);
+        ssl_ = nullptr;
+        close(socket_fd_);
+        socket_fd_ = -1;
+        running_ = false;
+        return;
+    }
 
-            // 5. WebSocket Handshake
-            if (perform_handshake(host, path, device_id)) {
-                connected_ = true;
-                std::cout << "✓ Connected to Middleware (WSS)" << std::endl;
-                
-                // Notify on (re)connect so caller can re-auth if needed
-                if (connect_callback_) {
-                    connect_callback_();
-                }
-            } else {
-                std::cerr << "WebSocket handshake failed" << std::endl;
-                close(socket_fd_);
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                continue;
-            }
-        }
+    // 5. WebSocket Handshake
+    if (!perform_handshake(host, path, device_id)) {
+        std::cerr << "❌ WebSocket handshake failed" << std::endl;
+        SSL_shutdown((SSL*)ssl_);
+        SSL_free((SSL*)ssl_);
+        ssl_ = nullptr;
+        close(socket_fd_);
+        socket_fd_ = -1;
+        running_ = false;
+        return;
+    }
+    
+    // SUCCESS - Connected!
+    connected_ = true;
+    std::cout << "✓ Connected to Middleware (WSS)" << std::endl;
+    
+    // Notify caller (auth will be sent via callback)
+    if (connect_callback_) {
+        connect_callback_();
+    }
 
-        // 6. Read Loop
+    // 6. Message Loop - process until disconnect or stop
+    while (running_ && connected_) {
+        // Process send queue (non-blocking)
+        process_send_queue();
+        
+        // Read incoming message
         std::string msg = receive_frame();
         if (msg.empty()) {
+            // Disconnected
             std::cout << "🔌 WebSocket disconnected" << std::endl;
             connected_ = false;
-            if (ssl_) {
-                SSL_shutdown((SSL*)ssl_);
-                SSL_free((SSL*)ssl_);
-                ssl_ = nullptr;
-            }
-            close(socket_fd_);
-            continue;
+            break;  // Exit loop - NO RECONNECT
         }
 
+        // Dispatch message to callback
         if (message_callback_) {
             message_callback_(msg);
         }
+        
+        // Process any queued messages after handling received message
+        process_send_queue();
     }
+    
+    // Cleanup
+    if (ssl_) {
+        SSL_shutdown((SSL*)ssl_);
+        SSL_free((SSL*)ssl_);
+        ssl_ = nullptr;
+    }
+    if (socket_fd_ != -1) {
+        close(socket_fd_);
+        socket_fd_ = -1;
+    }
+    connected_ = false;
+    running_ = false;
+    
+    std::cout << "🔌 WebSocket thread exited (no reconnect)" << std::endl;
 }
 
 bool NetworkManager::perform_handshake(const std::string& host, const std::string& path, const std::string& device_id) {
@@ -286,6 +339,39 @@ bool NetworkManager::perform_handshake(const std::string& host, const std::strin
 
 bool NetworkManager::send_message(const std::string& message) {
     return send_frame_internal(message);
+}
+
+void NetworkManager::queue_message(const std::string& message) {
+    std::lock_guard<std::mutex> lock(send_queue_mutex_);
+    
+    if (send_queue_.size() >= MAX_SEND_QUEUE) {
+        send_queue_.pop();  // Drop oldest
+        send_queue_dropped_++;
+    }
+    
+    send_queue_.push(message);
+}
+
+size_t NetworkManager::get_send_queue_size() const {
+    std::lock_guard<std::mutex> lock(send_queue_mutex_);
+    return send_queue_.size();
+}
+
+uint64_t NetworkManager::get_send_queue_dropped() const {
+    return send_queue_dropped_.load();
+}
+
+void NetworkManager::process_send_queue() {
+    std::string message;
+    
+    {
+        std::lock_guard<std::mutex> lock(send_queue_mutex_);
+        if (send_queue_.empty()) return;
+        message = std::move(send_queue_.front());
+        send_queue_.pop();
+    }
+    
+    send_frame_internal(message);
 }
 
 bool NetworkManager::send_frame_internal(const std::string& message) {
@@ -472,6 +558,129 @@ void NetworkManager::wifi_monitor_loop() {
             consecutive_failures = 0;
         }
     }
+}
+
+std::string NetworkManager::upload_image(const std::string& host, const std::vector<uint8_t>& jpeg_data,
+                                         const std::string& session_id, const std::string& device_id) {
+    std::cout << "📤 Uploading image to " << host << " (" << jpeg_data.size() << " bytes)..." << std::endl;
+    
+    // Create a new SSL connection for HTTP POST
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        std::cerr << "❌ Failed to create socket for image upload" << std::endl;
+        return "";
+    }
+    
+    // Set socket timeout
+    struct timeval timeout;
+    timeout.tv_sec = 30;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
+    // Resolve host
+    struct hostent* server = gethostbyname(host.c_str());
+    if (!server) {
+        std::cerr << "❌ Could not resolve host: " << host << std::endl;
+        close(sock);
+        return "";
+    }
+    
+    struct sockaddr_in serv_addr;
+    std::memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    std::memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    serv_addr.sin_port = htons(443);  // HTTPS
+    
+    // Connect
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        std::cerr << "❌ TCP connection failed for image upload" << std::endl;
+        close(sock);
+        return "";
+    }
+    
+    // SSL connection
+    SSL* upload_ssl = SSL_new((SSL_CTX*)ssl_ctx_);
+    SSL_set_fd(upload_ssl, sock);
+    if (SSL_connect(upload_ssl) <= 0) {
+        std::cerr << "❌ SSL handshake failed for image upload" << std::endl;
+        ERR_print_errors_fp(stderr);
+        SSL_free(upload_ssl);
+        close(sock);
+        return "";
+    }
+    
+    // Build HTTP POST request
+    std::string request = 
+        "POST /api/upload-image HTTP/1.1\r\n"
+        "Host: " + host + "\r\n"
+        "Content-Type: image/jpeg\r\n"
+        "Content-Length: " + std::to_string(jpeg_data.size()) + "\r\n"
+        "X-Session-ID: " + session_id + "\r\n"
+        "X-Device-ID: " + device_id + "\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    
+    // Send headers
+    if (SSL_write(upload_ssl, request.c_str(), request.length()) <= 0) {
+        std::cerr << "❌ Failed to send HTTP headers" << std::endl;
+        SSL_shutdown(upload_ssl);
+        SSL_free(upload_ssl);
+        close(sock);
+        return "";
+    }
+    
+    // Send image data
+    size_t total_sent = 0;
+    while (total_sent < jpeg_data.size()) {
+        int chunk_size = std::min(size_t(16384), jpeg_data.size() - total_sent);
+        int sent = SSL_write(upload_ssl, jpeg_data.data() + total_sent, chunk_size);
+        if (sent <= 0) {
+            std::cerr << "❌ Failed to send image data at offset " << total_sent << std::endl;
+            SSL_shutdown(upload_ssl);
+            SSL_free(upload_ssl);
+            close(sock);
+            return "";
+        }
+        total_sent += sent;
+    }
+    
+    std::cout << "📤 Image data sent (" << total_sent << " bytes)" << std::endl;
+    
+    // Read response
+    char buffer[4096];
+    std::string response;
+    int bytes;
+    while ((bytes = SSL_read(upload_ssl, buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[bytes] = '\0';
+        response += buffer;
+    }
+    
+    // Cleanup
+    SSL_shutdown(upload_ssl);
+    SSL_free(upload_ssl);
+    close(sock);
+    
+    // Parse response to extract image_id
+    // Response format: {"success": true, "image_id": "abc123...", "size": 12345}
+    std::string image_id;
+    size_t id_pos = response.find("\"image_id\"");
+    if (id_pos != std::string::npos) {
+        size_t start = response.find("\"", id_pos + 10) + 1;
+        size_t end = response.find("\"", start);
+        if (start != std::string::npos && end != std::string::npos) {
+            image_id = response.substr(start, end - start);
+        }
+    }
+    
+    if (!image_id.empty()) {
+        std::cout << "✅ Image uploaded successfully, id=" << image_id << std::endl;
+    } else {
+        std::cerr << "❌ Failed to parse image_id from response" << std::endl;
+        std::cerr << "Response: " << response.substr(0, 500) << std::endl;
+    }
+    
+    return image_id;
 }
 
 } // namespace mdai

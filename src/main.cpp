@@ -7,9 +7,22 @@
 std::unique_ptr<mdai::SystemController> controller;
 
 void signal_handler(int signum) {
-    std::cout << "\nInterrupt signal (" << signum << ") received. Shutting down..." << std::endl;
-    if (controller) {
-        controller->stop();
+    const char* sig_name = "UNKNOWN";
+    switch(signum) {
+        case SIGINT: sig_name = "SIGINT"; break;
+        case SIGTERM: sig_name = "SIGTERM"; break;
+        case SIGSEGV: sig_name = "SIGSEGV (Segmentation Fault)"; break;
+        case SIGABRT: sig_name = "SIGABRT (Abort)"; break;
+        case SIGFPE: sig_name = "SIGFPE (Floating Point Exception)"; break;
+    }
+    std::cerr << "\n❌ SIGNAL " << signum << " (" << sig_name << ") received!" << std::endl;
+    std::cerr << "   This is likely a crash. Check code for null pointers or memory issues." << std::endl;
+    std::cerr.flush();
+    
+    if (signum == SIGINT || signum == SIGTERM) {
+        if (controller) {
+            controller->stop();
+        }
     }
     exit(signum);
 }
@@ -104,9 +117,12 @@ int main() {
     std::cout << "║   Log: " << RDK_LOG_FILE << "           ║" << std::endl;
     std::cout << "╚════════════════════════════════════════════╝" << std::endl;
     
-    // Register signal handler for graceful shutdown
+    // Register signal handlers for graceful shutdown AND crash detection
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGSEGV, signal_handler);  // Catch segfaults
+    signal(SIGABRT, signal_handler);  // Catch aborts
+    signal(SIGFPE, signal_handler);   // Catch floating point errors
 
     std::cout << "Initializing MDai RDK X5 System..." << std::endl;
     

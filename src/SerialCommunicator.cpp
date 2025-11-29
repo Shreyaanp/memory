@@ -11,9 +11,6 @@
 namespace mdai {
 
 SerialCommunicator::SerialCommunicator(const Config& config) : config_(config) {
-    // Initialize heartbeat time to now (will timeout quickly if ESP32 doesn't respond)
-    last_heartbeat_time_ = std::chrono::steady_clock::now();
-    memset(read_buffer_, 0, sizeof(read_buffer_));
 }
 
 SerialCommunicator::~SerialCommunicator() {
@@ -416,291 +413,254 @@ bool SerialCommunicator::try_reconnect() {
     return false;
 }
 
-// ============================================================================
-// BINARY PROTOCOL IMPLEMENTATION
-// ============================================================================
+// ============================================
+// Async Queue Implementation
+// ============================================
 
-uint8_t SerialCommunicator::get_next_sequence() {
-    return sequence_number_.fetch_add(1);
+void SerialCommunicator::start_async() {
+    if (async_running_.load()) return;
+    
+    async_running_.store(true);
+    async_thread_ = std::thread(&SerialCommunicator::async_worker, this);
+    std::cout << "📤 Serial async thread started" << std::endl;
+}
+
+void SerialCommunicator::stop_async() {
+    if (!async_running_.load()) return;
+    
+    async_running_.store(false);
+    queue_cv_.notify_all();
+    
+    if (async_thread_.joinable()) {
+        async_thread_.join();
+    }
+    std::cout << "📤 Serial async thread stopped" << std::endl;
+}
+
+void SerialCommunicator::queue_state(int state_id, const std::string& text) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    
+    if (message_queue_.size() >= MAX_QUEUE_SIZE) {
+        message_queue_.pop();
+        queue_dropped_++;
+    }
+    
+    message_queue_.push(SerialMsg_State{state_id, text});
+    queue_cv_.notify_one();
+}
+
+void SerialCommunicator::queue_tracking(int x, int y, int progress_percent, bool target_valid) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    
+    // For tracking, replace existing tracking messages (only latest matters)
+    // First, drain old tracking messages
+    std::queue<SerialMessage> temp_queue;
+    while (!message_queue_.empty()) {
+        auto& msg = message_queue_.front();
+        if (!std::holds_alternative<SerialMsg_Tracking>(msg)) {
+            temp_queue.push(std::move(msg));
+        }
+        message_queue_.pop();
+    }
+    message_queue_ = std::move(temp_queue);
+    
+    if (message_queue_.size() >= MAX_QUEUE_SIZE) {
+        message_queue_.pop();
+        queue_dropped_++;
+    }
+    
+    message_queue_.push(SerialMsg_Tracking{x, y, progress_percent, target_valid});
+    queue_cv_.notify_one();
+}
+
+void SerialCommunicator::queue_batch_progress(int progress_percent) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    
+    if (message_queue_.size() >= MAX_QUEUE_SIZE) {
+        message_queue_.pop();
+        queue_dropped_++;
+    }
+    
+    message_queue_.push(SerialMsg_BatchProgress{progress_percent});
+    queue_cv_.notify_one();
+}
+
+void SerialCommunicator::queue_error(const std::string& error_msg) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    
+    if (message_queue_.size() >= MAX_QUEUE_SIZE) {
+        message_queue_.pop();
+        queue_dropped_++;
+    }
+    
+    message_queue_.push(SerialMsg_Error{error_msg});
+    queue_cv_.notify_one();
+}
+
+size_t SerialCommunicator::get_queue_size() const {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return message_queue_.size();
+}
+
+void SerialCommunicator::async_worker() {
+    while (async_running_.load()) {
+        SerialMessage msg;
+        
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait_for(lock, std::chrono::milliseconds(50), [this] {
+                return !message_queue_.empty() || !async_running_.load();
+            });
+            
+            if (!async_running_.load()) break;
+            if (message_queue_.empty()) {
+                // Read feedback from ESP32 when idle
+                lock.unlock();
+                read_serial_feedback();
+                continue;
+            }
+            
+            msg = std::move(message_queue_.front());
+            message_queue_.pop();
+        }
+        
+        process_message(msg);
+    }
+}
+
+void SerialCommunicator::process_message(const SerialMessage& msg) {
+    std::visit([this](auto&& arg) {
+        using T = std::decay_t<decltype(arg)>;
+        
+        if constexpr (std::is_same_v<T, SerialMsg_State>) {
+            if (arg.text.empty()) {
+                send_state(arg.state_id);
+            } else {
+                send_state_with_text(arg.state_id, arg.text);
+            }
+        }
+        else if constexpr (std::is_same_v<T, SerialMsg_Tracking>) {
+            send_tracking_binary(arg.x, arg.y, arg.progress, arg.valid);
+        }
+        else if constexpr (std::is_same_v<T, SerialMsg_BatchProgress>) {
+            send_batch_progress(arg.progress);
+        }
+        else if constexpr (std::is_same_v<T, SerialMsg_Error>) {
+            send_error(arg.message);
+        }
+    }, msg);
+}
+
+// ============================================
+// Binary Protocol Implementation
+// ============================================
+
+bool SerialCommunicator::send_tracking_binary(int x, int y, int progress_percent, bool target_valid) {
+    // For now, use text format (binary can be added later for performance)
+    return send_tracking_data(x, y, progress_percent, target_valid);
 }
 
 bool SerialCommunicator::send_binary_packet(uint8_t cmd, const uint8_t* payload, uint8_t len) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    
     if (!connected_ || fd_ == -1) return false;
-    if (len > 32) return false;  // Max payload size
     
+    uint8_t seq = sequence_number_++;
+    
+    // Build packet: START + LEN + SEQ + CMD + PAYLOAD + CHECKSUM + END
     std::vector<uint8_t> packet;
-    packet.reserve(len + 6);  // START + SEQ + CMD + LEN + PAYLOAD + CHECKSUM + END
-    
-    uint8_t seq = get_next_sequence();
-    
-    packet.push_back(SERIAL_START_BYTE);  // START
-    packet.push_back(seq);                 // SEQ
-    packet.push_back(cmd);                 // CMD
-    packet.push_back(len);                 // LEN
-    
-    // PAYLOAD
+    packet.push_back(SERIAL_START_BYTE);
+    packet.push_back(len);
+    packet.push_back(seq);
+    packet.push_back(cmd);
     for (uint8_t i = 0; i < len; i++) {
         packet.push_back(payload[i]);
     }
     
-    // CHECKSUM (XOR of SEQ, CMD, LEN, and payload)
-    uint8_t checksum = seq ^ cmd ^ len;
+    // Calculate checksum (XOR of LEN, SEQ, CMD, PAYLOAD)
+    uint8_t checksum = len ^ seq ^ cmd;
     for (uint8_t i = 0; i < len; i++) {
         checksum ^= payload[i];
     }
     packet.push_back(checksum);
+    packet.push_back(SERIAL_END_BYTE);
     
-    packet.push_back(SERIAL_END_BYTE);    // END
-    
-    std::lock_guard<std::mutex> lock(write_mutex_);
     ssize_t written = write(fd_, packet.data(), packet.size());
-    
     return written == static_cast<ssize_t>(packet.size());
 }
 
 bool SerialCommunicator::wait_for_ack(uint8_t seq, int timeout_ms) {
-    auto start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(ack_mutex_);
+    ack_received_ = false;
     
-    while (true) {
-        // Check if we received the ACK
-        if (last_ack_seq_.load() == seq) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    
+    while (!ack_received_ && std::chrono::steady_clock::now() < deadline) {
+        ack_cv_.wait_until(lock, deadline);
+        if (last_acked_sequence_ == seq) {
             return true;
         }
+    }
+    
+    return false;
+}
+
+void SerialCommunicator::read_serial_feedback() {
+    if (!connected_ || fd_ == -1) return;
+    
+    char buffer[256];
+    ssize_t bytes_read = read(fd_, buffer, sizeof(buffer) - 1);
+    
+    if (bytes_read <= 0) return;
+    
+    buffer[bytes_read] = '\0';
+    serial_read_buffer_ += buffer;
+    
+    // Process complete lines
+    size_t pos;
+    while ((pos = serial_read_buffer_.find('\n')) != std::string::npos) {
+        std::string line = serial_read_buffer_.substr(0, pos);
+        serial_read_buffer_.erase(0, pos + 1);
         
-        // Check timeout
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        if (elapsed >= timeout_ms) {
-            return false;
+        // Trim CR if present
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
         }
         
-        // Read and process incoming data
-        check_esp32_status();
+        if (line.empty()) continue;
         
-        // Small delay to avoid busy-waiting
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-}
-
-bool SerialCommunicator::send_tracking_binary(int x, int y, int progress_percent, bool target_valid) {
-    // Clamp values
-    if (x < 0) x = 0;
-    if (x > 465) x = 465;
-    if (y < 0) y = 0;
-    if (y > 465) y = 465;
-    if (progress_percent < 0) progress_percent = 0;
-    if (progress_percent > 100) progress_percent = 100;
-    
-    // Build binary tracking packet
-    BinaryTrackingData data;
-    data.x = static_cast<uint16_t>(x);
-    data.y = static_cast<uint16_t>(y);
-    data.progress = static_cast<uint8_t>(progress_percent);
-    data.flags = target_valid ? 0x01 : 0x00;
-    
-    // Send without waiting for ACK (tracking is high-frequency, losing one packet is OK)
-    return send_binary_packet(BIN_CMD_TRACKING, reinterpret_cast<uint8_t*>(&data), sizeof(data));
-}
-
-bool SerialCommunicator::send_state_reliable(int state_id, int max_retries, int timeout_ms) {
-    uint8_t payload[1] = { static_cast<uint8_t>(state_id) };
-    
-    for (int attempt = 0; attempt < max_retries; attempt++) {
-        uint8_t seq = sequence_number_.load();  // Get current seq before sending
-        
-        if (send_binary_packet(BIN_CMD_STATE, payload, 1)) {
-            // Wait for ACK
-            if (wait_for_ack(seq, timeout_ms)) {
-                last_state_ = state_id;
-                std::cout << "[Serial] State " << state_id << " ACKed (attempt " << (attempt + 1) << ")" << std::endl;
-                return true;
-            } else {
-                std::cout << "[Serial] State " << state_id << " timeout (attempt " << (attempt + 1) << "/" << max_retries << ")" << std::endl;
-            }
-        }
-    }
-    
-    std::cerr << "[Serial] State " << state_id << " FAILED after " << max_retries << " attempts" << std::endl;
-    
-    // Fall back to text protocol
-    std::cout << "[Serial] Falling back to text protocol..." << std::endl;
-    return send_state(state_id);
-}
-
-// ============================================================================
-// ESP32 STATUS MONITORING
-// ============================================================================
-
-bool SerialCommunicator::check_esp32_status() {
-    if (!connected_ || fd_ == -1) return false;
-    
-    // Static buffer for binary packet reception
-    static uint8_t bin_buf[40];
-    static int bin_buf_pos = 0;
-    static bool in_binary_packet = false;
-    
-    // Read available data from serial port (non-blocking)
-    char temp_buf[128];
-    ssize_t bytes_read = read(fd_, temp_buf, sizeof(temp_buf) - 1);
-    
-    if (bytes_read <= 0) {
-        // No data available (non-blocking mode)
-        return is_esp32_alive();
-    }
-    
-    // Process received bytes
-    for (ssize_t i = 0; i < bytes_read; i++) {
-        uint8_t c = static_cast<uint8_t>(temp_buf[i]);
-        
-        // Check for binary packet start
-        if (c == SERIAL_START_BYTE && !in_binary_packet) {
-            in_binary_packet = true;
-            bin_buf_pos = 0;
-            bin_buf[bin_buf_pos++] = c;
+        // Parse heartbeat: "H"
+        if (line == "H") {
+            last_heartbeat_ = std::chrono::steady_clock::now();
             continue;
         }
         
-        // If in binary packet mode, collect bytes
-        if (in_binary_packet) {
-            bin_buf[bin_buf_pos++] = c;
-            
-            // Binary ACK/NAK format: [START][SEQ][CMD][CHECKSUM][END] = 5 bytes
-            if (bin_buf_pos >= 5) {
-                // Check if we have a complete ACK/NAK packet
-                if (bin_buf[4] == SERIAL_END_BYTE && 
-                    (bin_buf[2] == BIN_CMD_ACK || bin_buf[2] == BIN_CMD_NAK)) {
-                    
-                    uint8_t seq = bin_buf[1];
-                    uint8_t cmd = bin_buf[2];
-                    uint8_t checksum = bin_buf[3];
-                    uint8_t expected_checksum = seq ^ cmd;
-                    
-                    if (checksum == expected_checksum) {
-                        if (cmd == BIN_CMD_ACK) {
-                            // ACK received!
-                            last_ack_seq_.store(seq);
-                            
-                            // Update heartbeat since ESP32 is responding
-                            {
-                                std::lock_guard<std::mutex> lock(heartbeat_mutex_);
-                                last_heartbeat_time_ = std::chrono::steady_clock::now();
-                            }
-                        } else {
-                            // NAK received
-                            std::cerr << "[Serial] NAK received for seq=" << (int)seq << std::endl;
-                        }
-                    } else {
-                        std::cerr << "[Serial] Binary checksum mismatch" << std::endl;
-                    }
-                    
-                    in_binary_packet = false;
-                    bin_buf_pos = 0;
-                    continue;
-                }
-            }
-            
-            // Overflow protection or invalid packet
-            if (bin_buf_pos >= 10) {
-                in_binary_packet = false;
-                bin_buf_pos = 0;
-            }
+        // Parse status: "S:6"
+        if (line.rfind("S:", 0) == 0) {
+            try {
+                int screen = std::stoi(line.substr(2));
+                esp32_reported_screen_.store(screen);
+            } catch (...) {}
             continue;
         }
         
-        // Text protocol handling
-        if (c == '\n' || c == '\r') {
-            if (read_buffer_pos_ > 0) {
-                read_buffer_[read_buffer_pos_] = '\0';
-                
-                // Parse the message
-                std::string msg(read_buffer_);
-                
-                // Heartbeat format: "HB:<screen>"
-                if (msg.rfind("HB:", 0) == 0) {
-                    std::lock_guard<std::mutex> lock(heartbeat_mutex_);
-                    last_heartbeat_time_ = std::chrono::steady_clock::now();
-                    
-                    // Extract screen number
-                    try {
-                        esp32_current_screen_ = std::stoi(msg.substr(3));
-                    } catch (...) {
-                        // Ignore parse errors
-                    }
-                }
-                // Status format: "STATUS:<screen>:<heap>:<error>"
-                else if (msg.rfind("STATUS:", 0) == 0) {
-                    std::lock_guard<std::mutex> lock(heartbeat_mutex_);
-                    last_heartbeat_time_ = std::chrono::steady_clock::now();
-                    
-                    // Parse: STATUS:6:150000:0
-                    size_t pos1 = msg.find(':', 7);
-                    size_t pos2 = msg.find(':', pos1 + 1);
-                    
-                    if (pos1 != std::string::npos && pos2 != std::string::npos) {
-                        try {
-                            esp32_current_screen_ = std::stoi(msg.substr(7, pos1 - 7));
-                            esp32_heap_ = std::stoul(msg.substr(pos1 + 1, pos2 - pos1 - 1));
-                            esp32_has_error_ = (msg.substr(pos2 + 1) == "1");
-                        } catch (...) {
-                            // Ignore parse errors
-                        }
-                    }
-                    
-                    // Log status
-                    std::cout << "[Serial] ESP32 Status: Screen=" << esp32_current_screen_ 
-                              << ", Heap=" << esp32_heap_ 
-                              << ", Error=" << (esp32_has_error_ ? "YES" : "NO") << std::endl;
-                }
-                // ACK format: "ACK:<cmd>" (text ACK from old protocol)
-                else if (msg.rfind("ACK:", 0) == 0) {
-                    std::lock_guard<std::mutex> lock(heartbeat_mutex_);
-                    last_heartbeat_time_ = std::chrono::steady_clock::now();
-                }
-                // Binary state confirmation: "BIN:STATE:<id>"
-                else if (msg.rfind("BIN:STATE:", 0) == 0) {
-                    std::lock_guard<std::mutex> lock(heartbeat_mutex_);
-                    last_heartbeat_time_ = std::chrono::steady_clock::now();
-                    try {
-                        esp32_current_screen_ = std::stoi(msg.substr(10));
-                    } catch (...) {}
-                }
-                // Error format: "ERR:<code>:<message>"
-                else if (msg.rfind("ERR:", 0) == 0) {
-                    std::cerr << "[Serial] ESP32 Error: " << msg << std::endl;
-                }
-                // Binary errors
-                else if (msg.rfind("BIN:ERR:", 0) == 0) {
-                    std::cerr << "[Serial] ESP32 Binary Error: " << msg << std::endl;
-                }
-                // OK responses
-                else if (msg.rfind("OK:", 0) == 0) {
-                    std::lock_guard<std::mutex> lock(heartbeat_mutex_);
-                    last_heartbeat_time_ = std::chrono::steady_clock::now();
-                }
-                
-                read_buffer_pos_ = 0;
-            }
-        } else {
-            if (read_buffer_pos_ < (int)sizeof(read_buffer_) - 1) {
-                read_buffer_[read_buffer_pos_++] = static_cast<char>(c);
-            } else {
-                // Buffer overflow, reset
-                read_buffer_pos_ = 0;
-            }
+        // Parse ACK: "ACK:5"
+        if (line.rfind("ACK:", 0) == 0) {
+            try {
+                std::lock_guard<std::mutex> lock(ack_mutex_);
+                last_acked_sequence_ = std::stoi(line.substr(4));
+                ack_received_ = true;
+                ack_cv_.notify_one();
+            } catch (...) {}
+            continue;
         }
     }
-    
-    return is_esp32_alive();
 }
 
-bool SerialCommunicator::is_esp32_alive(int timeout_ms) const {
-    std::lock_guard<std::mutex> lock(heartbeat_mutex_);
-    
+bool SerialCommunicator::is_esp32_responsive() const {
     auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_heartbeat_time_).count();
-    
-    return elapsed < timeout_ms;
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat_).count();
+    return elapsed < 10;  // Responsive if heartbeat received within 10 seconds
 }
 
 } // namespace mdai

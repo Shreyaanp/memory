@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -O3")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -O3 -march=armv8-a")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 
 # Find dependencies
@@ -17,13 +17,11 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json 3.2.0 QUIET)
 
-# MediaPipe Configuration (legacy - kept for fallback)
-set(MEDIAPIPE_AVAILABLE TRUE)
-set(MEDIAPIPE_WRAPPER_LIB "${CMAKE_SOURCE_DIR}/lib/mediapipe/libface_mesh_wrapper.so")
-set(MEDIAPIPE_WRAPPER_INCLUDE "${CMAKE_SOURCE_DIR}/include/mediapipe")
-message(STATUS "Face detection: MediaPipe Face Mesh (468 points with GPU acceleration)")
-
-# BPU Configuration removed - using MediaPipe for face detection
+# Native MediaPipe Configuration (no Python!)
+set(MEDIAPIPE_NATIVE_DIR "$ENV{HOME}/mediapipe_arm64_final")
+set(MEDIAPIPE_NATIVE_LIB "${MEDIAPIPE_NATIVE_DIR}/lib/libface_landmarker.so")
+set(MEDIAPIPE_NATIVE_INCLUDE "${MEDIAPIPE_NATIVE_DIR}/include")
+message(STATUS "Face detection: Native MediaPipe Face Landmarker (478 points, ~44 FPS, no Python)")
 
 if(OpenCV_FOUND)
     message(STATUS "OpenCV found: ${OpenCV_VERSION}")
@@ -44,18 +42,20 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${realsense2_INCLUDE_DIR}
     ${OpenCV_INCLUDE_DIRS}
-    ${MEDIAPIPE_WRAPPER_INCLUDE}
+    ${MEDIAPIPE_NATIVE_INCLUDE}
+    ${PROJECT_SOURCE_DIR}/include/mediapipe
     ${OPENSSL_INCLUDE_DIR}
 )
 
-# CORE SOURCES
+# CORE SOURCES (IR-only mode - no anti-spoofing)
 set(SOURCES
     src/FrameBox.cpp
     src/RingBuffer.cpp
     src/Producer.cpp
     src/CameraInitializer.cpp
-    src/AntiSpoofing.cpp
+    # src/AntiSpoofing.cpp  # REMOVED - IR-only mode
     src/FaceDetector.cpp
+    src/NativeFaceLandmarker.cpp
     src/SerialCommunicator.cpp
     src/NetworkManager.cpp
     src/CryptoUtils.cpp
@@ -68,14 +68,20 @@ add_library(mdai_realsense SHARED ${SOURCES})
 target_link_libraries(mdai_realsense 
     ${realsense2_LIBRARY}
     Threads::Threads
-    ${MEDIAPIPE_WRAPPER_LIB}
+    ${MEDIAPIPE_NATIVE_LIB}
     OpenSSL::SSL 
     OpenSSL::Crypto
     -Wl,--no-as-needed
     dl
     absl_status
     absl_statusor
-    zbar
+    /usr/local/lib/libquirc.a
+)
+
+# Set RPATH for native MediaPipe library
+set_target_properties(mdai_realsense PROPERTIES
+    BUILD_RPATH "${MEDIAPIPE_NATIVE_DIR}/lib"
+    INSTALL_RPATH "${MEDIAPIPE_NATIVE_DIR}/lib"
 )
 
 if(OpenCV_FOUND)
@@ -89,6 +95,12 @@ endif()
 # Main System Application
 add_executable(mdai_system src/main.cpp)
 target_link_libraries(mdai_system mdai_realsense)
+
+# Set RPATH for executable too
+set_target_properties(mdai_system PROPERTIES
+    BUILD_RPATH "${MEDIAPIPE_NATIVE_DIR}/lib"
+    INSTALL_RPATH "${MEDIAPIPE_NATIVE_DIR}/lib"
+)
 
 # Install targets
 install(TARGETS mdai_realsense mdai_system

@@ -1,0 +1,154 @@
+IR FACE DETECTION TEST RESULTS
+Generated: 2025-11-29 15:59:57
+================================================================================
+
+SUMMARY:
+
+SIMPLE:
+  Face Mesh: 13/15 (86.7%)
+  Face Det:  14/15 (93.3%)
+
+CLAHE:
+  Face Mesh: 13/15 (86.7%)
+  Face Det:  14/15 (93.3%)
+
+HISTOGRAM_EQ:
+  Face Mesh: 13/15 (86.7%)
+  Face Det:  14/15 (93.3%)
+
+Best for Face Mesh: simple
+Best for Face Detection: simple
+
+================================================================================
+DETAILED RESULTS:
+================================================================================
+
+
+File: close and low res modi_Infrared.png
+Size: 480x848, Mean: 94.4, Std: 63.9
+  simple: Mesh=YES (478lm), Det=YES (conf=0.87)
+         Nose: (258.4, 407.7)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.88)
+         Nose: (259.0, 406.9)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.89)
+         Nose: (258.9, 408.3)
+
+File: default close_Infrared.png
+Size: 480x848, Mean: 105.9, Std: 73.3
+  simple: Mesh=YES (478lm), Det=YES (conf=0.96)
+         Nose: (250.5, 423.5)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.96)
+         Nose: (249.6, 424.6)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.95)
+         Nose: (249.1, 425.7)
+
+File: default_Infrared.png
+Size: 480x848, Mean: 96.5, Std: 63.8
+  simple: Mesh=YES (478lm), Det=YES (conf=0.93)
+         Nose: (252.0, 394.0)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.91)
+         Nose: (252.3, 394.0)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.95)
+         Nose: (251.3, 396.9)
+
+File: higfh res close_Infrared.png
+Size: 800x1280, Mean: 95.3, Std: 65.8
+  simple: Mesh=YES (478lm), Det=YES (conf=0.93)
+         Nose: (401.4, 706.7)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.93)
+         Nose: (401.8, 706.5)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.91)
+         Nose: (401.0, 712.4)
+
+File: high res wide frame_Infrared.png
+Size: 800x1280, Mean: 88.5, Std: 56.1
+  simple: Mesh=YES (478lm), Det=YES (conf=0.92)
+         Nose: (386.8, 623.7)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.94)
+         Nose: (389.2, 623.5)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.95)
+         Nose: (390.0, 624.7)
+
+File: log light auto modi wide_Infrared.png
+Size: 480x848, Mean: 89.0, Std: 48.8
+  simple: Mesh=YES (478lm), Det=YES (conf=0.85)
+         Nose: (271.0, 403.7)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.82)
+         Nose: (271.0, 404.9)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.86)
+         Nose: (274.0, 405.0)
+
+File: low exposure and high gain manual_Infrared.png
+Size: 480x848, Mean: 57.8, Std: 39.7
+  simple: Mesh=YES (478lm), Det=YES (conf=0.91)
+         Nose: (240.3, 457.4)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.95)
+         Nose: (238.0, 458.9)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.95)
+         Nose: (239.3, 460.3)
+
+File: low light auto modi_Infrared.png
+Size: 480x848, Mean: 88.8, Std: 53.2
+  simple: Mesh=YES (478lm), Det=YES (conf=0.92)
+         Nose: (239.3, 400.6)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.91)
+         Nose: (237.2, 397.2)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.92)
+         Nose: (240.4, 399.1)
+
+File: low light close frame_Infrared.png
+Size: 480x848, Mean: 106.7, Std: 75.8
+  simple: Mesh=YES (478lm), Det=YES (conf=0.96)
+         Nose: (248.0, 378.8)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.96)
+         Nose: (248.3, 380.3)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.95)
+         Nose: (248.0, 381.2)
+
+File: low light wide frame_Infrared.png
+Size: 480x848, Mean: 90.0, Std: 56.6
+  simple: Mesh=YES (478lm), Det=YES (conf=0.90)
+         Nose: (245.6, 403.7)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.93)
+         Nose: (245.8, 403.8)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.94)
+         Nose: (245.8, 406.2)
+
+File: phone close normal_Infrared.png
+Size: 480x848, Mean: 84.9, Std: 49.4
+  simple: Mesh=YES (478lm), Det=YES (conf=0.88)
+         Nose: (263.1, 433.4)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.90)
+         Nose: (264.3, 435.5)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.92)
+         Nose: (263.9, 436.1)
+
+File: phone low light close_Infrared.png
+Size: 480x848, Mean: 77.8, Std: 54.3
+  simple: Mesh=YES (478lm), Det=YES (conf=0.87)
+         Nose: (115.4, 457.7)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.93)
+         Nose: (116.4, 457.5)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.92)
+         Nose: (115.1, 459.6)
+
+File: phone low light wide_Infrared.png
+Size: 480x848, Mean: 79.4, Std: 45.7
+  simple: Mesh=NO (0lm), Det=YES (conf=0.51)
+  clahe: Mesh=NO (0lm), Det=YES (conf=0.57)
+  histogram_eq: Mesh=NO (0lm), Det=YES (conf=0.52)
+
+File: phone normal wide_Infrared.png
+Size: 480x848, Mean: 81.8, Std: 43.8
+  simple: Mesh=NO (0lm), Det=NO (conf=0.00)
+  clahe: Mesh=NO (0lm), Det=NO (conf=0.00)
+  histogram_eq: Mesh=NO (0lm), Det=NO (conf=0.00)
+
+File: wide high res modi_Infrared.png
+Size: 480x848, Mean: 92.4, Std: 59.5
+  simple: Mesh=YES (478lm), Det=YES (conf=0.86)
+         Nose: (268.4, 410.8)
+  clahe: Mesh=YES (478lm), Det=YES (conf=0.86)
+         Nose: (267.8, 410.4)
+  histogram_eq: Mesh=YES (478lm), Det=YES (conf=0.87)
+         Nose: (268.2, 411.3)

@@ -1,36 +1,90 @@
 [Unit]
-Description=MDai Liveness Detection System
-After=local-fs.target
+Description=MDai RDK Liveness Detection System
+Documentation=file:///home/mercleDev/codebase/README.md
+
+# Boot order - wait for network and basic services
+After=network-online.target local-fs.target
 After=NetworkManager.service
-After=wifi-always-on.service
 After=tailscaled.service
-After=ssh.service
+Wants=network-online.target
 
-Wants=wifi-always-on.service
-Wants=tailscaled.service
-
-StartLimitIntervalSec=60
-StartLimitBurst=10
+# Rate limiting for restart loops
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=forking
+Type=simple
 User=mercleDev
 Group=mercleDev
 
-# Start EXACTLY like rebuild-and-restart.sh does
-ExecStartPre=-/usr/bin/pkill -9 -x mdai_system
-ExecStartPre=/bin/sleep 2
+# Hardware access groups
+SupplementaryGroups=dialout video plugdev
 
-ExecStart=/bin/bash -c 'cd /home/mercleDev/codebase && nohup ./build/mdai_system >> /home/mercleDev/mdai_logs/rdk.log 2>&1 &'
+# Working directory and environment
+WorkingDirectory=/home/mercleDev/codebase/build
+Environment="LD_LIBRARY_PATH=/home/mercleDev/codebase/build:/home/mercleDev/codebase/lib/mediapipe"
+Environment="HOME=/home/mercleDev"
 
-# Give it time to fork
-ExecStartPost=/bin/sleep 3
+# Ensure log directory exists
+ExecStartPre=/bin/mkdir -p /home/mercleDev/mdai_logs
 
+# Main executable - runs in foreground
+ExecStart=/home/mercleDev/codebase/build/mdai_system
+
+# ============================================
+# HIGH PRIORITY SCHEDULING
+# ============================================
+# Highest process priority
+Nice=-20
+
+# Real-time FIFO scheduling (highest CPU priority)
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=99
+
+# Real-time I/O priority for camera/serial
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+# ============================================
+# PROTECTION & RELIABILITY
+# ============================================
+# Never kill this process due to OOM
+OOMScoreAdjust=-1000
+
+# Restart policy
 Restart=always
-RestartSec=5
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=15
 
-KillMode=process
-TimeoutStopSec=10
+# Graceful shutdown via SIGTERM, then SIGKILL
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+
+# ============================================
+# RESOURCE GUARANTEES
+# ============================================
+# No CPU throttling
+CPUQuota=100%
+
+# Memory reservation (adjust based on your RDK specs)
+# MemoryMin=256M
+# MemoryHigh=1G
+
+# ============================================
+# SECURITY (minimal - we need hardware access)
+# ============================================
+# Keep access to /tmp for camera
+PrivateTmp=false
+
+# Allow network access
+PrivateNetwork=false
+
+# Standard output goes to journal (app also writes to its own log)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mdai-system
 
 [Install]
 WantedBy=multi-user.target

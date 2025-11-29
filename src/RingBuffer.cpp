@@ -132,11 +132,8 @@ size_t DynamicRingBuffer::get_memory_usage() const {
 }
 
 size_t DynamicRingBuffer::estimate_frame_size(const FrameBox& frame) const {
-    return frame.depth_data.size() * 2 + 
-           frame.color_data.size() + 
-           frame.ir_left_data.size() + 
-           frame.ir_right_data.size() + 
-           sizeof(FrameBox);
+    // IR-only mode: only ir_data is present
+    return frame.ir_data.size() + sizeof(FrameBox);
 }
 
 bool DynamicRingBuffer::grow_buffer() {

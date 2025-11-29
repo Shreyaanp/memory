@@ -6,37 +6,36 @@
 #include <opencv2/dnn.hpp>
 #endif
 
-// MediaPipe Face Mesh wrapper (468 points)
-#include "face_mesh_wrapper.h"
+// Native MediaPipe Face Landmarker (no Python!)
+#include "mediapipe/native_face_landmarker.h"
 
 namespace mdai {
 
 // ============================================================================
-// MediaPipe Face Mesh Detector Implementation (468 points)
+// MediaPipe Face Mesh Detector Implementation (478 points) - NATIVE C++
+// IR-ONLY MODE: Converts grayscale IR to BGR for MediaPipe
 // ============================================================================
 
 class MediaPipeFaceDetector::Impl {
 public:
-    Impl() : initialized_(false) {
-        // Configure MediaPipe Face Mesh
-        // Note: model_path is not used by the Python MediaPipe wrapper
-        // The wrapper uses Python's mediapipe.solutions.face_mesh.FaceMesh directly
-        FaceMeshConfig config;
+    Impl() : initialized_(false), frame_count_(0) {
+        // Configure Native MediaPipe Face Landmarker
+        NativeFaceLandmarkerConfig config;
+        config.model_path = "/home/mercleDev/mediapipe_arm64_final/models/face_landmarker.task";
         config.num_faces = 1;
-        config.min_detection_confidence = 0.5f;
+        config.min_face_detection_confidence = 0.5f;
+        config.min_face_presence_confidence = 0.5f;
         config.min_tracking_confidence = 0.5f;
-        config.min_presence_confidence = 0.5f;
-        config.use_gpu = true;  // Enable GPU acceleration (MediaPipe Python handles this automatically)
+        config.output_face_blendshapes = false;
         
-        detector_ = std::make_unique<FaceMeshDetector>(config);
+        detector_ = std::make_unique<NativeFaceLandmarker>(config);
         initialized_ = detector_->IsInitialized();
         
         if (initialized_) {
-            std::cout << "✓ MediaPipe Face Mesh (468 points) initialized successfully" << std::endl;
+            std::cout << "✓ MediaPipe Face Mesh (478 points) - IR-ONLY MODE" << std::endl;
         } else {
-            std::cerr << "❌ Failed to initialize MediaPipe Face Mesh: " 
+            std::cerr << "❌ Failed to initialize Native MediaPipe: " 
                       << detector_->GetLastError() << std::endl;
-            std::cerr << "   Make sure MediaPipe Python is installed: pip3 install mediapipe" << std::endl;
         }
     }
     
@@ -47,15 +46,20 @@ public:
             return false;
         }
         
-        cv::Mat color_mat = frame->get_color_mat();
-        if (color_mat.empty()) {
+        // IR-ONLY MODE: Get IR data converted to BGR
+        cv::Mat bgr_mat = frame->get_ir_as_bgr();
+        if (bgr_mat.empty()) {
             return false;
         }
         
-        // Frame is already rotated at source (Producer) - portrait 480x848
-        // Detect face mesh directly
-        FaceMeshResult face_mesh;
-        bool success = detector_->Detect(color_mat, face_mesh);
+        // Get timestamp for video mode tracking
+        int64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+        
+        // Detect face mesh using native detector
+        NativeFaceMeshResult face_mesh;
+        bool success = detector_->DetectForVideo(bgr_mat, timestamp_ms, face_mesh);
         
         // Reset face detection metadata
         frame->metadata.face_detected = false;
@@ -84,11 +88,6 @@ public:
         frame->metadata.face_detected = true;
         frame->metadata.face_detection_confidence = face_mesh.confidence;
         
-        // Frame is already in portrait orientation (480x848)
-        // Direct mapping to display (466x466)
-        int frame_width = color_mat.cols;
-        int frame_height = color_mat.rows;
-        
         // Store bbox in frame space
         frame->metadata.face_x = face_mesh.bbox.x;
         frame->metadata.face_y = face_mesh.bbox.y;
@@ -96,24 +95,27 @@ public:
         frame->metadata.face_h = face_mesh.bbox.height;
         
         // Store frame dimensions for proper normalization
-        frame->metadata.rotated_width = frame_width;
-        frame->metadata.rotated_height = frame_height;
+        frame->metadata.frame_width = bgr_mat.cols;
+        frame->metadata.frame_height = bgr_mat.rows;
         
-        // Store all 468 landmarks in frame space (pixel coords)
+        // Store all 478 landmarks in frame space (pixel coords)
         frame->metadata.landmarks.reserve(face_mesh.landmarks.size());
-        for (const auto& lm : face_mesh.landmarks) {
-            frame->metadata.landmarks.emplace_back(lm.x, lm.y, lm.z);
+        for (size_t i = 0; i < face_mesh.landmarks.size(); i++) {
+            const auto& lm = face_mesh.landmarks[i];
+            float vis = i < face_mesh.visibility.size() ? face_mesh.visibility[i] : 1.0f;
+            frame->metadata.landmarks.emplace_back(lm.x, lm.y, lm.z, vis);
         }
         
-        
+        frame_count_++;
         return true;
     }
     
     bool is_initialized() const { return initialized_; }
     
 private:
-    std::unique_ptr<FaceMeshDetector> detector_;
+    std::unique_ptr<NativeFaceLandmarker> detector_;
     bool initialized_;
+    uint64_t frame_count_;
 };
 
 MediaPipeFaceDetector::MediaPipeFaceDetector() 
@@ -128,7 +130,8 @@ bool MediaPipeFaceDetector::detect(FrameBox* frame) {
 }
 
 // ============================================================================
-// OpenCV DNN Face Detector Implementation
+// OpenCV DNN Face Detector Implementation (Fallback)
+// IR-ONLY MODE: Converts grayscale IR to BGR
 // ============================================================================
 
 #ifdef HAVE_OPENCV
@@ -153,7 +156,7 @@ OpenCVDNNFaceDetector::OpenCVDNNFaceDetector(const std::string& model_path,
             net->setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
             net->setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
             cuda_available = true;
-            std::cout << "✓ OpenCV DNN face detector initialized (CUDA GPU)" << std::endl;
+            std::cout << "✓ OpenCV DNN face detector initialized (CUDA GPU) - IR MODE" << std::endl;
         } catch (...) {
             cuda_available = false;
         }
@@ -163,7 +166,7 @@ OpenCVDNNFaceDetector::OpenCVDNNFaceDetector(const std::string& model_path,
             // Fallback to CPU with optimizations
             net->setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
             net->setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-            std::cout << "✓ OpenCV DNN face detector initialized (CPU)" << std::endl;
+            std::cout << "✓ OpenCV DNN face detector initialized (CPU) - IR MODE" << std::endl;
         }
         
         net_ = net;
@@ -182,15 +185,16 @@ bool OpenCVDNNFaceDetector::detect(FrameBox* frame) {
     }
     
     cv::dnn::Net* net = static_cast<cv::dnn::Net*>(net_);
-    cv::Mat color_mat = frame->get_color_mat();
     
-    if (color_mat.empty()) {
+    // IR-ONLY MODE: Get IR data converted to BGR
+    cv::Mat bgr_mat = frame->get_ir_as_bgr();
+    if (bgr_mat.empty()) {
         return false;
     }
     
     // Prepare input blob (ResNet-SSD expects 300x300)
     cv::Mat blob = cv::dnn::blobFromImage(
-        color_mat, 
+        bgr_mat, 
         1.0,                                    // scale
         cv::Size(300, 300),                     // size
         cv::Scalar(104.0, 177.0, 123.0),       // mean subtraction (BGR)
@@ -231,16 +235,16 @@ bool OpenCVDNNFaceDetector::detect(FrameBox* frame) {
         float y2_norm = detection_mat.at<float>(best_idx, 6);
         
         // Convert to pixel coordinates
-        int x1 = static_cast<int>(x1_norm * color_mat.cols);
-        int y1 = static_cast<int>(y1_norm * color_mat.rows);
-        int x2 = static_cast<int>(x2_norm * color_mat.cols);
-        int y2 = static_cast<int>(y2_norm * color_mat.rows);
+        int x1 = static_cast<int>(x1_norm * bgr_mat.cols);
+        int y1 = static_cast<int>(y1_norm * bgr_mat.rows);
+        int x2 = static_cast<int>(x2_norm * bgr_mat.cols);
+        int y2 = static_cast<int>(y2_norm * bgr_mat.rows);
         
         // Clamp to image boundaries
-        x1 = std::max(0, std::min(x1, color_mat.cols - 1));
-        y1 = std::max(0, std::min(y1, color_mat.rows - 1));
-        x2 = std::max(0, std::min(x2, color_mat.cols - 1));
-        y2 = std::max(0, std::min(y2, color_mat.rows - 1));
+        x1 = std::max(0, std::min(x1, bgr_mat.cols - 1));
+        y1 = std::max(0, std::min(y1, bgr_mat.rows - 1));
+        x2 = std::max(0, std::min(x2, bgr_mat.cols - 1));
+        y2 = std::max(0, std::min(y2, bgr_mat.rows - 1));
         
         frame->metadata.face_detected = true;
         frame->metadata.face_x = x1;
@@ -272,19 +276,19 @@ bool OpenCVDNNFaceDetector::detect(FrameBox* frame) {
 // ============================================================================
 
 std::unique_ptr<FaceDetector> create_face_detector() {
-    // Always use MediaPipe Face Mesh (468 points) with GPU acceleration
+    // Always use Native MediaPipe Face Mesh (478 points) - IR-ONLY MODE
     auto mp_detector = std::make_unique<MediaPipeFaceDetector>();
     if (mp_detector->is_initialized()) {
-        std::cout << "✓ Using MediaPipe Face Mesh (468 landmarks, GPU accelerated)" << std::endl;
+        std::cout << "✓ Using Native MediaPipe Face Mesh (478 landmarks) - IR-ONLY" << std::endl;
         return mp_detector;
     }
     
-    std::cerr << "❌ MediaPipe initialization failed, trying OpenCV DNN fallback..." << std::endl;
+    std::cerr << "❌ Native MediaPipe initialization failed, trying OpenCV DNN fallback..." << std::endl;
 
 #ifdef HAVE_OPENCV
     auto cv_detector = std::make_unique<OpenCVDNNFaceDetector>();
     if (cv_detector->is_initialized()) {
-        std::cout << "⚠ Using OpenCV DNN face detector (fallback)" << std::endl;
+        std::cout << "⚠ Using OpenCV DNN face detector (fallback) - IR-ONLY" << std::endl;
         return cv_detector;
     }
     std::cerr << "❌ OpenCV DNN initialization failed" << std::endl;
@@ -295,4 +299,3 @@ std::unique_ptr<FaceDetector> create_face_detector() {
 }
 
 } // namespace mdai
-
