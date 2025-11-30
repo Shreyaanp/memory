@@ -1,4 +1,5 @@
 #include "FrameBox.hpp"
+#include <iostream>
 
 namespace mdai {
 
@@ -71,20 +72,42 @@ FrameBox& FrameBox::operator=(FrameBox&& other) noexcept {
 }
 
 void FrameBox::notify_stage_complete(const std::string& stage_name) {
-    std::lock_guard<std::mutex> lock(stage_mutex);
-    completed_stages.insert(stage_name);
-    stage_cv.notify_all();
+    try {
+        std::lock_guard<std::mutex> lock(stage_mutex);
+        completed_stages.insert(stage_name);
+        stage_cv.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "❌ notify_stage_complete exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ notify_stage_complete unknown exception" << std::endl;
+    }
 }
 
 bool FrameBox::wait_for_stage(const std::string& stage_name, int timeout_ms) {
-    std::unique_lock<std::mutex> lock(stage_mutex);
-    return stage_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
-        [&]{ return completed_stages.count(stage_name) > 0; });
+    try {
+        std::unique_lock<std::mutex> lock(stage_mutex);
+        return stage_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
+            [&]{ return completed_stages.count(stage_name) > 0; });
+    } catch (const std::exception& e) {
+        std::cerr << "❌ wait_for_stage exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ wait_for_stage unknown exception" << std::endl;
+        return false;
+    }
 }
 
 bool FrameBox::is_stage_complete(const std::string& stage_name) const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(stage_mutex));
-    return completed_stages.count(stage_name) > 0;
+    try {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(stage_mutex));
+        return completed_stages.count(stage_name) > 0;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ is_stage_complete exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ is_stage_complete unknown exception" << std::endl;
+        return false;
+    }
 }
 
 std::pair<int, int> FrameBox::get_dimensions() const {
@@ -107,25 +130,41 @@ int FrameBox::release() {
 
 #ifdef HAVE_OPENCV
 cv::Mat FrameBox::get_ir_mat() const {
-    if (ir_data.empty() || ir_width <= 0 || ir_height <= 0) {
+    try {
+        if (ir_data.empty() || ir_width <= 0 || ir_height <= 0) {
+            return cv::Mat();
+        }
+        
+        // Create OpenCV Mat from IR data (8-bit grayscale)
+        return cv::Mat(ir_height, ir_width, CV_8UC1, 
+                       const_cast<uint8_t*>(ir_data.data()));
+    } catch (const std::exception& e) {
+        std::cerr << "❌ get_ir_mat exception: " << e.what() << std::endl;
+        return cv::Mat();
+    } catch (...) {
+        std::cerr << "❌ get_ir_mat unknown exception" << std::endl;
         return cv::Mat();
     }
-    
-    // Create OpenCV Mat from IR data (8-bit grayscale)
-    return cv::Mat(ir_height, ir_width, CV_8UC1, 
-                   const_cast<uint8_t*>(ir_data.data()));
 }
 
 cv::Mat FrameBox::get_ir_as_bgr() const {
-    cv::Mat gray = get_ir_mat();
-    if (gray.empty()) {
+    try {
+        cv::Mat gray = get_ir_mat();
+        if (gray.empty()) {
+            return cv::Mat();
+        }
+        
+        // Convert grayscale IR to BGR for MediaPipe
+        cv::Mat bgr;
+        cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
+        return bgr;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ get_ir_as_bgr exception: " << e.what() << std::endl;
+        return cv::Mat();
+    } catch (...) {
+        std::cerr << "❌ get_ir_as_bgr unknown exception" << std::endl;
         return cv::Mat();
     }
-    
-    // Convert grayscale IR to BGR for MediaPipe
-    cv::Mat bgr;
-    cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
-    return bgr;
 }
 #endif
 
@@ -145,23 +184,31 @@ std::tuple<const void*, int, int, const char*> FrameBox::get_ir_numpy() const {
 }
 
 std::string FrameBox::to_json() const {
-    std::string json = "{";
-    json += "\"sequence_id\":" + std::to_string(sequence_id) + ",";
-    json += "\"timestamp\":" + std::to_string(timestamp) + ",";
-    json += "\"ir_width\":" + std::to_string(ir_width) + ",";
-    json += "\"ir_height\":" + std::to_string(ir_height) + ",";
-    json += "\"has_ir\":" + std::string(ir_data.empty() ? "false" : "true") + ",";
-    json += "\"face_detected\":" + std::string(metadata.face_detected ? "true" : "false");
-    if (metadata.face_detected) {
-        json += ",\"face_x\":" + std::to_string(metadata.face_x);
-        json += ",\"face_y\":" + std::to_string(metadata.face_y);
-        json += ",\"face_w\":" + std::to_string(metadata.face_w);
-        json += ",\"face_h\":" + std::to_string(metadata.face_h);
-        json += ",\"confidence\":" + std::to_string(metadata.face_detection_confidence);
-        json += ",\"landmarks_count\":" + std::to_string(metadata.landmarks.size());
+    try {
+        std::string json = "{";
+        json += "\"sequence_id\":" + std::to_string(sequence_id) + ",";
+        json += "\"timestamp\":" + std::to_string(timestamp) + ",";
+        json += "\"ir_width\":" + std::to_string(ir_width) + ",";
+        json += "\"ir_height\":" + std::to_string(ir_height) + ",";
+        json += "\"has_ir\":" + std::string(ir_data.empty() ? "false" : "true") + ",";
+        json += "\"face_detected\":" + std::string(metadata.face_detected ? "true" : "false");
+        if (metadata.face_detected) {
+            json += ",\"face_x\":" + std::to_string(metadata.face_x);
+            json += ",\"face_y\":" + std::to_string(metadata.face_y);
+            json += ",\"face_w\":" + std::to_string(metadata.face_w);
+            json += ",\"face_h\":" + std::to_string(metadata.face_h);
+            json += ",\"confidence\":" + std::to_string(metadata.face_detection_confidence);
+            json += ",\"landmarks_count\":" + std::to_string(metadata.landmarks.size());
+        }
+        json += "}";
+        return json;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ to_json exception: " << e.what() << std::endl;
+        return "{}";
+    } catch (...) {
+        std::cerr << "❌ to_json unknown exception" << std::endl;
+        return "{}";
     }
-    json += "}";
-    return json;
 }
 
 } // namespace mdai

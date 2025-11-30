@@ -65,78 +65,110 @@ int NetworkManager::net_write(const void* buf, int len) {
 }
 
 bool NetworkManager::connect_wifi(const std::string& ssid, const std::string& password) {
-    std::cout << "Connecting to WiFi: " << ssid << std::endl;
-    
-    // Store credentials for auto-reconnect
-    last_ssid_ = ssid;
-    last_password_ = password;
-    
-    std::string cmd = "nmcli device wifi connect '" + ssid + "' password '" + password + "'";
-    bool success = (std::system(cmd.c_str()) == 0);
-    
-    if (success) {
-        std::cout << "✅ WiFi connected successfully" << std::endl;
-        // Start monitoring after successful connection
-        if (!wifi_monitor_running_) {
-            start_wifi_monitor();
+    try {
+        std::cout << "Connecting to WiFi: " << ssid << std::endl;
+        
+        // Store credentials for auto-reconnect
+        last_ssid_ = ssid;
+        last_password_ = password;
+        
+        std::string cmd = "nmcli device wifi connect '" + ssid + "' password '" + password + "'";
+        bool success = (std::system(cmd.c_str()) == 0);
+        
+        if (success) {
+            std::cout << "✅ WiFi connected successfully" << std::endl;
+            // Start monitoring after successful connection
+            if (!wifi_monitor_running_) {
+                start_wifi_monitor();
+            }
         }
+        
+        return success;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ connect_wifi exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ connect_wifi unknown exception" << std::endl;
+        return false;
     }
-    
-    return success;
 }
 
 bool NetworkManager::is_connected_to_internet() {
-    struct hostent* host = gethostbyname("google.com");
-    return (host != nullptr);
+    try {
+        struct hostent* host = gethostbyname("google.com");
+        return (host != nullptr);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ is_connected_to_internet exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ is_connected_to_internet unknown exception" << std::endl;
+        return false;
+    }
 }
 
 std::string NetworkManager::get_ip_address() {
-    // Implementation from previous step remains valid
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock == -1) return "0.0.0.0";
-    
-    // Use Google DNS IP to find route
-    struct sockaddr_in serv;
-    std::memset(&serv, 0, sizeof(serv));
-    serv.sin_family = AF_INET;
-    serv.sin_addr.s_addr = inet_addr("8.8.8.8");
-    serv.sin_port = htons(53);
-    
-    if (connect(sock, (const struct sockaddr*)&serv, sizeof(serv)) == -1) {
+    try {
+        // Implementation from previous step remains valid
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock == -1) return "0.0.0.0";
+        
+        // Use Google DNS IP to find route
+        struct sockaddr_in serv;
+        std::memset(&serv, 0, sizeof(serv));
+        serv.sin_family = AF_INET;
+        serv.sin_addr.s_addr = inet_addr("8.8.8.8");
+        serv.sin_port = htons(53);
+        
+        if (connect(sock, (const struct sockaddr*)&serv, sizeof(serv)) == -1) {
+            close(sock);
+            return "0.0.0.0";
+        }
+        
+        struct sockaddr_in name;
+        socklen_t namelen = sizeof(name);
+        if (getsockname(sock, (struct sockaddr*)&name, &namelen) == -1) {
+            close(sock);
+            return "0.0.0.0";
+        }
+        
+        char buffer[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &name.sin_addr, buffer, sizeof(buffer));
         close(sock);
+        return std::string(buffer);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ get_ip_address exception: " << e.what() << std::endl;
+        return "0.0.0.0";
+    } catch (...) {
+        std::cerr << "❌ get_ip_address unknown exception" << std::endl;
         return "0.0.0.0";
     }
-    
-    struct sockaddr_in name;
-    socklen_t namelen = sizeof(name);
-    if (getsockname(sock, (struct sockaddr*)&name, &namelen) == -1) {
-        close(sock);
-        return "0.0.0.0";
-    }
-    
-    char buffer[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &name.sin_addr, buffer, sizeof(buffer));
-    close(sock);
-    return std::string(buffer);
 }
 
 std::string NetworkManager::get_current_ssid() {
-    // Use nmcli to get the currently connected WiFi SSID
-    FILE* pipe = popen("nmcli -t -f active,ssid dev wifi | awk -F: '$1 ~ /^yes/ {print $2}'", "r");
-    if (!pipe) return "";
-    
-    char buffer[256];
-    std::string ssid;
-    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        ssid = buffer;
-        // Remove trailing newline
-        if (!ssid.empty() && ssid.back() == '\n') {
-            ssid.pop_back();
+    try {
+        // Use nmcli to get the currently connected WiFi SSID
+        FILE* pipe = popen("nmcli -t -f active,ssid dev wifi | awk -F: '$1 ~ /^yes/ {print $2}'", "r");
+        if (!pipe) return "";
+        
+        char buffer[256];
+        std::string ssid;
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            ssid = buffer;
+            // Remove trailing newline
+            if (!ssid.empty() && ssid.back() == '\n') {
+                ssid.pop_back();
+            }
         }
+        pclose(pipe);
+        
+        return ssid;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ get_current_ssid exception: " << e.what() << std::endl;
+        return "";
+    } catch (...) {
+        std::cerr << "❌ get_current_ssid unknown exception" << std::endl;
+        return "";
     }
-    pclose(pipe);
-    
-    return ssid;
 }
 
 // ============================================================================
@@ -144,53 +176,83 @@ std::string NetworkManager::get_current_ssid() {
 // ============================================================================
 
 bool NetworkManager::connect_to_middleware(const std::string& host, int port, const std::string& path, const std::string& device_id) {
-    if (running_) return false;
-    
-    // CRITICAL: Join any previous thread before starting a new one
-    // Assigning to a joinable thread causes std::terminate
-    if (client_thread_.joinable()) {
-        std::cout << "🔌 Cleaning up previous WebSocket thread..." << std::endl;
-        client_thread_.join();
+    try {
+        // If already running, stop it first (allows reconnection)
+        if (running_) {
+            std::cout << "🔌 Previous connection still active - stopping first..." << std::endl;
+            stop_reconnect();
+            // Give thread time to notice the stop signal
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        
+        // CRITICAL: Join any previous thread before starting a new one
+        // Assigning to a joinable thread causes std::terminate
+        if (client_thread_.joinable()) {
+            std::cout << "🔌 Waiting for previous WebSocket thread to finish..." << std::endl;
+            
+            // Join will block until thread exits - socket shutdown should have unblocked it
+            client_thread_.join();
+            std::cout << "🔌 Previous thread cleanup complete" << std::endl;
+        }
+        
+        running_ = true;
+        connected_ = false;  // Reset connection state
+        client_thread_ = std::thread(&NetworkManager::client_loop, this, host, port, path, device_id);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ connect_to_middleware exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ connect_to_middleware unknown exception" << std::endl;
+        return false;
     }
-    
-    running_ = true;
-    client_thread_ = std::thread(&NetworkManager::client_loop, this, host, port, path, device_id);
-    return true;
 }
 
 void NetworkManager::disconnect() {
-    running_ = false;
-    connected_ = false;
-    
-    // Shutdown socket to unblock any blocking reads in the thread
-    if (socket_fd_ != -1) {
-        shutdown(socket_fd_, SHUT_RDWR);
-    }
-    
-    // Wait for thread to finish (it will do its own cleanup)
-    if (client_thread_.joinable()) {
-        client_thread_.join();
+    try {
+        running_ = false;
+        connected_ = false;
+        
+        // Shutdown socket to unblock any blocking reads in the thread
+        if (socket_fd_ != -1) {
+            shutdown(socket_fd_, SHUT_RDWR);
+        }
+        
+        // Wait for thread to finish (it will do its own cleanup)
+        if (client_thread_.joinable()) {
+            client_thread_.join();
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ disconnect exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ disconnect unknown exception" << std::endl;
     }
 }
 
 void NetworkManager::stop_reconnect() {
-    // Stop the reconnection loop (non-blocking)
-    // NOTE: Do NOT join thread here - may be called from within the thread (callback)
-    
-    bool was_connected = connected_;
-    bool was_running = running_;
-    
-    running_ = false;
-    connected_ = false;
-    
-    // Close socket to unblock any pending read/write operations
-    if (socket_fd_ != -1) {
-        shutdown(socket_fd_, SHUT_RDWR);
-    }
-    
-    // Only log if there was an active connection/session
-    if (was_connected || was_running) {
-        std::cout << "🔌 WebSocket connection closed" << std::endl;
+    try {
+        // Stop the reconnection loop (non-blocking)
+        // NOTE: Do NOT join thread here - may be called from within the thread (callback)
+        
+        bool was_connected = connected_;
+        bool was_running = running_;
+        
+        running_ = false;
+        connected_ = false;
+        
+        // Close socket to unblock any pending read/write operations
+        if (socket_fd_ != -1) {
+            shutdown(socket_fd_, SHUT_RDWR);
+        }
+        
+        // Only log if there was an active connection/session
+        if (was_connected || was_running) {
+            std::cout << "🔌 WebSocket connection closed" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ stop_reconnect exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ stop_reconnect unknown exception" << std::endl;
     }
 }
 
@@ -207,6 +269,7 @@ void NetworkManager::set_connect_callback(ConnectCallback cb) {
 }
 
 void NetworkManager::client_loop(std::string host, int port, std::string path, std::string device_id) {
+    try {
     // ==========================================================================
     // SINGLE CONNECTION - NO AUTO-RECONNECT
     // ==========================================================================
@@ -326,9 +389,19 @@ void NetworkManager::client_loop(std::string host, int port, std::string path, s
     running_ = false;
     
     std::cout << "🔌 WebSocket thread exited" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ client_loop exception: " << e.what() << std::endl;
+        connected_ = false;
+        running_ = false;
+    } catch (...) {
+        std::cerr << "❌ client_loop unknown exception" << std::endl;
+        connected_ = false;
+        running_ = false;
+    }
 }
 
 bool NetworkManager::perform_handshake(const std::string& host, const std::string& path, const std::string& device_id) {
+    try {
     // Generate random 16-byte key
     std::string key_bytes(16, ' ');
     std::random_device rd;
@@ -355,21 +428,42 @@ bool NetworkManager::perform_handshake(const std::string& host, const std::strin
     
     std::string response(buffer);
     return (response.find("101 Switching Protocols") != std::string::npos);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ perform_handshake exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ perform_handshake unknown exception" << std::endl;
+        return false;
+    }
 }
 
 bool NetworkManager::send_message(const std::string& message) {
-    return send_frame_internal(message);
+    try {
+        return send_frame_internal(message);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ send_message exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ send_message unknown exception" << std::endl;
+        return false;
+    }
 }
 
 void NetworkManager::queue_message(const std::string& message) {
-    std::lock_guard<std::mutex> lock(send_queue_mutex_);
-    
-    if (send_queue_.size() >= MAX_SEND_QUEUE) {
-        send_queue_.pop();  // Drop oldest
-        send_queue_dropped_++;
+    try {
+        std::lock_guard<std::mutex> lock(send_queue_mutex_);
+        
+        if (send_queue_.size() >= MAX_SEND_QUEUE) {
+            send_queue_.pop();  // Drop oldest
+            send_queue_dropped_++;
+        }
+        
+        send_queue_.push(message);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ queue_message exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ queue_message unknown exception" << std::endl;
     }
-    
-    send_queue_.push(message);
 }
 
 size_t NetworkManager::get_send_queue_size() const {
@@ -382,146 +476,169 @@ uint64_t NetworkManager::get_send_queue_dropped() const {
 }
 
 void NetworkManager::process_send_queue() {
-    std::string message;
-    
-    {
-        std::lock_guard<std::mutex> lock(send_queue_mutex_);
-        if (send_queue_.empty()) return;
-        message = std::move(send_queue_.front());
-        send_queue_.pop();
+    try {
+        std::string message;
+        
+        {
+            std::lock_guard<std::mutex> lock(send_queue_mutex_);
+            if (send_queue_.empty()) return;
+            message = std::move(send_queue_.front());
+            send_queue_.pop();
+        }
+        
+        send_frame_internal(message);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ process_send_queue exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ process_send_queue unknown exception" << std::endl;
     }
-    
-    send_frame_internal(message);
 }
 
 bool NetworkManager::send_frame_internal(const std::string& message) {
-    if (!connected_ || !ssl_) return false;
-    
-    std::vector<uint8_t> frame;
-    frame.push_back(0x81); // FIN + Text Frame
-    
-    // Proper length encoding per WebSocket RFC 6455
-    size_t payload_len = message.length();
-    if (payload_len <= 125) {
-        frame.push_back(0x80 | payload_len);  // MASK bit + length
-    } else if (payload_len <= 65535) {
-        frame.push_back(0x80 | 126);  // MASK bit + 126 (extended 16-bit length)
-        frame.push_back((payload_len >> 8) & 0xFF);
-        frame.push_back(payload_len & 0xFF);
-    } else {
-        frame.push_back(0x80 | 127);  // MASK bit + 127 (extended 64-bit length)
-        for (int i = 7; i >= 0; --i) {
-            frame.push_back((payload_len >> (i * 8)) & 0xFF);
+    try {
+        if (!connected_ || !ssl_) return false;
+        
+        std::vector<uint8_t> frame;
+        frame.push_back(0x81); // FIN + Text Frame
+        
+        // Proper length encoding per WebSocket RFC 6455
+        size_t payload_len = message.length();
+        if (payload_len <= 125) {
+            frame.push_back(0x80 | payload_len);  // MASK bit + length
+        } else if (payload_len <= 65535) {
+            frame.push_back(0x80 | 126);  // MASK bit + 126 (extended 16-bit length)
+            frame.push_back((payload_len >> 8) & 0xFF);
+            frame.push_back(payload_len & 0xFF);
+        } else {
+            frame.push_back(0x80 | 127);  // MASK bit + 127 (extended 64-bit length)
+            for (int i = 7; i >= 0; --i) {
+                frame.push_back((payload_len >> (i * 8)) & 0xFF);
+            }
         }
+        
+        // Masking Key (should be random per RFC, using fixed for simplicity)
+        uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78}; 
+        frame.push_back(mask[0]); frame.push_back(mask[1]); frame.push_back(mask[2]); frame.push_back(mask[3]);
+        
+        // Mask Payload
+        for (size_t i = 0; i < message.length(); ++i) {
+            frame.push_back(message[i] ^ mask[i % 4]);
+        }
+        
+        int sent = net_write(frame.data(), frame.size());
+        return (sent == static_cast<int>(frame.size()));
+    } catch (const std::exception& e) {
+        std::cerr << "❌ send_frame_internal exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ send_frame_internal unknown exception" << std::endl;
+        return false;
     }
-    
-    // Masking Key (should be random per RFC, using fixed for simplicity)
-    uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78}; 
-    frame.push_back(mask[0]); frame.push_back(mask[1]); frame.push_back(mask[2]); frame.push_back(mask[3]);
-    
-    // Mask Payload
-    for (size_t i = 0; i < message.length(); ++i) {
-        frame.push_back(message[i] ^ mask[i % 4]);
-    }
-    
-    int sent = net_write(frame.data(), frame.size());
-    return (sent == static_cast<int>(frame.size()));
 }
 
 std::string NetworkManager::receive_frame() {
-    if (!connected_ || socket_fd_ < 0) return "";
-    
-    while (true) {  // Loop to handle control frames
-    uint8_t header[2];
-        int read_result = net_read(header, 2);
-        if (read_result <= 0) {
-            // For SSL, check if it's a retriable error
-            if (ssl_) {
-                int ssl_error = SSL_get_error((SSL*)ssl_, read_result);
-                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    continue;  // Retry
+    try {
+        if (!connected_ || socket_fd_ < 0) return "";
+        
+        while (true) {  // Loop to handle control frames
+        uint8_t header[2];
+            int read_result = net_read(header, 2);
+            if (read_result <= 0) {
+                // For SSL, check if it's a retriable error
+                if (ssl_) {
+                    int ssl_error = SSL_get_error((SSL*)ssl_, read_result);
+                    if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        continue;  // Retry
+                    }
+                }
+                return "";  // Real error or disconnect
+            }
+            
+            uint8_t opcode = header[0] & 0x0F;
+            bool is_fin = (header[0] & 0x80) != 0;
+            (void)is_fin;  // Suppress unused warning
+            uint64_t payload_len = header[1] & 0x7F;
+            
+            // Handle extended payload length
+            if (payload_len == 126) {
+                uint8_t len_bytes[2];
+                if (net_read(len_bytes, 2) <= 0) return "";
+                payload_len = (len_bytes[0] << 8) | len_bytes[1];
+            } else if (payload_len == 127) {
+                uint8_t len_bytes[8];
+                if (net_read(len_bytes, 8) <= 0) return "";
+                payload_len = 0;
+                for (int i = 0; i < 8; i++) {
+                    payload_len = (payload_len << 8) | len_bytes[i];
                 }
             }
-            return "";  // Real error or disconnect
-        }
-        
-        uint8_t opcode = header[0] & 0x0F;
-        bool is_fin = (header[0] & 0x80) != 0;
-        uint64_t payload_len = header[1] & 0x7F;
-        
-        // Handle extended payload length
-        if (payload_len == 126) {
-            uint8_t len_bytes[2];
-            if (net_read(len_bytes, 2) <= 0) return "";
-            payload_len = (len_bytes[0] << 8) | len_bytes[1];
-        } else if (payload_len == 127) {
-            uint8_t len_bytes[8];
-            if (net_read(len_bytes, 8) <= 0) return "";
-            payload_len = 0;
-            for (int i = 0; i < 8; i++) {
-                payload_len = (payload_len << 8) | len_bytes[i];
+            
+            // Read payload
+            std::vector<uint8_t> buffer(payload_len);
+            size_t total_read = 0;
+            while (total_read < payload_len) {
+                int r = net_read(buffer.data() + total_read, payload_len - total_read);
+                if (r <= 0) return "";
+                total_read += r;
             }
-        }
         
-        // Read payload
-        std::vector<uint8_t> buffer(payload_len);
-        size_t total_read = 0;
-        while (total_read < payload_len) {
-            int r = net_read(buffer.data() + total_read, payload_len - total_read);
-            if (r <= 0) return "";
-            total_read += r;
-        }
-    
-        // Handle different frame types
-        switch (opcode) {
-            case 0x01:  // Text frame
-            case 0x02:  // Binary frame
-    return std::string(buffer.begin(), buffer.end());
-                
-            case 0x08:  // Close frame
-                {
-                    // Extract close code if present
-                    uint16_t close_code = 0;
-                    std::string close_reason;
-                    if (buffer.size() >= 2) {
-                        close_code = (buffer[0] << 8) | buffer[1];
-                        if (buffer.size() > 2) {
-                            close_reason = std::string(buffer.begin() + 2, buffer.end());
-                        }
-                    }
-                    std::cout << "🔌 WebSocket close frame received - Code: " << close_code 
-                              << ", Reason: " << (close_reason.empty() ? "(none)" : close_reason) << std::endl;
+            // Handle different frame types
+            switch (opcode) {
+                case 0x01:  // Text frame
+                case 0x02:  // Binary frame
+        return std::string(buffer.begin(), buffer.end());
                     
-                    // Send close frame back
-                    uint8_t close_resp[2] = {0x88, 0x00};
-                    net_write(close_resp, 2);
-                }
-                return "";  // Signal disconnect
-                
-            case 0x09:  // Ping frame - respond with Pong
-                {
-                    std::vector<uint8_t> pong_frame;
-                    pong_frame.push_back(0x8A);  // FIN + Pong opcode
-                    pong_frame.push_back(0x80 | (payload_len & 0x7F));  // Mask bit + length
-                    // Add mask key
-                    uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
-                    pong_frame.insert(pong_frame.end(), mask, mask + 4);
-                    // Add masked payload (echo back ping data)
-                    for (size_t i = 0; i < buffer.size(); i++) {
-                        pong_frame.push_back(buffer[i] ^ mask[i % 4]);
+                case 0x08:  // Close frame
+                    {
+                        // Extract close code if present
+                        uint16_t close_code = 0;
+                        std::string close_reason;
+                        if (buffer.size() >= 2) {
+                            close_code = (buffer[0] << 8) | buffer[1];
+                            if (buffer.size() > 2) {
+                                close_reason = std::string(buffer.begin() + 2, buffer.end());
+                            }
+                        }
+                        std::cout << "🔌 WebSocket close frame received - Code: " << close_code 
+                                  << ", Reason: " << (close_reason.empty() ? "(none)" : close_reason) << std::endl;
+                        
+                        // Send close frame back
+                        uint8_t close_resp[2] = {0x88, 0x00};
+                        net_write(close_resp, 2);
                     }
-                    net_write(pong_frame.data(), pong_frame.size());
-                }
-                continue;  // Keep reading for actual data
-                
-            case 0x0A:  // Pong frame - ignore
-                continue;  // Keep reading for actual data
-                
-            default:
-                // Unknown opcode, skip
-                continue;
+                    return "";  // Signal disconnect
+                    
+                case 0x09:  // Ping frame - respond with Pong
+                    {
+                        std::vector<uint8_t> pong_frame;
+                        pong_frame.push_back(0x8A);  // FIN + Pong opcode
+                        pong_frame.push_back(0x80 | (payload_len & 0x7F));  // Mask bit + length
+                        // Add mask key
+                        uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
+                        pong_frame.insert(pong_frame.end(), mask, mask + 4);
+                        // Add masked payload (echo back ping data)
+                        for (size_t i = 0; i < buffer.size(); i++) {
+                            pong_frame.push_back(buffer[i] ^ mask[i % 4]);
+                        }
+                        net_write(pong_frame.data(), pong_frame.size());
+                    }
+                    continue;  // Keep reading for actual data
+                    
+                case 0x0A:  // Pong frame - ignore
+                    continue;  // Keep reading for actual data
+                    
+                default:
+                    // Unknown opcode, skip
+                    continue;
+            }
         }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ receive_frame exception: " << e.what() << std::endl;
+        return "";
+    } catch (...) {
+        std::cerr << "❌ receive_frame unknown exception" << std::endl;
+        return "";
     }
 }
 
@@ -550,49 +667,56 @@ void NetworkManager::wifi_monitor_loop() {
     const int max_failures = 3;
     
     while (wifi_monitor_running_) {
-        // Check WiFi every 10 seconds
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        
-        if (!is_connected_to_internet()) {
-            consecutive_failures++;
-            std::cerr << "⚠️  WiFi check failed (" << consecutive_failures << "/" << max_failures << ")" << std::endl;
+        try {
+            // Check WiFi every 10 seconds
+            std::this_thread::sleep_for(std::chrono::seconds(10));
             
-            if (consecutive_failures >= max_failures) {
-                std::cerr << "🔄 WiFi lost! Attempting reconnection..." << std::endl;
+            if (!is_connected_to_internet()) {
+                consecutive_failures++;
+                std::cerr << "⚠️  WiFi check failed (" << consecutive_failures << "/" << max_failures << ")" << std::endl;
                 
-                // Try to reconnect using stored credentials
-                if (!last_ssid_.empty()) {
-                    std::string cmd = "nmcli device wifi connect '" + last_ssid_ + "' password '" + last_password_ + "'";
-                    if (std::system(cmd.c_str()) == 0) {
-                        std::cout << "✅ WiFi reconnected successfully!" << std::endl;
-                        consecutive_failures = 0;
-                    } else {
-                        std::cerr << "❌ WiFi reconnection failed, will retry..." << std::endl;
-                        // Wait longer before next attempt
-                        std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (consecutive_failures >= max_failures) {
+                    std::cerr << "🔄 WiFi lost! Attempting reconnection..." << std::endl;
+                    
+                    // Try to reconnect using stored credentials
+                    if (!last_ssid_.empty()) {
+                        std::string cmd = "nmcli device wifi connect '" + last_ssid_ + "' password '" + last_password_ + "'";
+                        if (std::system(cmd.c_str()) == 0) {
+                            std::cout << "✅ WiFi reconnected successfully!" << std::endl;
+                            consecutive_failures = 0;
+                        } else {
+                            std::cerr << "❌ WiFi reconnection failed, will retry..." << std::endl;
+                            // Wait longer before next attempt
+                            std::this_thread::sleep_for(std::chrono::seconds(5));
+                        }
                     }
                 }
+            } else {
+                // Reset counter on successful check
+                if (consecutive_failures > 0) {
+                    std::cout << "✅ WiFi connection restored" << std::endl;
+                }
+                consecutive_failures = 0;
             }
-        } else {
-            // Reset counter on successful check
-            if (consecutive_failures > 0) {
-                std::cout << "✅ WiFi connection restored" << std::endl;
-            }
-            consecutive_failures = 0;
+        } catch (const std::exception& e) {
+            std::cerr << "❌ wifi_monitor_loop exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "❌ wifi_monitor_loop unknown exception" << std::endl;
         }
     }
 }
 
 std::string NetworkManager::upload_image(const std::string& host, const std::vector<uint8_t>& jpeg_data,
                                          const std::string& session_id, const std::string& device_id) {
-    std::cout << "📤 Uploading image to " << host << " (" << jpeg_data.size() << " bytes)..." << std::endl;
-    
-    // Create a new SSL connection for HTTP POST
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        std::cerr << "❌ Failed to create socket for image upload" << std::endl;
-        return "";
-    }
+    try {
+        std::cout << "📤 Uploading image to " << host << " (" << jpeg_data.size() << " bytes)..." << std::endl;
+        
+        // Create a new SSL connection for HTTP POST
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            std::cerr << "❌ Failed to create socket for image upload" << std::endl;
+            return "";
+        }
     
     // Set socket timeout
     struct timeval timeout;
@@ -709,6 +833,13 @@ std::string NetworkManager::upload_image(const std::string& host, const std::vec
     }
     
     return image_id;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ upload_image exception: " << e.what() << std::endl;
+        return "";
+    } catch (...) {
+        std::cerr << "❌ upload_image unknown exception" << std::endl;
+        return "";
+    }
 }
 
 } // namespace mdai

@@ -156,24 +156,35 @@ void Producer::set_status_callback(std::function<void(const std::string&)> callb
 }
 
 bool Producer::configure_pipeline() {
-    // Enable ONLY the left IR stream (index 1)
-        rs_config_.enable_stream(
-        RS2_STREAM_INFRARED, 1,  // Left IR sensor
-            config_.ir_width,
-            config_.ir_height,
-        RS2_FORMAT_Y8,          // 8-bit grayscale
-            config_.ir_fps
-        );
-    
-    // Select specific device if serial provided
-    if (!config_.device_serial.empty()) {
-        rs_config_.enable_device(config_.device_serial);
+    try {
+        // Enable ONLY the left IR stream (index 1)
+            rs_config_.enable_stream(
+            RS2_STREAM_INFRARED, 1,  // Left IR sensor
+                config_.ir_width,
+                config_.ir_height,
+            RS2_FORMAT_Y8,          // 8-bit grayscale
+                config_.ir_fps
+            );
+        
+        // Select specific device if serial provided
+        if (!config_.device_serial.empty()) {
+            rs_config_.enable_device(config_.device_serial);
+        }
+        
+        std::cout << "📹 IR-only mode: " << config_.ir_width << "x" 
+                  << config_.ir_height << "@" << config_.ir_fps << "fps" << std::endl;
+        
+        return true;
+    } catch (const rs2::error& e) {
+        report_error(std::string("❌ configure_pipeline rs2 error: ") + e.what());
+        return false;
+    } catch (const std::exception& e) {
+        report_error(std::string("❌ configure_pipeline exception: ") + e.what());
+        return false;
+    } catch (...) {
+        report_error("❌ configure_pipeline unknown exception");
+        return false;
     }
-    
-    std::cout << "📹 IR-only mode: " << config_.ir_width << "x" 
-              << config_.ir_height << "@" << config_.ir_fps << "fps" << std::endl;
-    
-    return true;
 }
 
 void Producer::configure_sensor_options() {
@@ -254,9 +265,17 @@ void Producer::capture_loop() {
                     }
                     first_frame_received_.store(true);
                     
-                    if (ring_buffer_->write(std::move(framebox))) {
+                    bool write_ok = ring_buffer_->write(std::move(framebox));
+                    if (write_ok) {
                         total_frames_captured_.fetch_add(1);
                         frames_since_last_calc_++;
+                    } else {
+                        // Track write failures
+                        static int write_fail_count = 0;
+                        write_fail_count++;
+                        if (write_fail_count % 100 == 1) {
+                            std::cerr << "⚠️ Producer: Ring buffer write failed (" << write_fail_count << " total)" << std::endl;
+                        }
                     }
                 }
                 
@@ -283,39 +302,51 @@ void Producer::capture_loop() {
 FrameBox Producer::process_ir_frame(rs2::video_frame& ir_frame) {
     FrameBox fb;
     
-    fb.sequence_id = sequence_id_.fetch_add(1);
-    fb.timestamp = ir_frame.get_timestamp();
-    
-    // Get frame dimensions
-    fb.ir_width = ir_frame.get_width();
-    fb.ir_height = ir_frame.get_height();
+    try {
+        fb.sequence_id = sequence_id_.fetch_add(1);
+        fb.timestamp = ir_frame.get_timestamp();
         
-    // Copy IR data
-            size_t ir_size = fb.ir_width * fb.ir_height;
-    fb.ir_data.resize(ir_size);
+        // Get frame dimensions
+        fb.ir_width = ir_frame.get_width();
+        fb.ir_height = ir_frame.get_height();
             
-    const uint8_t* ir_data = reinterpret_cast<const uint8_t*>(ir_frame.get_data());
-    std::copy(ir_data, ir_data + ir_size, fb.ir_data.begin());
-    
-    // Store frame dimensions in metadata
-    fb.metadata.frame_width = fb.ir_width;
-    fb.metadata.frame_height = fb.ir_height;
+        // Copy IR data
+                size_t ir_size = fb.ir_width * fb.ir_height;
+        fb.ir_data.resize(ir_size);
+                
+        const uint8_t* ir_data = reinterpret_cast<const uint8_t*>(ir_frame.get_data());
+        std::copy(ir_data, ir_data + ir_size, fb.ir_data.begin());
+        
+        // Store frame dimensions in metadata
+        fb.metadata.frame_width = fb.ir_width;
+        fb.metadata.frame_height = fb.ir_height;
+    } catch (const std::exception& e) {
+        report_error(std::string("❌ process_ir_frame exception: ") + e.what());
+    } catch (...) {
+        report_error("❌ process_ir_frame unknown exception");
+    }
     
     return fb;
 }
 
 void Producer::update_fps() {
-    auto now = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_fps_calc_time_).count();
-    
-    // Update FPS every second
-    if (duration >= 1000) {
-        float fps = (frames_since_last_calc_ * 1000.0f) / duration;
-        current_fps_.store(fps);
+    try {
+        auto now = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_fps_calc_time_).count();
         
-        frames_since_last_calc_ = 0;
-        last_fps_calc_time_ = now;
+        // Update FPS every second
+        if (duration >= 1000) {
+            float fps = (frames_since_last_calc_ * 1000.0f) / duration;
+            current_fps_.store(fps);
+            
+            frames_since_last_calc_ = 0;
+            last_fps_calc_time_ = now;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ update_fps exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ update_fps unknown exception" << std::endl;
     }
 }
 

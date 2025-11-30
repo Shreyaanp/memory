@@ -42,72 +42,80 @@ public:
     ~Impl() = default;
     
     bool detect_faces(FrameBox* frame) {
-        if (!initialized_ || !frame) {
-            return false;
-        }
-        
-        // IR-ONLY MODE: Get IR data converted to BGR
-        cv::Mat bgr_mat = frame->get_ir_as_bgr();
-        if (bgr_mat.empty()) {
-            return false;
-        }
-        
-        // Get timestamp for video mode tracking
-        int64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()
-        ).count();
-        
-        // Detect face mesh using native detector
-        NativeFaceMeshResult face_mesh;
-        bool success = detector_->DetectForVideo(bgr_mat, timestamp_ms, face_mesh);
-        
-        // Reset face detection metadata
-        frame->metadata.face_detected = false;
-        frame->metadata.face_detection_confidence = 0.0f;
-        frame->metadata.landmarks.clear();
-        
-        if (!success) {
-            // Detection failed
-            return false;
-        }
-        
-        // Check if face was detected
-        if (face_mesh.landmarks.empty() || face_mesh.confidence < 0.3f) {
-            return true;  // No face, but detection succeeded
-        }
-        
-        // Check for occlusion
-        if (face_mesh.IsOccluded(0.5f, 0.3f)) {
-            // More than 30% of landmarks occluded - reject
+        try {
+            if (!initialized_ || !frame) {
+                return false;
+            }
+            
+            // IR-ONLY MODE: Get IR data converted to BGR
+            cv::Mat bgr_mat = frame->get_ir_as_bgr();
+            if (bgr_mat.empty()) {
+                return false;
+            }
+            
+            // Get timestamp for video mode tracking
+            int64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count();
+            
+            // Detect face mesh using native detector
+            NativeFaceMeshResult face_mesh;
+            bool success = detector_->DetectForVideo(bgr_mat, timestamp_ms, face_mesh);
+            
+            // Reset face detection metadata
             frame->metadata.face_detected = false;
-            frame->metadata.face_rejection_reason = "Face partially occluded";
+            frame->metadata.face_detection_confidence = 0.0f;
+            frame->metadata.landmarks.clear();
+            
+            if (!success) {
+                // Detection failed
+                return false;
+            }
+            
+            // Check if face was detected
+            if (face_mesh.landmarks.empty() || face_mesh.confidence < 0.3f) {
+                return true;  // No face, but detection succeeded
+            }
+            
+            // Check for occlusion
+            if (face_mesh.IsOccluded(0.5f, 0.3f)) {
+                // More than 30% of landmarks occluded - reject
+                frame->metadata.face_detected = false;
+                frame->metadata.face_rejection_reason = "Face partially occluded";
+                return true;
+            }
+            
+            // Valid face detected
+            frame->metadata.face_detected = true;
+            frame->metadata.face_detection_confidence = face_mesh.confidence;
+            
+            // Store bbox in frame space
+            frame->metadata.face_x = face_mesh.bbox.x;
+            frame->metadata.face_y = face_mesh.bbox.y;
+            frame->metadata.face_w = face_mesh.bbox.width;
+            frame->metadata.face_h = face_mesh.bbox.height;
+            
+            // Store frame dimensions for proper normalization
+            frame->metadata.frame_width = bgr_mat.cols;
+            frame->metadata.frame_height = bgr_mat.rows;
+            
+            // Store all 478 landmarks in frame space (pixel coords)
+            frame->metadata.landmarks.reserve(face_mesh.landmarks.size());
+            for (size_t i = 0; i < face_mesh.landmarks.size(); i++) {
+                const auto& lm = face_mesh.landmarks[i];
+                float vis = i < face_mesh.visibility.size() ? face_mesh.visibility[i] : 1.0f;
+                frame->metadata.landmarks.emplace_back(lm.x, lm.y, lm.z, vis);
+            }
+            
+            frame_count_++;
             return true;
+        } catch (const std::exception& e) {
+            std::cerr << "❌ detect_faces exception: " << e.what() << std::endl;
+            return false;
+        } catch (...) {
+            std::cerr << "❌ detect_faces unknown exception" << std::endl;
+            return false;
         }
-        
-        // Valid face detected
-        frame->metadata.face_detected = true;
-        frame->metadata.face_detection_confidence = face_mesh.confidence;
-        
-        // Store bbox in frame space
-        frame->metadata.face_x = face_mesh.bbox.x;
-        frame->metadata.face_y = face_mesh.bbox.y;
-        frame->metadata.face_w = face_mesh.bbox.width;
-        frame->metadata.face_h = face_mesh.bbox.height;
-        
-        // Store frame dimensions for proper normalization
-        frame->metadata.frame_width = bgr_mat.cols;
-        frame->metadata.frame_height = bgr_mat.rows;
-        
-        // Store all 478 landmarks in frame space (pixel coords)
-        frame->metadata.landmarks.reserve(face_mesh.landmarks.size());
-        for (size_t i = 0; i < face_mesh.landmarks.size(); i++) {
-            const auto& lm = face_mesh.landmarks[i];
-            float vis = i < face_mesh.visibility.size() ? face_mesh.visibility[i] : 1.0f;
-            frame->metadata.landmarks.emplace_back(lm.x, lm.y, lm.z, vis);
-        }
-        
-        frame_count_++;
-        return true;
     }
     
     bool is_initialized() const { return initialized_; }
@@ -126,7 +134,15 @@ MediaPipeFaceDetector::MediaPipeFaceDetector()
 MediaPipeFaceDetector::~MediaPipeFaceDetector() = default;
 
 bool MediaPipeFaceDetector::detect(FrameBox* frame) {
-    return impl_->detect_faces(frame);
+    try {
+        return impl_->detect_faces(frame);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ MediaPipeFaceDetector::detect exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ MediaPipeFaceDetector::detect unknown exception" << std::endl;
+        return false;
+    }
 }
 
 // ============================================================================
@@ -180,81 +196,92 @@ OpenCVDNNFaceDetector::OpenCVDNNFaceDetector(const std::string& model_path,
 }
 
 bool OpenCVDNNFaceDetector::detect(FrameBox* frame) {
-    if (!initialized_ || !frame || !net_) {
-        return false;
-    }
-    
-    cv::dnn::Net* net = static_cast<cv::dnn::Net*>(net_);
-    
-    // IR-ONLY MODE: Get IR data converted to BGR
-    cv::Mat bgr_mat = frame->get_ir_as_bgr();
-    if (bgr_mat.empty()) {
-        return false;
-    }
-    
-    // Prepare input blob (ResNet-SSD expects 300x300)
-    cv::Mat blob = cv::dnn::blobFromImage(
-        bgr_mat, 
-        1.0,                                    // scale
-        cv::Size(300, 300),                     // size
-        cv::Scalar(104.0, 177.0, 123.0),       // mean subtraction (BGR)
-        false,                                  // swapRB (already BGR)
-        false                                   // crop
-    );
-    
-    net->setInput(blob);
-    cv::Mat detections = net->forward();
-    
-    // Reset face detection metadata
-    frame->metadata.face_detected = false;
-    frame->metadata.face_detection_confidence = 0.0f;
-    
-    // Process detections
-    // Output shape: [1, 1, N, 7] where N is number of detections
-    // Each detection: [image_id, label, confidence, x1, y1, x2, y2]
-    cv::Mat detection_mat(detections.size[2], detections.size[3], CV_32F, detections.ptr<float>());
-    
-    float best_confidence = 0.0f;
-    int best_idx = -1;
-    
-    for (int i = 0; i < detection_mat.rows; i++) {
-        float confidence = detection_mat.at<float>(i, 2);
-        
-        // Confidence threshold: 0.7 for high precision
-        if (confidence > 0.7f && confidence > best_confidence) {
-            best_confidence = confidence;
-            best_idx = i;
+    try {
+        if (!initialized_ || !frame || !net_) {
+            return false;
         }
+        
+        cv::dnn::Net* net = static_cast<cv::dnn::Net*>(net_);
+        
+        // IR-ONLY MODE: Get IR data converted to BGR
+        cv::Mat bgr_mat = frame->get_ir_as_bgr();
+        if (bgr_mat.empty()) {
+            return false;
+        }
+        
+        // Prepare input blob (ResNet-SSD expects 300x300)
+        cv::Mat blob = cv::dnn::blobFromImage(
+            bgr_mat, 
+            1.0,                                    // scale
+            cv::Size(300, 300),                     // size
+            cv::Scalar(104.0, 177.0, 123.0),       // mean subtraction (BGR)
+            false,                                  // swapRB (already BGR)
+            false                                   // crop
+        );
+        
+        net->setInput(blob);
+        cv::Mat detections = net->forward();
+        
+        // Reset face detection metadata
+        frame->metadata.face_detected = false;
+        frame->metadata.face_detection_confidence = 0.0f;
+        
+        // Process detections
+        // Output shape: [1, 1, N, 7] where N is number of detections
+        // Each detection: [image_id, label, confidence, x1, y1, x2, y2]
+        cv::Mat detection_mat(detections.size[2], detections.size[3], CV_32F, detections.ptr<float>());
+        
+        float best_confidence = 0.0f;
+        int best_idx = -1;
+        
+        for (int i = 0; i < detection_mat.rows; i++) {
+            float confidence = detection_mat.at<float>(i, 2);
+            
+            // Confidence threshold: 0.7 for high precision
+            if (confidence > 0.7f && confidence > best_confidence) {
+                best_confidence = confidence;
+                best_idx = i;
+            }
+        }
+        
+        if (best_idx >= 0) {
+            // Extract bbox (normalized coordinates 0-1)
+            float x1_norm = detection_mat.at<float>(best_idx, 3);
+            float y1_norm = detection_mat.at<float>(best_idx, 4);
+            float x2_norm = detection_mat.at<float>(best_idx, 5);
+            float y2_norm = detection_mat.at<float>(best_idx, 6);
+            
+            // Convert to pixel coordinates
+            int x1 = static_cast<int>(x1_norm * bgr_mat.cols);
+            int y1 = static_cast<int>(y1_norm * bgr_mat.rows);
+            int x2 = static_cast<int>(x2_norm * bgr_mat.cols);
+            int y2 = static_cast<int>(y2_norm * bgr_mat.rows);
+            
+            // Clamp to image boundaries
+            x1 = std::max(0, std::min(x1, bgr_mat.cols - 1));
+            y1 = std::max(0, std::min(y1, bgr_mat.rows - 1));
+            x2 = std::max(0, std::min(x2, bgr_mat.cols - 1));
+            y2 = std::max(0, std::min(y2, bgr_mat.rows - 1));
+            
+            frame->metadata.face_detected = true;
+            frame->metadata.face_x = x1;
+            frame->metadata.face_y = y1;
+            frame->metadata.face_w = x2 - x1;
+            frame->metadata.face_h = y2 - y1;
+            frame->metadata.face_detection_confidence = best_confidence;
+        }
+        
+        return true;
+    } catch (const cv::Exception& e) {
+        std::cerr << "❌ OpenCVDNNFaceDetector::detect cv exception: " << e.what() << std::endl;
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ OpenCVDNNFaceDetector::detect exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ OpenCVDNNFaceDetector::detect unknown exception" << std::endl;
+        return false;
     }
-    
-    if (best_idx >= 0) {
-        // Extract bbox (normalized coordinates 0-1)
-        float x1_norm = detection_mat.at<float>(best_idx, 3);
-        float y1_norm = detection_mat.at<float>(best_idx, 4);
-        float x2_norm = detection_mat.at<float>(best_idx, 5);
-        float y2_norm = detection_mat.at<float>(best_idx, 6);
-        
-        // Convert to pixel coordinates
-        int x1 = static_cast<int>(x1_norm * bgr_mat.cols);
-        int y1 = static_cast<int>(y1_norm * bgr_mat.rows);
-        int x2 = static_cast<int>(x2_norm * bgr_mat.cols);
-        int y2 = static_cast<int>(y2_norm * bgr_mat.rows);
-        
-        // Clamp to image boundaries
-        x1 = std::max(0, std::min(x1, bgr_mat.cols - 1));
-        y1 = std::max(0, std::min(y1, bgr_mat.rows - 1));
-        x2 = std::max(0, std::min(x2, bgr_mat.cols - 1));
-        y2 = std::max(0, std::min(y2, bgr_mat.rows - 1));
-        
-        frame->metadata.face_detected = true;
-        frame->metadata.face_x = x1;
-        frame->metadata.face_y = y1;
-        frame->metadata.face_w = x2 - x1;
-        frame->metadata.face_h = y2 - y1;
-        frame->metadata.face_detection_confidence = best_confidence;
-    }
-    
-    return true;
 }
 
 #else  // !HAVE_OPENCV
@@ -276,26 +303,34 @@ bool OpenCVDNNFaceDetector::detect(FrameBox* frame) {
 // ============================================================================
 
 std::unique_ptr<FaceDetector> create_face_detector() {
-    // Always use Native MediaPipe Face Mesh (478 points) - IR-ONLY MODE
-    auto mp_detector = std::make_unique<MediaPipeFaceDetector>();
-    if (mp_detector->is_initialized()) {
-        std::cout << "✓ Using Native MediaPipe Face Mesh (478 landmarks) - IR-ONLY" << std::endl;
-        return mp_detector;
-    }
-    
-    std::cerr << "❌ Native MediaPipe initialization failed, trying OpenCV DNN fallback..." << std::endl;
+    try {
+        // Always use Native MediaPipe Face Mesh (478 points) - IR-ONLY MODE
+        auto mp_detector = std::make_unique<MediaPipeFaceDetector>();
+        if (mp_detector->is_initialized()) {
+            std::cout << "✓ Using Native MediaPipe Face Mesh (478 landmarks) - IR-ONLY" << std::endl;
+            return mp_detector;
+        }
+        
+        std::cerr << "❌ Native MediaPipe initialization failed, trying OpenCV DNN fallback..." << std::endl;
 
 #ifdef HAVE_OPENCV
-    auto cv_detector = std::make_unique<OpenCVDNNFaceDetector>();
-    if (cv_detector->is_initialized()) {
-        std::cout << "⚠ Using OpenCV DNN face detector (fallback) - IR-ONLY" << std::endl;
-        return cv_detector;
-    }
-    std::cerr << "❌ OpenCV DNN initialization failed" << std::endl;
+        auto cv_detector = std::make_unique<OpenCVDNNFaceDetector>();
+        if (cv_detector->is_initialized()) {
+            std::cout << "⚠ Using OpenCV DNN face detector (fallback) - IR-ONLY" << std::endl;
+            return cv_detector;
+        }
+        std::cerr << "❌ OpenCV DNN initialization failed" << std::endl;
 #endif
 
-    std::cerr << "❌ No face detector available!" << std::endl;
-    return nullptr;
+        std::cerr << "❌ No face detector available!" << std::endl;
+        return nullptr;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ create_face_detector exception: " << e.what() << std::endl;
+        return nullptr;
+    } catch (...) {
+        std::cerr << "❌ create_face_detector unknown exception" << std::endl;
+        return nullptr;
+    }
 }
 
 } // namespace mdai

@@ -4,6 +4,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <memory>
 #include <stdexcept>
 
@@ -92,7 +93,7 @@ private:
     std::atomic<uint64_t> total_frames_dropped_{0};
     std::atomic<size_t> growth_count_{0};
     
-    std::mutex growth_mutex_;
+    mutable std::shared_mutex slots_mutex_;  // Protects slots_ vector during growth
     
     size_t estimate_frame_size(const FrameBox& frame) const;
     bool grow_buffer();

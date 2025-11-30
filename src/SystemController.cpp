@@ -271,6 +271,14 @@ void SystemController::run() {
                 static int no_frame_count = 0;
                 no_frame_count++;
                 
+                // Log periodically when no frames available
+                if (no_frame_count % 500 == 0) {
+                    SystemState current = current_state_.load();
+                    std::cerr << "⚠️ Main loop: No frames for " << no_frame_count 
+                              << " iterations, state=" << static_cast<int>(current) 
+                              << ", producer_running=" << (producer_ ? producer_->is_running() : false) << std::endl;
+                }
+                
                 // If no frames for extended period, try camera recovery
                 if (no_frame_count > 3000) {  // ~30 seconds at 10ms sleep
                     std::cerr << "⚠️ No frames for extended period - attempting camera recovery" << std::endl;
@@ -601,14 +609,17 @@ void SystemController::set_state(SystemState new_state) {
                         std::cout << "   ✓ delete_ack sent" << std::endl;
                     }
                     
-                    // Show delete screen for 3 seconds
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    // Show delete screen for 6 seconds
+                    std::this_thread::sleep_for(std::chrono::seconds(6));
                     
                     // Transition to IDLE (clear_session will be called there)
                     std::cout << "   🔄 DELETE_SCREEN → IDLE" << std::endl;
                     set_state(SystemState::IDLE);
                 } catch (const std::exception& e) {
                     std::cerr << "❌ Exception in DELETE_SCREEN: " << e.what() << std::endl;
+                    set_state(SystemState::IDLE);
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in DELETE_SCREEN thread" << std::endl;
                     set_state(SystemState::IDLE);
                 }
             }).detach();
@@ -686,12 +697,44 @@ void SystemController::handle_await_admin_qr(FrameBox* frame) {
 
 void SystemController::handle_idle(FrameBox* frame) {
 #ifdef HAVE_OPENCV
-    if (!frame) return;
+    // Debug counter to track if handle_idle is being called
+    static int idle_call_count = 0;
+    idle_call_count++;
+    
+    if (!frame) {
+        if (idle_call_count % 1000 == 0) {
+            std::cerr << "⚠️ handle_idle: null frame (call #" << idle_call_count << ")" << std::endl;
+        }
+        return;
+    }
     
     try {
         // ONLY scan QR in IDLE state - NOT in READY or any other state
         SystemState current = current_state_.load();
-        if (current != SystemState::IDLE) return;
+        if (current != SystemState::IDLE) {
+            if (idle_call_count % 1000 == 0) {
+                std::cerr << "⚠️ handle_idle: wrong state " << static_cast<int>(current) << std::endl;
+            }
+            return;
+        }
+        
+        // Don't scan if we already have an active connection or pending token
+        // This prevents re-scanning the same QR while waiting for auth_success
+        if (network_mgr_ && network_mgr_->is_connected()) {
+            if (idle_call_count % 1000 == 0) {
+                std::cerr << "⚠️ handle_idle: still connected, waiting..." << std::endl;
+            }
+            return;  // Already connected, wait for state transition
+        }
+        {
+            std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+            if (!pending_ws_token_.empty()) {
+                if (idle_call_count % 1000 == 0) {
+                    std::cerr << "⚠️ handle_idle: pending token exists" << std::endl;
+                }
+                return;  // Connection in progress, don't scan another QR
+            }
+        }
         
         // Frame skip for performance (scan every 5th frame)
         static int frame_skip = 0;
@@ -796,6 +839,24 @@ void SystemController::handle_idle(FrameBox* frame) {
     if (!decoded_info.empty()) {
         std::cout << "🔍 QR content preview: " << decoded_info.substr(0, std::min(size_t(50), decoded_info.length())) << "..." << std::endl;
         
+        // Duplicate QR detection - reject if same QR scanned within 100 seconds
+        static std::string last_scanned_qr;
+        static std::chrono::steady_clock::time_point last_scan_time;
+        const int QR_COOLDOWN_SECONDS = 100;
+        
+        auto now = std::chrono::steady_clock::now();
+        if (!last_scanned_qr.empty() && decoded_info == last_scanned_qr) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_scan_time).count();
+            if (elapsed < QR_COOLDOWN_SECONDS) {
+                std::cout << "⚠️ DUPLICATE QR detected (same as " << elapsed << "s ago) - ignoring" << std::endl;
+                return;
+            }
+        }
+        
+        // Update last scanned QR tracking
+        last_scanned_qr = decoded_info;
+        last_scan_time = now;
+        
         // Minimum length check
         if (decoded_info.length() < 20) {
             std::cout << "⚠️ QR too short (" << decoded_info.length() << " chars), ignoring" << std::endl;
@@ -868,7 +929,19 @@ void SystemController::handle_idle(FrameBox* frame) {
                 }
                 
                 std::string ws_path = "/ws/device";
-                network_mgr_->connect_to_middleware(middleware_host_, 443, ws_path, device_id_);
+                bool connect_started = network_mgr_->connect_to_middleware(middleware_host_, 443, ws_path, device_id_);
+                
+                if (!connect_started) {
+                    std::cerr << "❌ Failed to start WebSocket connection" << std::endl;
+                    // Clear pending token so new QR can be scanned
+                    {
+                        std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                        pending_ws_token_.clear();
+                    }
+                    if (serial_comm_) serial_comm_->queue_error("Connection error");
+                    set_state(SystemState::ERROR);
+                    return;
+                }
                 
                 int wait_count = 0;
                 while (network_mgr_ && !network_mgr_->is_connected() && wait_count < 100) {
@@ -878,6 +951,13 @@ void SystemController::handle_idle(FrameBox* frame) {
                 
                 if (!network_mgr_ || !network_mgr_->is_connected()) {
                     std::cerr << "❌ WebSocket connection failed after " << wait_count * 100 << "ms" << std::endl;
+                    
+                    // Clear pending token so new QR can be scanned
+                    {
+                        std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                        pending_ws_token_.clear();
+                    }
+                    
                     if (serial_comm_) {
                         serial_comm_->queue_error("Connection failed");
                         serial_comm_->queue_state(12);
@@ -889,6 +969,8 @@ void SystemController::handle_idle(FrameBox* frame) {
                     state_timer_active_ = true;
                 } else {
                     std::cout << "✅ WebSocket connected!" << std::endl;
+                    // Clear last scanned QR so same QR can be used again after session ends
+                    last_scanned_qr.clear();
                 }
                 
             } catch (const std::exception& e) {
