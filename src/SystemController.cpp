@@ -18,7 +18,7 @@
 namespace mdai {
 
 SystemController::SystemController() {
-    // Ring buffer: 32 initial slots, 1GB max memory (reduced from 2GB)
+    // Ring buffer: 32 initial slots, 3GB max memory
     ring_buffer_ = std::make_unique<DynamicRingBuffer>(32, 3ULL * 1024 * 1024 * 1024);
     
     SerialCommunicator::Config serial_cfg;
@@ -57,29 +57,38 @@ bool SystemController::initialize() {
         return false;
     }
     
-    if (!serial_comm_->connect()) {
-        std::cerr << "⚠ Serial connection failed" << std::endl;
+    if (serial_comm_) {
+        if (!serial_comm_->connect()) {
+            std::cerr << "⚠ Serial connection failed" << std::endl;
+        }
+        serial_comm_->start_async();
+    } else {
+        std::cerr << "⚠ Serial communicator not initialized" << std::endl;
     }
-    serial_comm_->start_async();
     
     face_detector_ = create_face_detector();
     if (!face_detector_) return false;
 
-    network_mgr_->set_message_callback([this](const std::string& msg) {
-        this->on_websocket_message(msg);
-    });
-    
-    network_mgr_->set_connect_callback([this]() {
-        std::lock_guard<std::mutex> lock(ws_auth_mutex_);
-        if (!pending_ws_token_.empty()) {
-            nlohmann::json auth_msg = {
-                {"type", "auth"},
-                {"bearer_token", pending_ws_token_},
-                {"device_id", device_id_}
-            };
-            network_mgr_->send_message(auth_msg.dump());
-        }
-    });
+    if (network_mgr_) {
+        network_mgr_->set_message_callback([this](const std::string& msg) {
+            this->on_websocket_message(msg);
+        });
+        
+        network_mgr_->set_connect_callback([this]() {
+            std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+            if (!pending_ws_token_.empty() && network_mgr_) {
+                nlohmann::json auth_msg = {
+                    {"type", "auth"},
+                    {"bearer_token", pending_ws_token_},
+                    {"device_id", device_id_}
+                };
+                network_mgr_->send_message(auth_msg.dump());
+            }
+        });
+    } else {
+        std::cerr << "⚠ Network manager not initialized" << std::endl;
+        return false;
+    }
     
     set_state(SystemState::BOOT);
     return true;
@@ -88,8 +97,36 @@ bool SystemController::initialize() {
 void SystemController::run() {
     running_ = true;
     while (running_) {
+        // Simple check - if no producer, wait (camera is initialized elsewhere)
         if (!producer_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        
+        // If producer exists but stopped (e.g., after PROCESSING), restart it
+        // Only in states that need camera for QR scanning
+        if (!producer_->is_running()) {
+            SystemState current = current_state_.load();
+            if (current == SystemState::IDLE || current == SystemState::AWAIT_ADMIN_QR) {
+                std::cout << "📹 Camera stopped - restarting for QR scanning..." << std::endl;
+                
+                // Stop old producer properly first
+                producer_->stop();
+                producer_.reset();
+                
+                // Small delay for camera to release resources
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                
+                // Create new producer
+                initialize_camera();
+                
+                if (producer_ && producer_->is_running()) {
+                    std::cout << "✅ Camera restarted successfully" << std::endl;
+                } else {
+                    std::cerr << "❌ Camera restart failed" << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                }
+            }
             continue;
         }
 
@@ -101,7 +138,7 @@ void SystemController::run() {
         if (++wifi_check_counter >= 100) {
             wifi_check_counter = 0;
             
-            if (network_mgr_->is_connected_to_internet()) {
+            if (network_mgr_ && network_mgr_->is_connected_to_internet()) {
                 if (wifi_fail_count > 0) wifi_fail_count = 0;
                 
                 if (current_state_ == SystemState::AWAIT_ADMIN_QR) {
@@ -117,14 +154,16 @@ void SystemController::run() {
                     session_id_.clear();
                     
                     motion_tracker_.reset();
-                    ring_buffer_->set_recording_active(false);
-                    ring_buffer_->clear();
+                    if (ring_buffer_) {
+                        ring_buffer_->set_recording_active(false);
+                    }
+                    // NOTE: Don't clear ring_buffer - causes race condition crash
                     
-                    if (network_mgr_->is_connected()) {
+                    if (network_mgr_ && network_mgr_->is_connected()) {
                         network_mgr_->disconnect();
                     }
                     
-                    serial_comm_->queue_state(3);
+                    if (serial_comm_) serial_comm_->queue_state(3);
                     set_state(SystemState::AWAIT_ADMIN_QR);
                     wifi_fail_count = 0;
                 }
@@ -176,7 +215,7 @@ void SystemController::run() {
                 if (state_duration > STATE_STUCK_TIMEOUT_SEC) {
                     std::cerr << "⚠️ STATE WATCHDOG: Stuck in state for " << state_duration 
                               << "s - forcing reset to IDLE" << std::endl;
-                    serial_comm_->queue_error("Session timeout");
+                    if (serial_comm_) serial_comm_->queue_error("Session timeout");
                     set_state(SystemState::ERROR);
                 }
                 
@@ -184,7 +223,7 @@ void SystemController::run() {
                 if (current == SystemState::ALIGN && state_duration > ALIGN_TIMEOUT_SEC) {
                     std::cerr << "⚠️ ALIGN TIMEOUT: No progress for " << state_duration 
                               << "s - resetting" << std::endl;
-                    serial_comm_->queue_error("Alignment timeout");
+                    if (serial_comm_) serial_comm_->queue_error("Alignment timeout");
                     set_state(SystemState::ERROR);
                 }
             }
@@ -219,6 +258,10 @@ void SystemController::run() {
         // ============================================
 
         try {
+            if (!ring_buffer_) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
             FrameBox* frame = ring_buffer_->get_latest_frame();
             if (frame) {
                 process_frame(frame);
@@ -243,17 +286,59 @@ void SystemController::run() {
         } catch (const std::exception& e) {
             std::cerr << "❌ Exception in main loop: " << e.what() << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } catch (...) {
+            std::cerr << "❌ Unknown exception in main loop - recovering..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
     
     std::cout << "⚠️ Main loop exited (running=" << running_.load() << ")" << std::endl;
 }
 
+void SystemController::request_restart(const std::string& reason) {
+    std::cout << "🔄 Restart requested: " << (reason.empty() ? "No reason specified" : reason) << std::endl;
+    restart_requested_.store(true);
+    restart_reason_ = reason;
+    running_ = false;  // This will cause run() to exit
+}
+
 void SystemController::stop() {
+    std::cout << "🛑 SystemController::stop() called" << std::endl;
+    
+    // Set running flag first to stop main loop
     running_ = false;
-    if (serial_comm_) serial_comm_->stop_async();
-    if (producer_) producer_->stop();
-    if (network_mgr_) network_mgr_->disconnect();
+    
+    // Notify ESP32 display of shutdown (state 16 = shutdown screen)
+    // Do this BEFORE stopping serial to ensure the message gets through
+    if (serial_comm_) {
+        std::cout << "   📺 Sending shutdown state to display..." << std::endl;
+        serial_comm_->send_state_with_text(16, "Shutting down...");
+        // Give serial a moment to send the message
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    // Stop producer first to release camera resources
+    if (producer_) {
+        std::cout << "   📹 Stopping camera..." << std::endl;
+        producer_->stop();
+    }
+    
+    // Disconnect network
+    if (network_mgr_) {
+        std::cout << "   🌐 Disconnecting network..." << std::endl;
+        network_mgr_->disconnect();
+    }
+    
+    // Stop serial async thread last
+    if (serial_comm_) {
+        std::cout << "   📟 Stopping serial communication..." << std::endl;
+        serial_comm_->stop_async();
+    }
+    
+    // Brief delay to allow threads to clean up
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    
+    std::cout << "   ✅ SystemController stopped" << std::endl;
 }
 
 void SystemController::clear_session() {
@@ -272,20 +357,21 @@ void SystemController::clear_session() {
         pending_ws_token_.clear();
     }
     
-    // Clear recording buffer
+    // Stop recording but DON'T clear the ring buffer here
+    // The ring buffer is still being accessed by frame processing threads
+    // Just disable recording - frames will naturally be overwritten
     if (ring_buffer_) {
         ring_buffer_->set_recording_active(false);
-        ring_buffer_->clear();
+        // NOTE: Don't call ring_buffer_->clear() - causes crash due to race condition
+        // with frame processing. Buffer will be reused naturally.
     }
     
     // Reset motion tracker
     motion_tracker_.reset();
     
-    // Disconnect WebSocket if connected
+    // Just signal to stop - don't call disconnect() here
+    // The WebSocket thread handles its own cleanup when the connection closes
     if (network_mgr_) {
-        if (was_connected) {
-            network_mgr_->disconnect();
-        }
         network_mgr_->stop_reconnect();
     }
     
@@ -303,118 +389,201 @@ void SystemController::set_state(SystemState new_state) {
     
     switch (new_state) {
         case SystemState::BOOT:
-            std::thread([this]() { handle_boot(); }).detach();
+            std::thread([this]() {
+                try {
+                    handle_boot();
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in BOOT thread: " << e.what() << std::endl;
+                    set_state(SystemState::ERROR);
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in BOOT thread" << std::endl;
+                    set_state(SystemState::ERROR);
+                }
+            }).detach();
             break;
             
         case SystemState::AWAIT_ADMIN_QR:
-            serial_comm_->queue_state(3);
+            if (serial_comm_) serial_comm_->queue_state(3);
             break;
             
         case SystemState::PROVISIONING:
-            serial_comm_->queue_state(2);
+            if (serial_comm_) serial_comm_->queue_state(2);
             break;
             
         case SystemState::PROVISIONED: {
-            std::string ssid = network_mgr_->get_current_ssid();
+            std::string ssid = network_mgr_ ? network_mgr_->get_current_ssid() : "";
             if (ssid.empty()) ssid = "WiFi Connected";
-            serial_comm_->send_state_with_text(4, ssid);
+            if (serial_comm_) serial_comm_->send_state_with_text(4, ssid);
             std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                serial_comm_->queue_state(5);
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                set_state(SystemState::IDLE);
+                try {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    if (serial_comm_) serial_comm_->queue_state(5);
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    set_state(SystemState::IDLE);
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in PROVISIONED thread: " << e.what() << std::endl;
+                    set_state(SystemState::ERROR);
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in PROVISIONED thread" << std::endl;
+                    set_state(SystemState::ERROR);
+                }
             }).detach();
             break;
         }
             
         case SystemState::IDLE:
             std::cout << "🔄 Entering IDLE state - ready for new QR" << std::endl;
-            serial_comm_->queue_state(6);
+            if (serial_comm_) serial_comm_->queue_state(6);
             clear_session();  // Clear all old session data
+            // Camera restart is handled in main loop to avoid race conditions
             break;
             
         case SystemState::READY:
-            serial_comm_->queue_state(7);
+            if (serial_comm_) serial_comm_->queue_state(7);
             // Timeout: If no start command in 30 seconds, go to ERROR
             std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(30));
-                if (current_state_ == SystemState::READY) {
-                    std::cout << "⚠️ READY timeout - no start command" << std::endl;
-                    serial_comm_->queue_error("Session timeout");
-                    set_state(SystemState::ERROR);
+                try {
+                    std::this_thread::sleep_for(std::chrono::seconds(30));
+                    if (current_state_ == SystemState::READY) {
+                        std::cout << "⚠️ READY timeout - no start command" << std::endl;
+                        if (serial_comm_) serial_comm_->queue_error("Session timeout");
+                        set_state(SystemState::ERROR);
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in READY timeout thread: " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in READY timeout thread" << std::endl;
                 }
             }).detach();
             break;
             
         case SystemState::COUNTDOWN:
-            serial_comm_->queue_state(8);
-            serial_comm_->send_state_with_text(8, "...");
+            if (serial_comm_) {
+                serial_comm_->queue_state(8);
+                serial_comm_->send_state_with_text(8, "...");
+            }
             std::thread([this]() {
-                for (int count = 5; count >= 1; count--) {
-                    if (current_state_ != SystemState::COUNTDOWN) return;
-                    serial_comm_->send_state_with_text(8, std::to_string(count));
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                }
-                if (current_state_ == SystemState::COUNTDOWN) {
-                    set_state(SystemState::ALIGN);
+                try {
+                    for (int count = 5; count >= 1; count--) {
+                        if (current_state_ != SystemState::COUNTDOWN) return;
+                        if (serial_comm_) serial_comm_->send_state_with_text(8, std::to_string(count));
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
+                    if (current_state_ == SystemState::COUNTDOWN) {
+                        set_state(SystemState::ALIGN);
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in COUNTDOWN thread: " << e.what() << std::endl;
+                    set_state(SystemState::ERROR);
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in COUNTDOWN thread" << std::endl;
+                    set_state(SystemState::ERROR);
                 }
             }).detach();
             break;
             
         case SystemState::WARMUP:
-            serial_comm_->queue_state(7);
+            if (serial_comm_) serial_comm_->queue_state(7);
             std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                if (current_state_ == SystemState::WARMUP) {
-                    set_state(SystemState::ALIGN);
+                try {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    if (current_state_ == SystemState::WARMUP) {
+                        set_state(SystemState::ALIGN);
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in WARMUP thread: " << e.what() << std::endl;
+                    set_state(SystemState::ERROR);
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in WARMUP thread" << std::endl;
+                    set_state(SystemState::ERROR);
                 }
             }).detach();
             break;
             
         case SystemState::ALIGN:
-            serial_comm_->queue_state(9);
-            serial_comm_->queue_tracking(233, 233, 0, true);
-            ring_buffer_->set_recording_active(false);
-            ring_buffer_->clear();
-            motion_tracker_.reset();
-            ring_buffer_->set_recording_active(true);
+            if (serial_comm_) {
+                serial_comm_->queue_state(9);
+                serial_comm_->queue_tracking(233, 233, 0, true);
+            }
+            if (ring_buffer_) {
+                ring_buffer_->set_recording_active(false);
+                // NOTE: Don't clear ring_buffer here - causes race condition with producer
+                motion_tracker_.reset();
+                ring_buffer_->set_recording_active(true);
+            }
             break;
             
         case SystemState::PROCESSING:
-            ring_buffer_->set_recording_active(false);
-            serial_comm_->queue_state(10);
-            std::thread([this]() { handle_processing(); }).detach();
+            if (ring_buffer_) ring_buffer_->set_recording_active(false);
+            // Stop producer to prevent overwriting frames during processing
+            if (producer_) {
+                producer_->stop();
+            }
+            if (serial_comm_) serial_comm_->queue_state(10);
+            std::thread([this]() {
+                try {
+                    handle_processing();
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in PROCESSING thread: " << e.what() << std::endl;
+                    if (serial_comm_) serial_comm_->queue_error("Processing error");
+                    set_state(SystemState::ERROR);
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in PROCESSING thread" << std::endl;
+                    if (serial_comm_) serial_comm_->queue_error("Processing error");
+                    set_state(SystemState::ERROR);
+                }
+            }).detach();
             break;
             
         case SystemState::SUCCESS:
-            serial_comm_->queue_state(11);
+            if (serial_comm_) serial_comm_->queue_state(11);
             // Timeout: If no delete message in 30 seconds, go to DELETE_SCREEN anyway
             std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(30));
-                if (current_state_ == SystemState::SUCCESS) {
-                    std::cout << "⚠️ SUCCESS timeout (no delete from server)" << std::endl;
-                    set_state(SystemState::DELETE_SCREEN);
+                try {
+                    std::this_thread::sleep_for(std::chrono::seconds(30));
+                    if (current_state_ == SystemState::SUCCESS) {
+                        std::cout << "⚠️ SUCCESS timeout (no delete from server)" << std::endl;
+                        set_state(SystemState::DELETE_SCREEN);
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in SUCCESS timeout thread: " << e.what() << std::endl;
+                    set_state(SystemState::IDLE);
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in SUCCESS timeout thread" << std::endl;
+                    set_state(SystemState::IDLE);
                 }
             }).detach();
             break;
             
         case SystemState::ERROR:
             std::cout << "❌ Entering ERROR state..." << std::endl;
-            serial_comm_->queue_state(12);
-            clear_session();  // Clear all session data immediately
-            // Go to IDLE after 3 seconds (use thread, not timer - more reliable)
+            if (serial_comm_) serial_comm_->queue_state(12);
+            // Stop recording but DON'T fully clear session yet - that happens in IDLE
+            if (ring_buffer_) {
+                ring_buffer_->set_recording_active(false);
+            }
+            // Go to IDLE after 3 seconds (cleanup happens there)
             std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                if (current_state_ == SystemState::ERROR) {
-                    std::cout << "   ⏰ ERROR timeout → IDLE" << std::endl;
-                    set_state(SystemState::IDLE);
+                try {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    if (current_state_ == SystemState::ERROR) {
+                        std::cout << "   ⏰ ERROR timeout → IDLE" << std::endl;
+                        set_state(SystemState::IDLE);
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ Exception in ERROR timeout thread: " << e.what() << std::endl;
+                    // Force transition to IDLE to recover
+                    current_state_ = SystemState::IDLE;
+                } catch (...) {
+                    std::cerr << "❌ Unknown exception in ERROR timeout thread" << std::endl;
+                    current_state_ = SystemState::IDLE;
                 }
             }).detach();
             break;
             
         case SystemState::DELETE_SCREEN: {
             std::cout << "🗑️ Entering DELETE_SCREEN state..." << std::endl;
-            serial_comm_->queue_state(15);
+            if (serial_comm_) serial_comm_->queue_state(15);
             
             // Save session ID for delete_ack, then start cleanup thread
             std::string saved_session = session_id_;
@@ -453,9 +622,10 @@ void SystemController::set_state(SystemState new_state) {
 
 void SystemController::initialize_camera() {
     CameraConfig config;
+    // Standard resolution for IR camera with higher FPS
     config.ir_width = 848;
     config.ir_height = 480;
-    config.ir_fps = 30;
+    config.ir_fps = 30;  // Higher FPS at this resolution
     config.auto_exposure = true;
     
     producer_ = std::make_unique<Producer>(config, ring_buffer_.get());
@@ -489,6 +659,8 @@ void SystemController::process_frame(FrameBox* frame) {
 
 void SystemController::handle_await_admin_qr(FrameBox* frame) {
 #ifdef HAVE_OPENCV
+    if (!frame) return;
+    
     static int frame_skip = 0;
     if (frame_skip++ % 5 != 0) return;
     
@@ -514,6 +686,8 @@ void SystemController::handle_await_admin_qr(FrameBox* frame) {
 
 void SystemController::handle_idle(FrameBox* frame) {
 #ifdef HAVE_OPENCV
+    if (!frame) return;
+    
     try {
         // ONLY scan QR in IDLE state - NOT in READY or any other state
         SystemState current = current_state_.load();
@@ -534,25 +708,40 @@ void SystemController::handle_idle(FrameBox* frame) {
         return;
     }
     
-    // Apply CLAHE for better contrast (critical for IR-based QR scanning)
-    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+    // Build multiple preprocessing candidates for robust QR detection
+    std::vector<cv::Mat> candidates;
+    
+    // Method 0: CLAHE enhanced (higher clip limit for IR)
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(4.0, cv::Size(8, 8));
     cv::Mat enhanced;
     clahe->apply(gray, enhanced);
+    candidates.push_back(enhanced);
     
-    // Try multiple preprocessing approaches for better QR detection
-    std::vector<cv::Mat> candidates;
-    candidates.push_back(enhanced);  // CLAHE enhanced
+    // Method 1: Gaussian blur + Otsu threshold (good for noisy IR)
+    cv::Mat blurred, otsu;
+    cv::GaussianBlur(gray, blurred, cv::Size(3, 3), 0);
+    cv::threshold(blurred, otsu, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    candidates.push_back(otsu);
     
-    // Also try adaptive threshold
-    cv::Mat thresh;
-    cv::adaptiveThreshold(gray, thresh, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, 
+    // Method 2: Adaptive threshold on CLAHE (best for phone screens)
+    cv::Mat adaptive_on_clahe;
+    cv::adaptiveThreshold(enhanced, adaptive_on_clahe, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, 
                           cv::THRESH_BINARY, 51, 10);
-    candidates.push_back(thresh);
+    candidates.push_back(adaptive_on_clahe);
     
-    // Try original grayscale
+    // Method 3: Sharpened + threshold
+    cv::Mat sharpened;
+    cv::GaussianBlur(gray, sharpened, cv::Size(0, 0), 3);
+    cv::addWeighted(gray, 1.5, sharpened, -0.5, 0, sharpened);
+    cv::Mat sharp_thresh;
+    cv::threshold(sharpened, sharp_thresh, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    candidates.push_back(sharp_thresh);
+    
+    // Method 4: Original grayscale (fallback)
     candidates.push_back(gray);
     
     std::string decoded_info;
+    static int ecc_fail_count = 0;  // Track ECC failures to reduce log spam
     
     for (size_t i = 0; i < candidates.size() && decoded_info.empty(); i++) {
         cv::Mat& img = candidates[i];
@@ -566,15 +755,19 @@ void SystemController::handle_idle(FrameBox* frame) {
         }
         
         uint8_t *image = quirc_begin(qr, nullptr, nullptr);
+        if (!image) {
+            quirc_destroy(qr);
+            continue;
+        }
         memcpy(image, img.data, img.cols * img.rows);
         quirc_end(qr);
         
         int num_codes = quirc_count(qr);
         
-        // Log periodically (every 100 scans)
+        // Log scan progress periodically (every 500 scans, reduced verbosity)
         static int total_scans = 0;
-        if (++total_scans % 100 == 0) {
-            std::cout << "📷 QR scan #" << total_scans << " - codes found: " << num_codes << " (method " << i << ")" << std::endl;
+        if (++total_scans % 500 == 0) {
+            std::cout << "📷 QR scans: " << total_scans << ", ECC fails: " << ecc_fail_count << std::endl;
         }
         
         if (num_codes > 0) {
@@ -587,8 +780,13 @@ void SystemController::handle_idle(FrameBox* frame) {
             if (err == QUIRC_SUCCESS) {
                 decoded_info = std::string(reinterpret_cast<char*>(data.payload), data.payload_len);
                 std::cout << "📱 QR DETECTED! Method " << i << ", Length: " << decoded_info.length() << " bytes" << std::endl;
+                ecc_fail_count = 0;  // Reset on success
             } else {
-                std::cout << "⚠️ QR found but decode failed: " << quirc_strerror(err) << std::endl;
+                ecc_fail_count++;
+                // Only log ECC failures every 50 occurrences to reduce spam
+                if (ecc_fail_count % 50 == 1) {
+                    std::cout << "⚠️ QR visible but ECC errors (count: " << ecc_fail_count << ") - hold phone steady" << std::endl;
+                }
             }
         }
         
@@ -634,7 +832,7 @@ void SystemController::handle_idle(FrameBox* frame) {
             std::string qr_key = load_qr_shared_key();
             if (qr_key.empty()) {
                 std::cerr << "❌ QR decryption key not configured!" << std::endl;
-                serial_comm_->queue_error("Device not configured");
+                if (serial_comm_) serial_comm_->queue_error("Device not configured");
                 set_state(SystemState::ERROR);
                 return;
             }
@@ -662,20 +860,29 @@ void SystemController::handle_idle(FrameBox* frame) {
                     pending_ws_token_ = ws_token;
                 }
                 
+                if (!network_mgr_) {
+                    std::cerr << "❌ Network manager not available" << std::endl;
+                    if (serial_comm_) serial_comm_->queue_error("Internal error");
+                    set_state(SystemState::ERROR);
+                    return;
+                }
+                
                 std::string ws_path = "/ws/device";
                 network_mgr_->connect_to_middleware(middleware_host_, 443, ws_path, device_id_);
                 
                 int wait_count = 0;
-                while (!network_mgr_->is_connected() && wait_count < 100) {
+                while (network_mgr_ && !network_mgr_->is_connected() && wait_count < 100) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     wait_count++;
                 }
                 
-                if (!network_mgr_->is_connected()) {
+                if (!network_mgr_ || !network_mgr_->is_connected()) {
                     std::cerr << "❌ WebSocket connection failed after " << wait_count * 100 << "ms" << std::endl;
-                    serial_comm_->queue_error("Connection failed");
-                    serial_comm_->queue_state(12);
-                    network_mgr_->disconnect();
+                    if (serial_comm_) {
+                        serial_comm_->queue_error("Connection failed");
+                        serial_comm_->queue_state(12);
+                    }
+                    if (network_mgr_) network_mgr_->disconnect();
                     state_timer_start_ = std::chrono::steady_clock::now();
                     state_timer_target_ = SystemState::IDLE;
                     state_timer_duration_ms_ = 3000;
@@ -704,7 +911,7 @@ void SystemController::handle_idle(FrameBox* frame) {
 void SystemController::handle_warmup(FrameBox* /* frame */) {
     static int warmup_frames = 0;
     if (warmup_frames++ > 60) {
-        if (warmup_frames == 62) {
+        if (warmup_frames == 62 && network_mgr_) {
             network_mgr_->send_message("{\"type\":\"status\", \"payload\":\"warmed_up\"}");
         }
     }
@@ -714,7 +921,7 @@ void SystemController::handle_align(FrameBox* frame) {
     if (!frame) {
         motion_tracker_.no_face_counter++;
         if (motion_tracker_.no_face_counter > 150) {
-            serial_comm_->queue_error("Camera disconnected");
+            if (serial_comm_) serial_comm_->queue_error("Camera disconnected");
             set_state(SystemState::ERROR);
         }
         return;
@@ -727,11 +934,11 @@ void SystemController::handle_align(FrameBox* frame) {
     startup_frames++;
     bool in_grace_period = (startup_frames < STARTUP_GRACE_PERIOD);
     
-    if (!face_detector_->detect(frame)) {
+    if (!face_detector_ || !face_detector_->detect(frame)) {
         motion_tracker_.no_face_counter++;
         motion_tracker_.validation_state = FaceValidationState::NO_FACE;
         
-        serial_comm_->queue_tracking(233, 233, 
+        if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
             static_cast<int>(motion_tracker_.progress * 100), false);
         
         if (!in_grace_period && motion_tracker_.no_face_counter > FACE_TIMEOUT_FRAMES) {
@@ -745,13 +952,13 @@ void SystemController::handle_align(FrameBox* frame) {
     if (landmarks.size() < 468) {
         motion_tracker_.no_face_counter++;
         motion_tracker_.validation_state = FaceValidationState::NO_FACE;
-        serial_comm_->queue_tracking(233, 233, 
+        if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
             static_cast<int>(motion_tracker_.progress * 100), false);
         return;
     }
     
-    motion_tracker_.validation_state = validate_face_position(frame);
-    bool is_valid = (motion_tracker_.validation_state == FaceValidationState::VALID);
+    // Relaxed validation - just check if face is detected, no extreme yaw check
+    bool is_valid = frame->metadata.face_detected && landmarks.size() >= 468;
     
     if (frame->metadata.face_detected) {
         motion_tracker_.no_face_counter = 0;
@@ -765,9 +972,11 @@ void SystemController::handle_align(FrameBox* frame) {
     float nose_x_norm = nose_x_rot / frame->metadata.frame_width;
     float nose_y_norm = nose_y_rot / frame->metadata.frame_height;
     
-    float raw_x = nose_x_norm * 465.0f;
-    float raw_y = nose_y_norm * 465.0f;
-    raw_x = 465.0f - raw_x;
+    // Camera is rotated 90° - swap X and Y axes
+    // Camera Y → Screen X, Camera X → Screen Y
+    float raw_x = nose_y_norm * 465.0f;
+    float raw_y = nose_x_norm * 465.0f;
+    // No mirroring needed
     
     constexpr float BASE_SMOOTHING = 0.15f;
     constexpr float DEAD_ZONE = 3.0f;
@@ -801,22 +1010,13 @@ void SystemController::handle_align(FrameBox* frame) {
         progress = calculate_circular_motion_progress(cv::Point2f(nose_x_norm, nose_y_norm));
     }
     
-    serial_comm_->queue_tracking(screen_x, screen_y, 
+    if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 
         static_cast<int>(progress * 100), is_valid);
     
-    static int mobile_update_skip = 0;
-    if (mobile_update_skip++ % 10 == 0) {
-        nlohmann::json progress_msg = {
-            {"type", "progress"},
-            {"state", "align"},
-            {"progress", static_cast<int>(progress * 100)},
-            {"nose_position", {{"x", nose_x_norm}, {"y", nose_y_norm}}}
-        };
-        network_mgr_->send_message(progress_msg.dump());
-    }
+    // Progress messages to mobile removed - not needed
     
     if (progress >= 1.0f) {
-        serial_comm_->queue_tracking(screen_x, screen_y, 100, true);
+        if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 100, true);
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         set_state(SystemState::PROCESSING);
         return;
@@ -829,12 +1029,12 @@ void SystemController::handle_face_timeout() {
         {"code", "timeout_no_face"},
         {"message", "No face detected"}
     };
-    network_mgr_->send_message(error_msg.dump());
+    if (network_mgr_) network_mgr_->send_message(error_msg.dump());
     
-    ring_buffer_->set_recording_active(false);
-    ring_buffer_->clear(); 
+    if (ring_buffer_) ring_buffer_->set_recording_active(false);
+    // NOTE: Don't clear ring_buffer - causes race condition
     
-    serial_comm_->queue_error("Face not detected");
+    if (serial_comm_) serial_comm_->queue_error("Face not detected");
     set_state(SystemState::ERROR);
 }
 
@@ -933,129 +1133,174 @@ void SystemController::handle_processing() {
     std::cout << "🔬 Processing IR frames..." << std::endl;
     
     std::string current_session_id = session_id_;
+    std::vector<FrameBox*> recording;  // Declare at top for cleanup in catch
     
-    
-    serial_comm_->queue_batch_progress(10);
-    
-    std::vector<FrameBox*> recording = ring_buffer_->get_all_valid_frames();
-    std::cout << "📊 Retrieved " << recording.size() << " frames" << std::endl;
-    
-    if (recording.empty()) {
-        serial_comm_->queue_error("No recording data");
-        network_mgr_->send_message("{\"type\":\"error\", \"code\":\"no_recording_data\"}");
-        ring_buffer_->clear();
-        set_state(SystemState::ERROR);
-        return;
-    }
-    
-    serial_comm_->queue_batch_progress(30);
-    
-    // Select best frame based on face detection confidence
-    FrameBox* best_frame = nullptr;
-    float best_confidence = -1.0f;
-    
-    for (FrameBox* frame : recording) {
-        if (frame->metadata.face_detected && 
-            frame->metadata.landmarks.size() >= 468 &&
-            frame->metadata.face_detection_confidence > best_confidence) {
-            best_confidence = frame->metadata.face_detection_confidence;
-            best_frame = frame;
+    // Helper lambda to release all acquired frames (moved to top for exception safety)
+    auto release_all_frames = [this, &recording]() {
+        if (!ring_buffer_) return;
+        for (FrameBox* frame : recording) {
+            if (frame) ring_buffer_->release_frame(frame);
         }
-    }
+        recording.clear();
+    };
     
-    if (!best_frame) {
-        best_frame = recording.back();
-    }
-    
-    serial_comm_->queue_batch_progress(50);
-    
-    // Convert IR to BGR for image encoding
-    cv::Mat ir_bgr = best_frame->get_ir_as_bgr();
-    if (ir_bgr.empty()) {
-        serial_comm_->queue_error("Camera error");
-        ring_buffer_->clear();
-        set_state(SystemState::ERROR);
-        return;
-    }
-    
-    std::vector<uchar> jpeg_buffer;
-    std::vector<int> compression_params = {cv::IMWRITE_JPEG_QUALITY, 90};
-    cv::imencode(".jpg", ir_bgr, jpeg_buffer, compression_params);
-    
-    serial_comm_->queue_batch_progress(70);
-    
-    std::string save_path = "/home/mercleDev/mdai_logs/captured_face_" + current_session_id + ".jpg";
-    cv::imwrite(save_path, ir_bgr);
-    std::cout << "📸 IR image saved: " << save_path << std::endl;
-    
-    ring_buffer_->clear();
-    
-    serial_comm_->queue_batch_progress(75);
-    
-    // Upload image
-    std::vector<uint8_t> buffer_uint8(jpeg_buffer.begin(), jpeg_buffer.end());
-    std::string image_id = network_mgr_->upload_image(middleware_host_, buffer_uint8, 
-                                                       current_session_id, device_id_);
-    
-    if (image_id.empty()) {
-        serial_comm_->queue_error("Image upload failed");
-        set_state(SystemState::ERROR);
-        return;
-    }
-    
-    serial_comm_->queue_batch_progress(85);
-    
-    // Send result (platform_id handled server-side, not needed here)
-    nlohmann::json api_payload;
-    api_payload["type"] = "submit_result";
-    api_payload["status"] = "success";
-    api_payload["session_id"] = current_session_id;
-    api_payload["image_id"] = image_id;
-    api_payload["mode"] = "ir_only";
-    api_payload["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
-    
-    result_ack_received_ = false;
-    
-    if (!network_mgr_->send_message(api_payload.dump())) {
-        serial_comm_->queue_error("Failed to send result");
-        set_state(SystemState::ERROR);
-        return;
-    }
-    
-    // Wait for ACK
-    auto send_time = std::chrono::steady_clock::now();
-    while (!result_ack_received_) {
-        if (!network_mgr_->is_connected()) {
-            serial_comm_->queue_error("Connection lost");
+    try {
+        if (serial_comm_) serial_comm_->queue_batch_progress(10);
+        
+        if (!ring_buffer_) {
+            std::cerr << "❌ Ring buffer not available" << std::endl;
+            if (serial_comm_) serial_comm_->queue_error("Internal error");
             set_state(SystemState::ERROR);
             return;
         }
         
-        if (current_state_ != SystemState::PROCESSING) return;
+        recording = ring_buffer_->get_all_valid_frames();
+        std::cout << "📊 Retrieved " << recording.size() << " frames" << std::endl;
         
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - send_time
-        ).count();
-        
-        if (elapsed >= 10000) {
-            serial_comm_->queue_error("Server timeout");
+        if (recording.empty()) {
+            if (serial_comm_) serial_comm_->queue_error("No recording data");
+            if (network_mgr_) network_mgr_->send_message("{\"type\":\"error\", \"code\":\"no_recording_data\"}");
             set_state(SystemState::ERROR);
             return;
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    
-    serial_comm_->queue_batch_progress(100);
-    
-    if (current_state_ == SystemState::PROCESSING) {
-        set_state(SystemState::SUCCESS);
+        if (serial_comm_) serial_comm_->queue_batch_progress(30);
+        
+        // Select best frame based on face detection confidence
+        FrameBox* best_frame = nullptr;
+        float best_confidence = -1.0f;
+        
+        for (FrameBox* frame : recording) {
+            if (frame && frame->metadata.face_detected && 
+                frame->metadata.landmarks.size() >= 468 &&
+                frame->metadata.face_detection_confidence > best_confidence) {
+                best_confidence = frame->metadata.face_detection_confidence;
+                best_frame = frame;
+            }
+        }
+        
+        if (!best_frame && !recording.empty()) {
+            best_frame = recording.back();
+        }
+        
+        if (!best_frame) {
+            if (serial_comm_) serial_comm_->queue_error("No valid frames");
+            release_all_frames();
+            set_state(SystemState::ERROR);
+            return;
+        }
+        
+        if (serial_comm_) serial_comm_->queue_batch_progress(50);
+        
+        // Convert IR to BGR for image encoding
+        cv::Mat ir_bgr = best_frame->get_ir_as_bgr();
+        if (ir_bgr.empty()) {
+            if (serial_comm_) serial_comm_->queue_error("Camera error");
+            release_all_frames();
+            set_state(SystemState::ERROR);
+            return;
+        }
+        
+        // Rotate image 90° counter-clockwise (-90°) to correct camera orientation
+        cv::Mat rotated;
+        cv::rotate(ir_bgr, rotated, cv::ROTATE_90_CLOCKWISE);
+        
+        std::vector<uchar> jpeg_buffer;
+        std::vector<int> compression_params = {cv::IMWRITE_JPEG_QUALITY, 90};
+        cv::imencode(".jpg", rotated, jpeg_buffer, compression_params);
+        
+        if (serial_comm_) serial_comm_->queue_batch_progress(70);
+        
+        std::string save_path = "/home/mercleDev/mdai_logs/captured_face_" + current_session_id + ".jpg";
+        cv::imwrite(save_path, rotated);
+        std::cout << "📸 IR image saved: " << save_path << " (rotated for portrait)" << std::endl;
+        
+        // Release all acquired frames - we've extracted the image data we need
+        release_all_frames();
+        
+        if (serial_comm_) serial_comm_->queue_batch_progress(75);
+        
+        // Upload image
+        std::vector<uint8_t> buffer_uint8(jpeg_buffer.begin(), jpeg_buffer.end());
+        if (!network_mgr_) {
+            if (serial_comm_) serial_comm_->queue_error("Network not available");
+            set_state(SystemState::ERROR);
+            return;
+        }
+        std::string image_id = network_mgr_->upload_image(middleware_host_, buffer_uint8, 
+                                                           current_session_id, device_id_);
+        
+        if (image_id.empty()) {
+            if (serial_comm_) serial_comm_->queue_error("Image upload failed");
+            set_state(SystemState::ERROR);
+            return;
+        }
+        
+        if (serial_comm_) serial_comm_->queue_batch_progress(85);
+        
+        // Send result (platform_id handled server-side, not needed here)
+        nlohmann::json api_payload;
+        api_payload["type"] = "submit_result";
+        api_payload["status"] = "success";
+        api_payload["session_id"] = current_session_id;
+        api_payload["image_id"] = image_id;
+        api_payload["mode"] = "ir_only";
+        api_payload["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
+        
+        result_ack_received_ = false;
+        
+        if (!network_mgr_ || !network_mgr_->send_message(api_payload.dump())) {
+            if (serial_comm_) serial_comm_->queue_error("Failed to send result");
+            set_state(SystemState::ERROR);
+            return;
+        }
+        
+        // Wait for ACK
+        auto send_time = std::chrono::steady_clock::now();
+        while (!result_ack_received_) {
+            if (!network_mgr_ || !network_mgr_->is_connected()) {
+                if (serial_comm_) serial_comm_->queue_error("Connection lost");
+                set_state(SystemState::ERROR);
+                return;
+            }
+            
+            if (current_state_ != SystemState::PROCESSING) return;
+            
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - send_time
+            ).count();
+            
+            if (elapsed >= 10000) {
+                if (serial_comm_) serial_comm_->queue_error("Server timeout");
+                set_state(SystemState::ERROR);
+                return;
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+        if (serial_comm_) serial_comm_->queue_batch_progress(100);
+        
+        if (current_state_ == SystemState::PROCESSING) {
+            set_state(SystemState::SUCCESS);
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ Exception in handle_processing(): " << e.what() << std::endl;
+        release_all_frames();
+        if (serial_comm_) serial_comm_->queue_error("Processing failed");
+        set_state(SystemState::ERROR);
+    } catch (...) {
+        std::cerr << "❌ Unknown exception in handle_processing()" << std::endl;
+        release_all_frames();
+        if (serial_comm_) serial_comm_->queue_error("Processing failed");
+        set_state(SystemState::ERROR);
     }
 }
 
 void SystemController::on_websocket_message(const std::string& message) {
     if (message.empty()) {
-        serial_comm_->queue_error("Connection lost");
+        if (serial_comm_) serial_comm_->queue_error("Connection lost");
         set_state(SystemState::ERROR);
         return;
     }
@@ -1065,7 +1310,7 @@ void SystemController::on_websocket_message(const std::string& message) {
         std::string msg_type = msg_json.value("type", "");
         
         if (msg_type == "connection_failed") {
-            serial_comm_->queue_error("Connection failed");
+            if (serial_comm_) serial_comm_->queue_error("Connection failed");
             set_state(SystemState::ERROR);
             return;
         }
@@ -1075,7 +1320,7 @@ void SystemController::on_websocket_message(const std::string& message) {
             if (current_state_ != SystemState::IDLE && 
                 current_state_ != SystemState::DELETE_SCREEN &&
                 current_state_ != SystemState::ERROR) {
-                serial_comm_->queue_error("Connection lost");
+                if (serial_comm_) serial_comm_->queue_error("Connection lost");
                 set_state(SystemState::ERROR);
             }
             return;
@@ -1088,7 +1333,7 @@ void SystemController::on_websocket_message(const std::string& message) {
             set_state(SystemState::READY);
         }
         else if (msg_type == "auth_failed") {
-            serial_comm_->queue_error("Auth failed");
+            if (serial_comm_) serial_comm_->queue_error("Auth failed");
             set_state(SystemState::ERROR);
         }
         else if (msg_type == "mobile_disconnected") {
@@ -1096,7 +1341,7 @@ void SystemController::on_websocket_message(const std::string& message) {
             if (current_state_ != SystemState::DELETE_SCREEN && 
                 current_state_ != SystemState::IDLE &&
                 current_state_ != SystemState::ERROR) {
-                serial_comm_->queue_error("Mobile disconnected");
+                if (serial_comm_) serial_comm_->queue_error("Mobile disconnected");
                 set_state(SystemState::ERROR);
             }
         }
@@ -1134,13 +1379,15 @@ void SystemController::on_websocket_message(const std::string& message) {
                 std::cout << "❌ Verification FAILED: " << reason << " - " << message << std::endl;
                 
                 // Show user-friendly error message
-                if (reason == "spoof_detected") {
-                    std::cout << "🚨 SPOOF DETECTED by server!" << std::endl;
-                    serial_comm_->queue_error("Spoof detected");
-                } else if (!message.empty()) {
-                    serial_comm_->queue_error(message);
-                } else {
-                    serial_comm_->queue_error(reason);
+                if (serial_comm_) {
+                    if (reason == "spoof_detected") {
+                        std::cout << "🚨 SPOOF DETECTED by server!" << std::endl;
+                        serial_comm_->queue_error("Spoof detected");
+                    } else if (!message.empty()) {
+                        serial_comm_->queue_error(message);
+                    } else {
+                        serial_comm_->queue_error(reason);
+                    }
                 }
                 set_state(SystemState::ERROR);
             }
@@ -1160,7 +1407,7 @@ void SystemController::on_websocket_message(const std::string& message) {
             std::string reason = msg_json.value("reason", "Session closed");
             std::cout << "⚠️ Session closed by server: " << reason << std::endl;
             if (current_state_ != SystemState::IDLE && current_state_ != SystemState::ERROR) {
-                serial_comm_->queue_error("Session expired");
+                if (serial_comm_) serial_comm_->queue_error("Session expired");
                 set_state(SystemState::ERROR);
             }
         }
@@ -1169,7 +1416,7 @@ void SystemController::on_websocket_message(const std::string& message) {
             std::string error = msg_json.value("error", "Unknown error");
             std::cout << "❌ Server error: " << error << std::endl;
             if (current_state_ != SystemState::IDLE && current_state_ != SystemState::ERROR) {
-                serial_comm_->queue_error(error);
+                if (serial_comm_) serial_comm_->queue_error(error);
                 set_state(SystemState::ERROR);
             }
         }
@@ -1222,52 +1469,74 @@ bool SystemController::load_device_config() {
 }
 
 bool SystemController::check_wifi_on_boot() {
-    return network_mgr_->is_connected_to_internet();
+    return network_mgr_ && network_mgr_->is_connected_to_internet();
 }
 
 void SystemController::handle_boot() {
-    serial_comm_->queue_state(1);
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    std::cout << "🚀 handle_boot() started" << std::endl;
     
-    serial_comm_->queue_state(2);
-    
-    std::cout << "🔧 Initializing IR camera..." << std::endl;
-    
-    const int MAX_RETRIES = 3;
-    bool camera_ok = false;
-    
-    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        if (producer_ && !producer_->is_running()) {
-            producer_.reset();
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+    try {
+        if (serial_comm_) serial_comm_->queue_state(1);
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        
+        if (serial_comm_) serial_comm_->queue_state(2);
+        
+        std::cout << "🔧 Initializing IR camera..." << std::endl;
+        
+        const int MAX_RETRIES = 3;
+        bool camera_ok = false;
+        
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                if (producer_ && !producer_->is_running()) {
+                    producer_.reset();
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                }
+                
+                initialize_camera();
+                
+                if (producer_ && producer_->is_running()) {
+                    camera_ok = true;
+                    std::cout << "✅ IR camera started (attempt " << attempt << ")" << std::endl;
+                    break;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "⚠️ Camera init attempt " << attempt << " failed: " << e.what() << std::endl;
+            }
+            
+            if (attempt < MAX_RETRIES) {
+                std::this_thread::sleep_for(std::chrono::seconds(attempt * 3));
+            }
         }
         
-        initialize_camera();
-        
-        if (producer_ && producer_->is_running()) {
-            camera_ok = true;
-            std::cout << "✅ IR camera started (attempt " << attempt << ")" << std::endl;
-            break;
+        if (!camera_ok) {
+            std::cerr << "❌ Camera failed after " << MAX_RETRIES << " attempts" << std::endl;
+            if (serial_comm_) {
+                serial_comm_->queue_error("Camera hardware error");
+                serial_comm_->queue_state(12);
+            }
+            set_state(SystemState::ERROR);
+            return;
         }
         
-        if (attempt < MAX_RETRIES) {
-            std::this_thread::sleep_for(std::chrono::seconds(attempt * 3));
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        
+        if (check_wifi_on_boot()) {
+            set_state(SystemState::PROVISIONED);
+        } else {
+            set_state(SystemState::AWAIT_ADMIN_QR);
         }
-    }
-    
-    if (!camera_ok) {
-        serial_comm_->queue_error("Camera hardware error");
-        serial_comm_->queue_state(12);
+        
+        std::cout << "✅ handle_boot() completed successfully" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ FATAL in handle_boot(): " << e.what() << std::endl;
+        if (serial_comm_) serial_comm_->queue_error("Boot failed");
         set_state(SystemState::ERROR);
-        return;
-    }
-    
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    
-    if (check_wifi_on_boot()) {
-        set_state(SystemState::PROVISIONED);
-    } else {
-        set_state(SystemState::AWAIT_ADMIN_QR);
+    } catch (...) {
+        std::cerr << "❌ FATAL unknown exception in handle_boot()" << std::endl;
+        if (serial_comm_) serial_comm_->queue_error("Boot failed");
+        set_state(SystemState::ERROR);
     }
 }
 
@@ -1286,20 +1555,20 @@ bool SystemController::handle_wifi_qr(const std::string& qr_data) {
         if (!server_success) return false;
         
         set_state(SystemState::WIFI_CHANGE_CONNECTING);
-        serial_comm_->queue_state(14);
+        if (serial_comm_) serial_comm_->queue_state(14);
         
-        if (network_mgr_->connect_wifi(wifi_ssid, wifi_password)) {
+        if (network_mgr_ && network_mgr_->connect_wifi(wifi_ssid, wifi_password)) {
             previous_ssid_ = wifi_ssid;
             previous_password_ = wifi_password;
             set_state(SystemState::WIFI_CHANGE_SUCCESS);
-            serial_comm_->queue_state(4);
+            if (serial_comm_) serial_comm_->queue_state(4);
             std::this_thread::sleep_for(std::chrono::seconds(3));
             set_state(SystemState::IDLE);
             return true;
         } else {
             set_state(SystemState::WIFI_CHANGE_FAILED);
-            serial_comm_->queue_state(13);
-            if (!previous_ssid_.empty()) {
+            if (serial_comm_) serial_comm_->queue_state(13);
+            if (!previous_ssid_.empty() && network_mgr_) {
                 network_mgr_->connect_wifi(previous_ssid_, previous_password_);
             }
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -1308,7 +1577,7 @@ bool SystemController::handle_wifi_qr(const std::string& qr_data) {
         }
         
     } catch (...) {
-        serial_comm_->queue_state(12);
+        if (serial_comm_) serial_comm_->queue_state(12);
         return false;
     }
 }
@@ -1333,8 +1602,10 @@ void SystemController::handle_hardware_error(const std::string& component, const
     // Stage 1: After MAX_RETRIES failures, restart the service
     if (hardware_failure_count_ == MAX_HARDWARE_RETRIES) {
         std::cerr << "🔄 Max retries reached - RESTARTING SERVICE..." << std::endl;
-        serial_comm_->queue_error("Restarting service...");
-        serial_comm_->queue_state(12);
+        if (serial_comm_) {
+            serial_comm_->queue_error("Restarting service...");
+            serial_comm_->queue_state(12);
+        }
         std::this_thread::sleep_for(std::chrono::seconds(2));
         
         // Kill this process - systemd will restart it
@@ -1346,8 +1617,10 @@ void SystemController::handle_hardware_error(const std::string& component, const
     // Stage 2: If still failing after timeout, reboot device
     if (elapsed > HARDWARE_FAILURE_REBOOT_TIMEOUT_SEC && hardware_failure_count_ > MAX_HARDWARE_RETRIES) {
         std::cerr << "🔄 Hardware failure persists for " << elapsed << "s - REBOOTING DEVICE..." << std::endl;
-        serial_comm_->queue_error("Hardware failure - rebooting");
-        serial_comm_->queue_state(12);
+        if (serial_comm_) {
+            serial_comm_->queue_error("Hardware failure - rebooting");
+            serial_comm_->queue_state(12);
+        }
         std::this_thread::sleep_for(std::chrono::seconds(3));
         
         // Reboot the device
@@ -1357,7 +1630,7 @@ void SystemController::handle_hardware_error(const std::string& component, const
     
     // Try to recover the component
     if (component == "Camera") {
-        serial_comm_->queue_error("Camera error - reconnecting...");
+        if (serial_comm_) serial_comm_->queue_error("Camera error - reconnecting...");
         
         // Stop and reset camera
         if (producer_) {
@@ -1385,3 +1658,4 @@ void SystemController::handle_hardware_error(const std::string& component, const
 }
 
 } // namespace mdai
+

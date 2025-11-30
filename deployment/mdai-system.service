@@ -119,6 +119,12 @@ StandardError=append:/home/mercleDev/mdai_logs/system.log
 SyslogIdentifier=mdai-system
 
 # ============================================
+# CORE DUMPS (for debugging crashes)
+# ============================================
+# Enable core dumps for crash analysis
+LimitCORE=infinity
+
+# ============================================
 # SECURITY (minimal - need hardware access)
 # ============================================
 PrivateTmp=false

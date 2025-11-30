@@ -84,3 +84,4 @@ echo -e "${YELLOW}On next reboot, mdai-system will start automatically.${NC}"
 
 
 
+

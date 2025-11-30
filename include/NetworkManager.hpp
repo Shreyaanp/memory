@@ -74,12 +74,18 @@ private:
     // SSL helpers
     bool init_ssl();
     void cleanup_ssl();
+    int net_read(void* buf, int len);   // Read from SSL or plain socket
+    int net_write(const void* buf, int len); // Write to SSL or plain socket
     
     // Send queue (for async non-blocking sends)
     mutable std::mutex send_queue_mutex_;
     std::queue<std::string> send_queue_;
     static constexpr size_t MAX_SEND_QUEUE = 100;
     std::atomic<uint64_t> send_queue_dropped_{0};
+    
+    // Cleanup mutex (protects disconnect/cleanup operations)
+    mutable std::mutex cleanup_mutex_;
+    std::atomic<bool> cleanup_in_progress_{false};
     
     void process_send_queue();  // Called from client_loop
 };

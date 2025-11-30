@@ -54,8 +54,8 @@ struct FrameBoxMetadata {
     
     // Frame dimensions (for landmark normalization)
     // Frame may be rotated 90° CW at source for portrait orientation
-    int frame_width = 848;
-    int frame_height = 480;
+    int frame_width = 1280;
+    int frame_height = 800;
     
     // Generic extensible fields (kept for compatibility)
     std::map<std::string, float> scores;

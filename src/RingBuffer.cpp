@@ -1,206 +1,442 @@
 #include "RingBuffer.hpp"
 #include <algorithm>
 #include <iostream>
+#include <thread>
+#include <chrono>
+#include <stdexcept>
 
 namespace mdai {
 
 DynamicRingBuffer::DynamicRingBuffer(size_t initial_capacity, size_t max_memory_bytes)
     : capacity_(initial_capacity), max_memory_bytes_(max_memory_bytes) {
     
-    slots_.reserve(initial_capacity);
-    for (size_t i = 0; i < initial_capacity; ++i) {
-        slots_.push_back(std::make_unique<RingBufferSlot>());
+    if (initial_capacity == 0) {
+        throw std::invalid_argument("Ring buffer capacity must be > 0");
+    }
+    
+    try {
+        slots_.reserve(initial_capacity);
+        for (size_t i = 0; i < initial_capacity; ++i) {
+            slots_.push_back(std::make_unique<RingBufferSlot>());
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ RingBuffer init failed: " << e.what() << std::endl;
+        throw;
     }
 }
 
 DynamicRingBuffer::~DynamicRingBuffer() {
-    clear();
+    // Destructor should not throw - just let unique_ptr destructors clean up
+    // Don't call clear() as consumers may still hold references
 }
 
 bool DynamicRingBuffer::write(FrameBox&& frame) {
-    size_t frame_size = estimate_frame_size(frame);
-    size_t current_mem = get_memory_usage();
-    size_t current_usage = get_usage();
-    
-    // If recording is active and we are full, try to grow
-    if (recording_active_ && current_usage >= capacity_) {
-        if (current_mem + frame_size < max_memory_bytes_) {
-            grow_buffer();
-        } else {
-            total_frames_dropped_++;
-            return false; 
-        }
-    }
-
-    size_t slot_idx = find_available_slot();
-    
-    if (slot_idx >= capacity_) {
-        if (!recording_active_) {
-            // Circular mode: overwrite oldest slot
-            slot_idx = write_index_ % capacity_;
-        } else {
-            total_frames_dropped_++;
+    try {
+        size_t cap = capacity_.load(std::memory_order_acquire);
+        if (cap == 0 || slots_.empty()) {
             return false;
         }
-    }
-
-    RingBufferSlot& slot = *slots_[slot_idx];
-    
-    {
-        std::lock_guard<std::mutex> lock(slot.slot_mutex);
         
-        // Clear old frame data before overwriting (important for memory management)
-        if (slot.state == SlotState::READY || slot.state == SlotState::READING) {
-            slot.frame = FrameBox();  // Clear old data first
+        size_t frame_size = estimate_frame_size(frame);
+        size_t current_mem = get_memory_usage();
+        size_t current_usage = get_usage();
+        
+        // If recording is active and we are full, try to grow
+        if (recording_active_.load(std::memory_order_acquire) && current_usage >= cap) {
+            if (current_mem + frame_size < max_memory_bytes_) {
+                if (grow_buffer()) {
+                    cap = capacity_.load(std::memory_order_acquire);
+                }
+            } else {
+                total_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+                return false; 
+            }
+        }
+
+        // CIRCULAR BUFFER: Find the oldest frame to overwrite
+        // Strategy 1: Try to find an EMPTY slot first
+        // Strategy 2: If no empty slots, overwrite the OLDEST frame (lowest sequence_id)
+        //             that has no active readers
+        
+        size_t target_slot = cap; // Invalid
+        uint64_t min_seq = UINT64_MAX;
+        
+        // First pass: Find empty slot OR oldest frame without readers
+        for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+            if (!slots_[i]) continue;
+            
+            RingBufferSlot& slot = *slots_[i];
+            SlotState state = slot.state.load(std::memory_order_acquire);
+            
+            // Prefer EMPTY slots
+            if (state == SlotState::EMPTY) {
+                target_slot = i;
+                break; // Found empty slot, use it immediately
+            }
+            
+            // For READY slots, track the oldest one (lowest sequence_id)
+            if (state == SlotState::READY) {
+                // Skip if being read
+                if (slot.reader_count.load(std::memory_order_acquire) > 0) {
+                    continue;
+                }
+                
+                uint64_t seq = slot.frame.sequence_id;
+                if (seq < min_seq) {
+                    min_seq = seq;
+                    target_slot = i;
+                }
+            }
         }
         
-        slot.state = SlotState::WRITING;
-        slot.frame = std::move(frame);
-        slot.state = SlotState::READY;
+        // If no suitable slot found, try harder - find ANY slot without readers
+        if (target_slot >= cap) {
+            for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+                if (!slots_[i]) continue;
+                
+                RingBufferSlot& slot = *slots_[i];
+                if (slot.reader_count.load(std::memory_order_acquire) == 0) {
+                    target_slot = i;
+                    break;
+                }
+            }
+        }
+        
+        // Write to the target slot
+        if (target_slot < cap && target_slot < slots_.size() && slots_[target_slot]) {
+            RingBufferSlot& slot = *slots_[target_slot];
+            
+            // Try to acquire the slot
+            std::unique_lock<std::mutex> lock(slot.slot_mutex, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                // Slot is busy, try simple circular write
+                size_t fallback_idx = write_index_.load(std::memory_order_acquire) % cap;
+                if (fallback_idx < slots_.size() && slots_[fallback_idx]) {
+                    RingBufferSlot& fallback_slot = *slots_[fallback_idx];
+                    std::unique_lock<std::mutex> fallback_lock(fallback_slot.slot_mutex, std::try_to_lock);
+                    if (fallback_lock.owns_lock() && 
+                        fallback_slot.reader_count.load(std::memory_order_acquire) == 0) {
+                        fallback_slot.state.store(SlotState::WRITING, std::memory_order_release);
+                        fallback_slot.frame = std::move(frame);
+                        fallback_slot.state.store(SlotState::READY, std::memory_order_release);
+                        write_index_.store(fallback_idx + 1, std::memory_order_release);
+                        total_frames_written_.fetch_add(1, std::memory_order_relaxed);
+                        return true;
+                    }
+                }
+                total_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            
+            // Double-check reader_count with lock held
+            if (slot.reader_count.load(std::memory_order_acquire) > 0) {
+                // Someone started reading, drop frame
+                total_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            
+            // Safe to write - overwrite oldest frame
+            slot.state.store(SlotState::WRITING, std::memory_order_release);
+            slot.frame = std::move(frame);
+            slot.state.store(SlotState::READY, std::memory_order_release);
+            
+            write_index_.store(target_slot + 1, std::memory_order_release);
+            total_frames_written_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        
+        // All slots are being read - drop the frame
+        total_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ RingBuffer write exception: " << e.what() << std::endl;
+        total_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    } catch (...) {
+        std::cerr << "❌ RingBuffer write unknown exception" << std::endl;
+        total_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
-    
-    write_index_++;
-    total_frames_written_++;
-    return true;
 }
 
 FrameBox* DynamicRingBuffer::get_latest_frame() {
-    // Simple scan for highest sequence ID
-    FrameBox* newest = nullptr;
-    uint64_t max_seq = 0;
-    
-    for (auto& slot : slots_) {
-        if (slot->state == SlotState::READY) {
-             if (slot->frame.sequence_id > max_seq) {
-                 max_seq = slot->frame.sequence_id;
-                 newest = &slot->frame;
-             }
+    try {
+        size_t cap = capacity_.load(std::memory_order_acquire);
+        if (cap == 0 || slots_.empty()) {
+            return nullptr;
         }
+        
+        // Single-pass approach: find best candidate then acquire
+        uint64_t max_seq = 0;
+        size_t best_slot_idx = cap; // Invalid index
+        
+        // Find the slot with the highest sequence_id
+        for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+            if (!slots_[i]) continue;
+            
+            RingBufferSlot& slot = *slots_[i];
+            
+            SlotState state = slot.state.load(std::memory_order_acquire);
+            if (state != SlotState::READY && state != SlotState::READING) {
+                continue;
+            }
+            
+            uint64_t seq = slot.frame.sequence_id;
+            if (seq > max_seq) {
+                max_seq = seq;
+                best_slot_idx = i;
+            }
+        }
+        
+        // If we found a candidate, lock it and acquire
+        if (best_slot_idx < cap && best_slot_idx < slots_.size() && slots_[best_slot_idx]) {
+            RingBufferSlot& slot = *slots_[best_slot_idx];
+            std::lock_guard<std::mutex> lock(slot.slot_mutex);
+            
+            // Re-check state after acquiring lock
+            SlotState state = slot.state.load(std::memory_order_acquire);
+            if (state == SlotState::READY || state == SlotState::READING) {
+                // Acquire the frame
+                slot.reader_count.fetch_add(1, std::memory_order_acq_rel);
+                slot.state.store(SlotState::READING, std::memory_order_release);
+                slot.frame.acquire();
+                return &slot.frame;
+            }
+        }
+        
+        return nullptr;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ RingBuffer get_latest_frame exception: " << e.what() << std::endl;
+        return nullptr;
+    } catch (...) {
+        std::cerr << "❌ RingBuffer get_latest_frame unknown exception" << std::endl;
+        return nullptr;
     }
-    
-    if (newest) {
-        // Increment ref count mechanism if needed, or just return ptr
-        // For safety in this design, consumer must call release_frame or be careful
-        // (Ideally we'd return a wrapper/handle)
-        newest->acquire();
-    }
-    return newest;
 }
 
 void DynamicRingBuffer::release_frame(FrameBox* frame) {
-    if (frame) {
+    if (!frame) return;
+    
+    try {
+        // Release the FrameBox ref_count first
         frame->release();
+        
+        // Find the slot containing this frame and decrement reader_count
+        size_t cap = capacity_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+            if (!slots_[i]) continue;
+            
+            RingBufferSlot& slot = *slots_[i];
+            
+            if (&slot.frame == frame) {
+                std::lock_guard<std::mutex> lock(slot.slot_mutex);
+                
+                int prev_count = slot.reader_count.load(std::memory_order_acquire);
+                
+                // Safety check: don't decrement below 0
+                if (prev_count > 0) {
+                    prev_count = slot.reader_count.fetch_sub(1, std::memory_order_acq_rel);
+                    
+                    // If this was the last reader, mark slot as READY again
+                    if (prev_count == 1) {
+                        slot.state.store(SlotState::READY, std::memory_order_release);
+                    }
+                } else {
+                    // reader_count was already 0 - this shouldn't happen but handle gracefully
+                    std::cerr << "⚠️ RingBuffer: release_frame called but reader_count was 0" << std::endl;
+                    // Ensure state is READY if not being written
+                    SlotState current_state = slot.state.load(std::memory_order_acquire);
+                    if (current_state == SlotState::READING) {
+                        slot.state.store(SlotState::READY, std::memory_order_release);
+                    }
+                }
+                
+                return;
+            }
+        }
+        
+        // Frame not found in buffer - this can happen if buffer grew or frame is stale
+        // Not an error, just ignore
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ RingBuffer release_frame exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ RingBuffer release_frame unknown exception" << std::endl;
     }
 }
 
 void DynamicRingBuffer::set_recording_active(bool active) {
-    recording_active_ = active;
-    if (active) {
-        // When starting recording, maybe we want to clear old junk?
-        // Or keep it as pre-roll context? Keeping for context is better.
-    }
+    recording_active_.store(active, std::memory_order_release);
 }
 
 bool DynamicRingBuffer::is_recording_active() const {
-    return recording_active_;
+    return recording_active_.load(std::memory_order_acquire);
 }
 
 void DynamicRingBuffer::clear() {
-    for (auto& slot : slots_) {
-        std::lock_guard<std::mutex> lock(slot->slot_mutex);
-        slot->state = SlotState::EMPTY;
-        slot->frame = FrameBox(); // Clear data
+    try {
+        // Wait briefly for any readers to finish
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        
+        size_t cap = capacity_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+            if (!slots_[i]) continue;
+            
+            RingBufferSlot& slot = *slots_[i];
+            std::lock_guard<std::mutex> lock(slot.slot_mutex);
+            
+            // Only clear if no readers
+            if (slot.reader_count.load(std::memory_order_acquire) == 0) {
+                slot.state.store(SlotState::EMPTY, std::memory_order_release);
+                slot.frame = FrameBox();
+            }
+        }
+        write_index_.store(0, std::memory_order_release);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ RingBuffer clear exception: " << e.what() << std::endl;
     }
-    write_index_ = 0;
 }
 
 size_t DynamicRingBuffer::get_capacity() const {
-    return capacity_;
+    return capacity_.load(std::memory_order_acquire);
 }
 
 size_t DynamicRingBuffer::get_usage() const {
-    size_t count = 0;
-    for (const auto& slot : slots_) {
-        if (slot->state == SlotState::READY || slot->state == SlotState::READING) {
-            count++;
+    try {
+        size_t count = 0;
+        size_t cap = capacity_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+            if (!slots_[i]) continue;
+            SlotState state = slots_[i]->state.load(std::memory_order_acquire);
+            if (state == SlotState::READY || state == SlotState::READING) {
+                count++;
+            }
         }
+        return count;
+    } catch (...) {
+        return 0;
     }
-    return count;
 }
 
 size_t DynamicRingBuffer::get_memory_usage() const {
-    // Rough estimate
-    size_t bytes = 0;
-    for (const auto& slot : slots_) {
-        if (slot->state != SlotState::EMPTY) {
-            bytes += estimate_frame_size(slot->frame);
+    try {
+        size_t bytes = 0;
+        size_t cap = capacity_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+            if (!slots_[i]) continue;
+            SlotState state = slots_[i]->state.load(std::memory_order_acquire);
+            if (state != SlotState::EMPTY) {
+                bytes += estimate_frame_size(slots_[i]->frame);
+            }
         }
+        return bytes;
+    } catch (...) {
+        return 0;
     }
-    return bytes;
 }
 
 size_t DynamicRingBuffer::estimate_frame_size(const FrameBox& frame) const {
-    // IR-only mode: only ir_data is present
     return frame.ir_data.size() + sizeof(FrameBox);
 }
 
 bool DynamicRingBuffer::grow_buffer() {
-    std::lock_guard<std::mutex> lock(growth_mutex_);
-    size_t old_cap = capacity_;
-    size_t new_cap = old_cap * 2;
-    
-    // Reallocation logic (tricky with vector of unique_ptrs if active)
-    // We just append
-    slots_.reserve(new_cap);
-    for (size_t i = old_cap; i < new_cap; ++i) {
-        slots_.push_back(std::make_unique<RingBufferSlot>());
+    try {
+        std::lock_guard<std::mutex> lock(growth_mutex_);
+        
+        size_t old_cap = capacity_.load(std::memory_order_acquire);
+        size_t new_cap = old_cap * 2;
+        
+        // Sanity check - don't grow beyond reasonable limits
+        if (new_cap > 10000) {
+            std::cerr << "⚠️ RingBuffer: refusing to grow beyond 10000 slots" << std::endl;
+            return false;
+        }
+        
+        slots_.reserve(new_cap);
+        for (size_t i = old_cap; i < new_cap; ++i) {
+            slots_.push_back(std::make_unique<RingBufferSlot>());
+        }
+        
+        capacity_.store(new_cap, std::memory_order_release);
+        growth_count_.fetch_add(1, std::memory_order_relaxed);
+        
+        std::cout << "📈 RingBuffer grew: " << old_cap << " → " << new_cap << " slots" << std::endl;
+        return true;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ RingBuffer grow_buffer exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ RingBuffer grow_buffer unknown exception" << std::endl;
+        return false;
     }
-    
-    capacity_ = new_cap;
-    growth_count_++;
-    return true;
 }
 
 size_t DynamicRingBuffer::find_available_slot() {
-    // In normal mode (not recording), always use circular overwrite
-    // This is more efficient than searching for EMPTY slots
-    if (!recording_active_) {
-        return write_index_ % capacity_;
-    }
-    
-    // Recording mode: try to find an EMPTY slot first
-    for (size_t i = 0; i < capacity_; ++i) {
-        if (slots_[i]->state == SlotState::EMPTY) {
-            return i;
-        }
-    }
-    
-    // No empty slots - signal full (caller will try to grow or drop)
-    return capacity_;
+    size_t cap = capacity_.load(std::memory_order_acquire);
+    if (cap == 0) return 0;
+    return write_index_.load(std::memory_order_acquire) % cap;
 }
 
-// Helper for Sequential Access (Batch Processing)
 std::vector<FrameBox*> DynamicRingBuffer::get_all_valid_frames() {
     std::vector<FrameBox*> frames;
-    for (auto& slot : slots_) {
-        if (slot->state == SlotState::READY || slot->state == SlotState::READING) {
-            frames.push_back(&slot->frame);
+    
+    try {
+        size_t cap = capacity_.load(std::memory_order_acquire);
+        frames.reserve(cap); // Pre-allocate to avoid reallocation
+        
+        for (size_t i = 0; i < cap && i < slots_.size(); ++i) {
+            if (!slots_[i]) continue;
+            
+            RingBufferSlot& slot = *slots_[i];
+            
+            std::lock_guard<std::mutex> lock(slot.slot_mutex);
+            
+            SlotState state = slot.state.load(std::memory_order_acquire);
+            if (state == SlotState::READY || state == SlotState::READING) {
+                // Acquire for reading
+                slot.reader_count.fetch_add(1, std::memory_order_acq_rel);
+                slot.state.store(SlotState::READING, std::memory_order_release);
+                slot.frame.acquire();
+                
+                frames.push_back(&slot.frame);
+            }
         }
+        
+        // Sort by sequence ID
+        if (frames.size() > 1) {
+            std::sort(frames.begin(), frames.end(), 
+                [](const FrameBox* a, const FrameBox* b) {
+                    if (!a || !b) return false;
+                    return a->sequence_id < b->sequence_id;
+                });
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ RingBuffer get_all_valid_frames exception: " << e.what() << std::endl;
+        // If we failed mid-way, we need to release any frames we already acquired
+        for (FrameBox* frame : frames) {
+            release_frame(frame);
+        }
+        frames.clear();
+    } catch (...) {
+        std::cerr << "❌ RingBuffer get_all_valid_frames unknown exception" << std::endl;
+        for (FrameBox* frame : frames) {
+            release_frame(frame);
+        }
+        frames.clear();
     }
     
-    // Sort by Sequence ID
-    std::sort(frames.begin(), frames.end(), 
-        [](const FrameBox* a, const FrameBox* b) {
-            return a->sequence_id < b->sequence_id;
-        });
-        
     return frames;
 }
 
-// Stub Implementations for unused methods
+// Stub implementations
 FrameBox* DynamicRingBuffer::get_next_frame(uint64_t) { return nullptr; }
-uint64_t DynamicRingBuffer::get_total_frames_written() const { return total_frames_written_; }
-uint64_t DynamicRingBuffer::get_total_frames_dropped() const { return total_frames_dropped_; }
-size_t DynamicRingBuffer::get_growth_count() const { return growth_count_; }
+uint64_t DynamicRingBuffer::get_total_frames_written() const { return total_frames_written_.load(std::memory_order_acquire); }
+uint64_t DynamicRingBuffer::get_total_frames_dropped() const { return total_frames_dropped_.load(std::memory_order_acquire); }
+size_t DynamicRingBuffer::get_growth_count() const { return growth_count_.load(std::memory_order_acquire); }
 
 } // namespace mdai

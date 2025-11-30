@@ -46,6 +46,24 @@ void NetworkManager::cleanup_ssl() {
     EVP_cleanup();
 }
 
+// Helper: Read from SSL or plain socket
+int NetworkManager::net_read(void* buf, int len) {
+    if (ssl_) {
+        return SSL_read((SSL*)ssl_, buf, len);
+    } else {
+        return read(socket_fd_, buf, len);
+    }
+}
+
+// Helper: Write to SSL or plain socket
+int NetworkManager::net_write(const void* buf, int len) {
+    if (ssl_) {
+        return SSL_write((SSL*)ssl_, buf, len);
+    } else {
+        return write(socket_fd_, buf, len);
+    }
+}
+
 bool NetworkManager::connect_wifi(const std::string& ssid, const std::string& password) {
     std::cout << "Connecting to WiFi: " << ssid << std::endl;
     
@@ -144,24 +162,12 @@ void NetworkManager::disconnect() {
     running_ = false;
     connected_ = false;
     
-    // Shutdown socket FIRST to unblock any blocking reads in the thread
+    // Shutdown socket to unblock any blocking reads in the thread
     if (socket_fd_ != -1) {
-        shutdown(socket_fd_, SHUT_RDWR);  // Unblock SSL_read
+        shutdown(socket_fd_, SHUT_RDWR);
     }
     
-    // Now cleanup SSL (after unblocking)
-    if (ssl_) {
-        SSL_shutdown((SSL*)ssl_);
-        SSL_free((SSL*)ssl_);
-        ssl_ = nullptr;
-    }
-    
-    if (socket_fd_ != -1) {
-        close(socket_fd_);
-        socket_fd_ = -1;
-    }
-    
-    // Join thread (should exit quickly now that socket is shutdown)
+    // Wait for thread to finish (it will do its own cleanup)
     if (client_thread_.joinable()) {
         client_thread_.join();
     }
@@ -243,6 +249,13 @@ void NetworkManager::client_loop(std::string host, int port, std::string path, s
 
     // 4. Upgrade to SSL
     ssl_ = SSL_new((SSL_CTX*)ssl_ctx_);
+    if (!ssl_) {
+        std::cerr << "❌ SSL_new failed" << std::endl;
+        close(socket_fd_);
+        socket_fd_ = -1;
+        running_ = false;
+        return;
+    }
     SSL_set_fd((SSL*)ssl_, socket_fd_);
     if (SSL_connect((SSL*)ssl_) <= 0) {
         std::cerr << "❌ SSL handshake failed" << std::endl;
@@ -299,7 +312,7 @@ void NetworkManager::client_loop(std::string host, int port, std::string path, s
         process_send_queue();
     }
     
-    // Cleanup
+    // Cleanup SSL and socket
     if (ssl_) {
         SSL_shutdown((SSL*)ssl_);
         SSL_free((SSL*)ssl_);
@@ -312,7 +325,7 @@ void NetworkManager::client_loop(std::string host, int port, std::string path, s
     connected_ = false;
     running_ = false;
     
-    std::cout << "🔌 WebSocket thread exited (no reconnect)" << std::endl;
+    std::cout << "🔌 WebSocket thread exited" << std::endl;
 }
 
 bool NetworkManager::perform_handshake(const std::string& host, const std::string& path, const std::string& device_id) {
@@ -332,11 +345,11 @@ bool NetworkManager::perform_handshake(const std::string& host, const std::strin
         "Sec-WebSocket-Key: " + sec_key + "\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n";
     
-    if (SSL_write((SSL*)ssl_, request.c_str(), request.length()) <= 0) return false;
+    if (net_write(request.c_str(), request.length()) <= 0) return false;
     
     // Read Response Headers (Basic parsing)
     char buffer[4096];
-    int bytes = SSL_read((SSL*)ssl_, buffer, sizeof(buffer) - 1);
+    int bytes = net_read(buffer, sizeof(buffer) - 1);
     if (bytes <= 0) return false;
     buffer[bytes] = '\0';
     
@@ -411,37 +424,40 @@ bool NetworkManager::send_frame_internal(const std::string& message) {
         frame.push_back(message[i] ^ mask[i % 4]);
     }
     
-    int sent = SSL_write((SSL*)ssl_, frame.data(), frame.size());
+    int sent = net_write(frame.data(), frame.size());
     return (sent == static_cast<int>(frame.size()));
 }
 
 std::string NetworkManager::receive_frame() {
-    if (!connected_ || !ssl_) return "";
+    if (!connected_ || socket_fd_ < 0) return "";
     
     while (true) {  // Loop to handle control frames
     uint8_t header[2];
-        int read_result = SSL_read((SSL*)ssl_, header, 2);
+        int read_result = net_read(header, 2);
         if (read_result <= 0) {
-            int ssl_error = SSL_get_error((SSL*)ssl_, read_result);
-            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;  // Retry
+            // For SSL, check if it's a retriable error
+            if (ssl_) {
+                int ssl_error = SSL_get_error((SSL*)ssl_, read_result);
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;  // Retry
+                }
             }
             return "";  // Real error or disconnect
         }
         
         uint8_t opcode = header[0] & 0x0F;
         bool is_fin = (header[0] & 0x80) != 0;
-    uint64_t payload_len = header[1] & 0x7F;
+        uint64_t payload_len = header[1] & 0x7F;
         
         // Handle extended payload length
-    if (payload_len == 126) {
-        uint8_t len_bytes[2];
-        if (SSL_read((SSL*)ssl_, len_bytes, 2) <= 0) return "";
-        payload_len = (len_bytes[0] << 8) | len_bytes[1];
+        if (payload_len == 126) {
+            uint8_t len_bytes[2];
+            if (net_read(len_bytes, 2) <= 0) return "";
+            payload_len = (len_bytes[0] << 8) | len_bytes[1];
         } else if (payload_len == 127) {
             uint8_t len_bytes[8];
-            if (SSL_read((SSL*)ssl_, len_bytes, 8) <= 0) return "";
+            if (net_read(len_bytes, 8) <= 0) return "";
             payload_len = 0;
             for (int i = 0; i < 8; i++) {
                 payload_len = (payload_len << 8) | len_bytes[i];
@@ -449,13 +465,13 @@ std::string NetworkManager::receive_frame() {
         }
         
         // Read payload
-    std::vector<uint8_t> buffer(payload_len);
-    size_t total_read = 0;
-    while (total_read < payload_len) {
-        int r = SSL_read((SSL*)ssl_, buffer.data() + total_read, payload_len - total_read);
-        if (r <= 0) return "";
-        total_read += r;
-    }
+        std::vector<uint8_t> buffer(payload_len);
+        size_t total_read = 0;
+        while (total_read < payload_len) {
+            int r = net_read(buffer.data() + total_read, payload_len - total_read);
+            if (r <= 0) return "";
+            total_read += r;
+        }
     
         // Handle different frame types
         switch (opcode) {
@@ -479,7 +495,7 @@ std::string NetworkManager::receive_frame() {
                     
                     // Send close frame back
                     uint8_t close_resp[2] = {0x88, 0x00};
-                    SSL_write((SSL*)ssl_, close_resp, 2);
+                    net_write(close_resp, 2);
                 }
                 return "";  // Signal disconnect
                 
@@ -495,7 +511,7 @@ std::string NetworkManager::receive_frame() {
                     for (size_t i = 0; i < buffer.size(); i++) {
                         pong_frame.push_back(buffer[i] ^ mask[i % 4]);
                     }
-                    SSL_write((SSL*)ssl_, pong_frame.data(), pong_frame.size());
+                    net_write(pong_frame.data(), pong_frame.size());
                 }
                 continue;  // Keep reading for actual data
                 
@@ -608,6 +624,11 @@ std::string NetworkManager::upload_image(const std::string& host, const std::vec
     
     // SSL connection
     SSL* upload_ssl = SSL_new((SSL_CTX*)ssl_ctx_);
+    if (!upload_ssl) {
+        std::cerr << "❌ SSL_new failed for image upload" << std::endl;
+        close(sock);
+        return "";
+    }
     SSL_set_fd(upload_ssl, sock);
     if (SSL_connect(upload_ssl) <= 0) {
         std::cerr << "❌ SSL handshake failed for image upload" << std::endl;

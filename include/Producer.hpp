@@ -22,10 +22,10 @@ namespace mdai {
  * @brief Simplified camera configuration for IR-only mode
  */
 struct CameraConfig {
-    // IR stream configuration
-    int ir_width = 848;
-    int ir_height = 480;
-    int ir_fps = 30;
+    // IR stream configuration (1280x800 = native D435i resolution)
+    int ir_width = 1280;
+    int ir_height = 800;
+    int ir_fps = 30;  // Max FPS at this resolution
     
     // Device selection
     std::string device_serial = "";  // Empty = use any device

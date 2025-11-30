@@ -56,6 +56,12 @@ public:
     bool initialize();
     void run();
     void stop();
+    
+    // Request a service restart (exits with code that triggers systemd restart)
+    void request_restart(const std::string& reason = "");
+    
+    // Check if restart was requested
+    bool is_restart_requested() const { return restart_requested_.load(); }
 
 private:
     // Components
@@ -68,6 +74,8 @@ private:
     // State Management
     std::atomic<SystemState> current_state_{SystemState::BOOT};
     std::atomic<bool> running_{false};
+    std::atomic<bool> restart_requested_{false};
+    std::string restart_reason_;
     
     // Timer for state transitions
     std::chrono::steady_clock::time_point state_timer_start_;

@@ -53,14 +53,35 @@ std::string CryptoUtils::base64_encode(const std::string& input) {
 
 std::pair<std::string, std::string> CryptoUtils::generate_rsa_key_pair(int bits) {
     EVP_PKEY* pkey = EVP_PKEY_new();
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!pkey) {
+        std::cerr << "[CryptoUtils] EVP_PKEY_new failed" << std::endl;
+        return {"", ""};
+    }
     
-    EVP_PKEY_keygen_init(ctx);
-    EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits);
-    EVP_PKEY_keygen(ctx, &pkey);
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!ctx) {
+        std::cerr << "[CryptoUtils] EVP_PKEY_CTX_new_id failed" << std::endl;
+        EVP_PKEY_free(pkey);
+        return {"", ""};
+    }
+    
+    if (EVP_PKEY_keygen_init(ctx) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits) <= 0 ||
+        EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+        std::cerr << "[CryptoUtils] RSA key generation failed" << std::endl;
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return {"", ""};
+    }
 
     // Extract Public Key
     BIO* pub_bio = BIO_new(BIO_s_mem());
+    if (!pub_bio) {
+        std::cerr << "[CryptoUtils] BIO_new failed for public key" << std::endl;
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return {"", ""};
+    }
     PEM_write_bio_PUBKEY(pub_bio, pkey);
     
     char* pub_data;
@@ -70,6 +91,12 @@ std::pair<std::string, std::string> CryptoUtils::generate_rsa_key_pair(int bits)
 
     // Extract Private Key
     BIO* priv_bio = BIO_new(BIO_s_mem());
+    if (!priv_bio) {
+        std::cerr << "[CryptoUtils] BIO_new failed for private key" << std::endl;
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return {"", ""};
+    }
     PEM_write_bio_PrivateKey(priv_bio, pkey, NULL, NULL, 0, NULL, NULL);
     
     char* priv_data;
@@ -85,14 +112,25 @@ std::pair<std::string, std::string> CryptoUtils::generate_rsa_key_pair(int bits)
 
 std::string CryptoUtils::rsa_decrypt(const std::string& encrypted_data, const std::string& private_key_pem) {
     BIO* bio = BIO_new_mem_buf(private_key_pem.c_str(), -1);
+    if (!bio) return "";
+    
     EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
     BIO_free(bio);
 
     if (!pkey) return "";
 
     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, NULL);
-    EVP_PKEY_decrypt_init(ctx);
-    EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        return "";
+    }
+    
+    if (EVP_PKEY_decrypt_init(ctx) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return "";
+    }
 
     size_t outlen;
     EVP_PKEY_decrypt(ctx, NULL, &outlen, 
