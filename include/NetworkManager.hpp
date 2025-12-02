@@ -27,6 +27,7 @@ public:
     void start_wifi_monitor();
     void stop_wifi_monitor();
     bool is_wifi_stable() const;
+    bool is_wifi_connected();  // Check if WiFi interface is connected (link status)
 
     // WebSocket Client (WSS)
     bool connect_to_middleware(const std::string& host, int port, const std::string& path, const std::string& device_id);

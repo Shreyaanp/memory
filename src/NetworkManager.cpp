@@ -171,6 +171,36 @@ std::string NetworkManager::get_current_ssid() {
     }
 }
 
+// Helper: Check if WiFi interface is actually connected (not just internet)
+bool NetworkManager::is_wifi_connected() {
+    try {
+        // Check if WiFi device (wlan0) is in connected state
+        // Parse device status output: "wlan0 wifi connected SSID"
+        FILE* pipe = popen("nmcli device status 2>/dev/null | grep '^wlan0' | awk '{print $3}'", "r");
+        if (!pipe) return false;
+        
+        char buffer[256];
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            std::string state(buffer);
+            // Remove trailing newline
+            if (!state.empty() && state.back() == '\n') {
+                state.pop_back();
+            }
+            pclose(pipe);
+            // Check if state contains "connected" (could be "connected", "connected (externally)", etc.)
+            return (state.find("connected") != std::string::npos);
+        }
+        pclose(pipe);
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ is_wifi_connected exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ is_wifi_connected unknown exception" << std::endl;
+        return false;
+    }
+}
+
 // ============================================================================
 // WebSocket Client (WSS) Implementation
 // ============================================================================
@@ -664,31 +694,53 @@ bool NetworkManager::is_wifi_stable() const {
 
 void NetworkManager::wifi_monitor_loop() {
     int consecutive_failures = 0;
-    const int max_failures = 3;
+    const int max_failures = 2;  // Reduced from 3 to 2 for faster detection
     
     while (wifi_monitor_running_) {
         try {
-            // Check WiFi every 10 seconds
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            // Check WiFi every 5 seconds (reduced from 10 for faster detection)
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             
-            if (!is_connected_to_internet()) {
+            // Check both WiFi link status and internet connectivity
+            bool wifi_link_ok = is_wifi_connected();
+            bool internet_ok = is_connected_to_internet();
+            
+            if (!wifi_link_ok || !internet_ok) {
                 consecutive_failures++;
-                std::cerr << "⚠️  WiFi check failed (" << consecutive_failures << "/" << max_failures << ")" << std::endl;
+                std::cerr << "⚠️  WiFi check failed (link=" << (wifi_link_ok ? "OK" : "FAIL") 
+                          << ", internet=" << (internet_ok ? "OK" : "FAIL") 
+                          << ") (" << consecutive_failures << "/" << max_failures << ")" << std::endl;
                 
                 if (consecutive_failures >= max_failures) {
                     std::cerr << "🔄 WiFi lost! Attempting reconnection..." << std::endl;
                     
                     // Try to reconnect using stored credentials
                     if (!last_ssid_.empty()) {
-                        std::string cmd = "nmcli device wifi connect '" + last_ssid_ + "' password '" + last_password_ + "'";
-                        if (std::system(cmd.c_str()) == 0) {
+                        // CRITICAL: Force WiFi rescan before attempting connection
+                        // This ensures we see the hotspot even if NetworkManager's cache is stale
+                        std::cerr << "📡 Forcing WiFi rescan..." << std::endl;
+                        std::string rescan_cmd = "nmcli device wifi rescan 2>&1";
+                        std::system(rescan_cmd.c_str());
+                        
+                        // Wait a moment for scan to complete
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                        
+                        // Now attempt connection
+                        std::string cmd = "nmcli device wifi connect '" + last_ssid_ + "' password '" + last_password_ + "' 2>&1";
+                        int result = std::system(cmd.c_str());
+                        
+                        if (result == 0) {
                             std::cout << "✅ WiFi reconnected successfully!" << std::endl;
                             consecutive_failures = 0;
+                            // Give it a moment to establish connection
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
                         } else {
                             std::cerr << "❌ WiFi reconnection failed, will retry..." << std::endl;
-                            // Wait longer before next attempt
-                            std::this_thread::sleep_for(std::chrono::seconds(5));
+                            // Wait before next attempt (shorter wait since we check more frequently)
+                            std::this_thread::sleep_for(std::chrono::seconds(3));
                         }
+                    } else {
+                        std::cerr << "⚠️  No stored WiFi credentials for reconnection" << std::endl;
                     }
                 }
             } else {
