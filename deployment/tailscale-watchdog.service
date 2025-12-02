@@ -1,0 +1,12 @@
+[Unit]
+Description=Tailscale Watchdog - Auto-restart if down
+After=tailscaled.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30s
+ExecStart=/usr/local/bin/tailscale-watchdog.sh
+
+[Install]
+WantedBy=multi-user.target

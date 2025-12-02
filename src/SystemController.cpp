@@ -52,46 +52,60 @@ std::string SystemController::load_qr_shared_key() {
 }
 
 bool SystemController::initialize() {
-    if (!load_device_config()) {
-        std::cerr << "⚠ Device not registered. Run deploy-complete-system.sh first!" << std::endl;
-        return false;
-    }
-    
-    if (serial_comm_) {
-        if (!serial_comm_->connect()) {
-            std::cerr << "⚠ Serial connection failed" << std::endl;
+    try {
+        if (!load_device_config()) {
+            std::cerr << "⚠ Device not registered. Run deploy-complete-system.sh first!" << std::endl;
+            return false;
         }
-        serial_comm_->start_async();
-    } else {
-        std::cerr << "⚠ Serial communicator not initialized" << std::endl;
-    }
-    
-    face_detector_ = create_face_detector();
-    if (!face_detector_) return false;
-
-    if (network_mgr_) {
-        network_mgr_->set_message_callback([this](const std::string& msg) {
-            this->on_websocket_message(msg);
-        });
         
-        network_mgr_->set_connect_callback([this]() {
-            std::lock_guard<std::mutex> lock(ws_auth_mutex_);
-            if (!pending_ws_token_.empty() && network_mgr_) {
-                nlohmann::json auth_msg = {
-                    {"type", "auth"},
-                    {"bearer_token", pending_ws_token_},
-                    {"device_id", device_id_}
-                };
-                network_mgr_->send_message(auth_msg.dump());
+        if (serial_comm_) {
+            if (!serial_comm_->connect()) {
+                std::cerr << "⚠ Serial connection failed" << std::endl;
             }
-        });
-    } else {
-        std::cerr << "⚠ Network manager not initialized" << std::endl;
+            serial_comm_->start_async();
+        } else {
+            std::cerr << "⚠ Serial communicator not initialized" << std::endl;
+        }
+        
+        face_detector_ = create_face_detector();
+        if (!face_detector_) return false;
+
+        if (network_mgr_) {
+            network_mgr_->set_message_callback([this](const std::string& msg) {
+                this->on_websocket_message(msg);
+            });
+            
+            network_mgr_->set_connect_callback([this]() {
+                try {
+                    std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+                    if (!pending_ws_token_.empty() && network_mgr_) {
+                        nlohmann::json auth_msg = {
+                            {"type", "auth"},
+                            {"bearer_token", pending_ws_token_},
+                            {"device_id", device_id_}
+                        };
+                        network_mgr_->send_message(auth_msg.dump());
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "❌ connect_callback exception: " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "❌ connect_callback unknown exception" << std::endl;
+                }
+            });
+        } else {
+            std::cerr << "⚠ Network manager not initialized" << std::endl;
+            return false;
+        }
+        
+        set_state(SystemState::BOOT);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ initialize exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ initialize unknown exception" << std::endl;
         return false;
     }
-    
-    set_state(SystemState::BOOT);
-    return true;
 }
 
 void SystemController::run() {
@@ -311,83 +325,95 @@ void SystemController::request_restart(const std::string& reason) {
 }
 
 void SystemController::stop() {
-    std::cout << "🛑 SystemController::stop() called" << std::endl;
-    
-    // Set running flag first to stop main loop
-    running_ = false;
-    
-    // Notify ESP32 display of shutdown (state 16 = shutdown screen)
-    // Do this BEFORE stopping serial to ensure the message gets through
-    if (serial_comm_) {
-        std::cout << "   📺 Sending shutdown state to display..." << std::endl;
-        serial_comm_->send_state_with_text(16, "Shutting down...");
-        // Give serial a moment to send the message
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    try {
+        std::cout << "🛑 SystemController::stop() called" << std::endl;
+        
+        // Set running flag first to stop main loop
+        running_ = false;
+        
+        // Notify ESP32 display of shutdown (state 16 = shutdown screen)
+        // Do this BEFORE stopping serial to ensure the message gets through
+        if (serial_comm_) {
+            std::cout << "   📺 Sending shutdown state to display..." << std::endl;
+            serial_comm_->send_state_with_text(16, "Shutting down...");
+            // Give serial a moment to send the message
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+        // Stop producer first to release camera resources
+        if (producer_) {
+            std::cout << "   📹 Stopping camera..." << std::endl;
+            producer_->stop();
+        }
+        
+        // Disconnect network
+        if (network_mgr_) {
+            std::cout << "   🌐 Disconnecting network..." << std::endl;
+            network_mgr_->disconnect();
+        }
+        
+        // Stop serial async thread last
+        if (serial_comm_) {
+            std::cout << "   📟 Stopping serial communication..." << std::endl;
+            serial_comm_->stop_async();
+        }
+        
+        // Brief delay to allow threads to clean up
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        
+        std::cout << "   ✅ SystemController stopped" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ SystemController::stop exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ SystemController::stop unknown exception" << std::endl;
     }
-    
-    // Stop producer first to release camera resources
-    if (producer_) {
-        std::cout << "   📹 Stopping camera..." << std::endl;
-        producer_->stop();
-    }
-    
-    // Disconnect network
-    if (network_mgr_) {
-        std::cout << "   🌐 Disconnecting network..." << std::endl;
-        network_mgr_->disconnect();
-    }
-    
-    // Stop serial async thread last
-    if (serial_comm_) {
-        std::cout << "   📟 Stopping serial communication..." << std::endl;
-        serial_comm_->stop_async();
-    }
-    
-    // Brief delay to allow threads to clean up
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    
-    std::cout << "   ✅ SystemController stopped" << std::endl;
 }
 
 void SystemController::clear_session() {
-    // Clear all session data - call this when returning to IDLE
-    bool had_session = !session_id_.empty();
-    bool was_connected = network_mgr_ && network_mgr_->is_connected();
-    
-    if (had_session || was_connected) {
-        std::cout << "🧹 Clearing session data..." << std::endl;
-    }
-    
-    // Clear session identifiers
-    session_id_.clear();
-    {
-        std::lock_guard<std::mutex> lock(ws_auth_mutex_);
-        pending_ws_token_.clear();
-    }
-    
-    // Stop recording but DON'T clear the ring buffer here
-    // The ring buffer is still being accessed by frame processing threads
-    // Just disable recording - frames will naturally be overwritten
-    if (ring_buffer_) {
-        ring_buffer_->set_recording_active(false);
-        // NOTE: Don't call ring_buffer_->clear() - causes crash due to race condition
-        // with frame processing. Buffer will be reused naturally.
-    }
-    
-    // Reset motion tracker
-    motion_tracker_.reset();
-    
-    // Just signal to stop - don't call disconnect() here
-    // The WebSocket thread handles its own cleanup when the connection closes
-    if (network_mgr_) {
-        network_mgr_->stop_reconnect();
-    }
-    
-    // Reset result ACK flag
-    result_ack_received_ = false;
-    
-    if (had_session || was_connected) {
-        std::cout << "   ✓ Session cleared" << std::endl;
+    try {
+        // Clear all session data - call this when returning to IDLE
+        bool had_session = !session_id_.empty();
+        bool was_connected = network_mgr_ && network_mgr_->is_connected();
+        
+        if (had_session || was_connected) {
+            std::cout << "🧹 Clearing session data..." << std::endl;
+        }
+        
+        // Clear session identifiers
+        session_id_.clear();
+        {
+            std::lock_guard<std::mutex> lock(ws_auth_mutex_);
+            pending_ws_token_.clear();
+        }
+        
+        // Stop recording but DON'T clear the ring buffer here
+        // The ring buffer is still being accessed by frame processing threads
+        // Just disable recording - frames will naturally be overwritten
+        if (ring_buffer_) {
+            ring_buffer_->set_recording_active(false);
+            // NOTE: Don't call ring_buffer_->clear() - causes crash due to race condition
+            // with frame processing. Buffer will be reused naturally.
+        }
+        
+        // Reset motion tracker
+        motion_tracker_.reset();
+        
+        // Just signal to stop - don't call disconnect() here
+        // The WebSocket thread handles its own cleanup when the connection closes
+        if (network_mgr_) {
+            network_mgr_->stop_reconnect();
+        }
+        
+        // Reset result ACK flag
+        result_ack_received_ = false;
+        
+        if (had_session || was_connected) {
+            std::cout << "   ✓ Session cleared" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ clear_session exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ clear_session unknown exception" << std::endl;
     }
 }
 
@@ -632,65 +658,83 @@ void SystemController::set_state(SystemState new_state) {
 }
 
 void SystemController::initialize_camera() {
-    CameraConfig config;
-    // Standard resolution for IR camera with higher FPS
-    config.ir_width = 848;
-    config.ir_height = 480;
-    config.ir_fps = 30;  // Higher FPS at this resolution
-    config.auto_exposure = true;
-    
-    producer_ = std::make_unique<Producer>(config, ring_buffer_.get());
-    
-    producer_->set_error_callback([this](const std::string& error) {
-        camera_error_detected_.store(true);
-        camera_error_message_ = error;
-    });
-    
-    producer_->set_status_callback([this](const std::string& status) {
-        std::cout << "📹 Camera: " << status << std::endl;
-    });
-    
-    producer_->start();
+    try {
+        CameraConfig config;
+        // Standard resolution for IR camera with higher FPS
+        config.ir_width = 848;
+        config.ir_height = 480;
+        config.ir_fps = 30;  // Higher FPS at this resolution
+        config.auto_exposure = true;
+        
+        producer_ = std::make_unique<Producer>(config, ring_buffer_.get());
+        
+        producer_->set_error_callback([this](const std::string& error) {
+            camera_error_detected_.store(true);
+            camera_error_message_ = error;
+        });
+        
+        producer_->set_status_callback([this](const std::string& status) {
+            std::cout << "📹 Camera: " << status << std::endl;
+        });
+        
+        producer_->start();
+    } catch (const std::exception& e) {
+        std::cerr << "❌ initialize_camera exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ initialize_camera unknown exception" << std::endl;
+    }
 }
 
 void SystemController::process_frame(FrameBox* frame) {
-    SystemState state = current_state_.load();
-    
-    // Frame counter for IDLE state (no logging - too verbose)
-    
-    switch (state) {
-        case SystemState::AWAIT_ADMIN_QR: handle_await_admin_qr(frame); break;
-        case SystemState::IDLE: handle_idle(frame); break;
-        case SystemState::READY: break;  // Don't scan QR in READY - waiting for start command
-        case SystemState::WARMUP: handle_warmup(frame); break;
-        case SystemState::ALIGN: handle_align(frame); break;
-        default: break;
+    try {
+        SystemState state = current_state_.load();
+        
+        // Frame counter for IDLE state (no logging - too verbose)
+        
+        switch (state) {
+            case SystemState::AWAIT_ADMIN_QR: handle_await_admin_qr(frame); break;
+            case SystemState::IDLE: handle_idle(frame); break;
+            case SystemState::READY: break;  // Don't scan QR in READY - waiting for start command
+            case SystemState::WARMUP: handle_warmup(frame); break;
+            case SystemState::ALIGN: handle_align(frame); break;
+            default: break;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ process_frame exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ process_frame unknown exception" << std::endl;
     }
 }
 
 void SystemController::handle_await_admin_qr(FrameBox* frame) {
 #ifdef HAVE_OPENCV
-    if (!frame) return;
-    
-    static int frame_skip = 0;
-    if (frame_skip++ % 5 != 0) return;
-    
-    // Get raw IR grayscale directly for better QR detection
-    cv::Mat gray = frame->get_ir_mat();
-    if (gray.empty()) return;
-    
-    // Apply CLAHE for better contrast (critical for IR-based QR scanning)
-    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
-    cv::Mat enhanced;
-    clahe->apply(gray, enhanced);
-    
-    cv::QRCodeDetector qr_decoder;
-    std::string decoded_info = qr_decoder.detectAndDecode(enhanced);
-    
-    if (!decoded_info.empty()) {
-        if (handle_wifi_qr(decoded_info)) {
-            std::cout << "✅ WiFi Provisioning Complete" << std::endl;
+    try {
+        if (!frame) return;
+        
+        static int frame_skip = 0;
+        if (frame_skip++ % 5 != 0) return;
+        
+        // Get raw IR grayscale directly for better QR detection
+        cv::Mat gray = frame->get_ir_mat();
+        if (gray.empty()) return;
+        
+        // Apply CLAHE for better contrast (critical for IR-based QR scanning)
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+        cv::Mat enhanced;
+        clahe->apply(gray, enhanced);
+        
+        cv::QRCodeDetector qr_decoder;
+        std::string decoded_info = qr_decoder.detectAndDecode(enhanced);
+        
+        if (!decoded_info.empty()) {
+            if (handle_wifi_qr(decoded_info)) {
+                std::cout << "✅ WiFi Provisioning Complete" << std::endl;
+            }
         }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ handle_await_admin_qr exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ handle_await_admin_qr unknown exception" << std::endl;
     }
 #endif
 }
@@ -991,224 +1035,270 @@ void SystemController::handle_idle(FrameBox* frame) {
 }
 
 void SystemController::handle_warmup(FrameBox* /* frame */) {
-    static int warmup_frames = 0;
-    if (warmup_frames++ > 60) {
-        if (warmup_frames == 62 && network_mgr_) {
-            network_mgr_->send_message("{\"type\":\"status\", \"payload\":\"warmed_up\"}");
+    try {
+        static int warmup_frames = 0;
+        if (warmup_frames++ > 60) {
+            if (warmup_frames == 62 && network_mgr_) {
+                network_mgr_->send_message("{\"type\":\"status\", \"payload\":\"warmed_up\"}");
+            }
         }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ handle_warmup exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ handle_warmup unknown exception" << std::endl;
     }
 }
 
 void SystemController::handle_align(FrameBox* frame) {
-    if (!frame) {
-        motion_tracker_.no_face_counter++;
-        if (motion_tracker_.no_face_counter > 150) {
-            if (serial_comm_) serial_comm_->queue_error("Camera disconnected");
-            set_state(SystemState::ERROR);
+    try {
+        if (!frame) {
+            motion_tracker_.no_face_counter++;
+            if (motion_tracker_.no_face_counter > 150) {
+                if (serial_comm_) serial_comm_->queue_error("Camera disconnected");
+                set_state(SystemState::ERROR);
+            }
+            return;
         }
-        return;
-    }
-    
-    static int startup_frames = 0;
-    static const int STARTUP_GRACE_PERIOD = 450;
-    static const int FACE_TIMEOUT_FRAMES = 150;
-    
-    startup_frames++;
-    bool in_grace_period = (startup_frames < STARTUP_GRACE_PERIOD);
-    
-    if (!face_detector_ || !face_detector_->detect(frame)) {
-        motion_tracker_.no_face_counter++;
-        motion_tracker_.validation_state = FaceValidationState::NO_FACE;
         
-        if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
-            static_cast<int>(motion_tracker_.progress * 100), false);
+        static int startup_frames = 0;
+        static const int STARTUP_GRACE_PERIOD = 450;
+        static const int FACE_TIMEOUT_FRAMES = 150;
         
-        if (!in_grace_period && motion_tracker_.no_face_counter > FACE_TIMEOUT_FRAMES) {
-            handle_face_timeout();
-            startup_frames = 0;
-        }
-        return;
-    }
-    
-    auto& landmarks = frame->metadata.landmarks;
-    if (landmarks.size() < 468) {
-        motion_tracker_.no_face_counter++;
-        motion_tracker_.validation_state = FaceValidationState::NO_FACE;
-        if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
-            static_cast<int>(motion_tracker_.progress * 100), false);
-        return;
-    }
-    
-    // Relaxed validation - just check if face is detected, no extreme yaw check
-    bool is_valid = frame->metadata.face_detected && landmarks.size() >= 468;
-    
-    if (frame->metadata.face_detected) {
-        motion_tracker_.no_face_counter = 0;
-    } else {
-        motion_tracker_.no_face_counter++;
-    }
-    
-    float nose_x_rot = landmarks[4].x;
-    float nose_y_rot = landmarks[4].y;
-    
-    float nose_x_norm = nose_x_rot / frame->metadata.frame_width;
-    float nose_y_norm = nose_y_rot / frame->metadata.frame_height;
-    
-    // Camera is rotated 90° - swap X and Y axes
-    // Camera Y → Screen X, Camera X → Screen Y
-    float raw_x = nose_y_norm * 465.0f;
-    float raw_y = nose_x_norm * 465.0f;
-    // No mirroring needed
-    
-    constexpr float BASE_SMOOTHING = 0.15f;
-    constexpr float DEAD_ZONE = 3.0f;
-    constexpr float VELOCITY_THRESHOLD = 20.0f;
-    
-    if (!motion_tracker_.smoothing_initialized) {
-        motion_tracker_.smoothed_x = raw_x;
-        motion_tracker_.smoothed_y = raw_y;
-        motion_tracker_.smoothing_initialized = true;
-    } else {
-        float dx = raw_x - motion_tracker_.smoothed_x;
-        float dy = raw_y - motion_tracker_.smoothed_y;
-        float distance = std::sqrt(dx * dx + dy * dy);
+        startup_frames++;
+        bool in_grace_period = (startup_frames < STARTUP_GRACE_PERIOD);
         
-        if (distance > DEAD_ZONE) {
-            float velocity_factor = std::min(distance / VELOCITY_THRESHOLD, 1.0f);
-            float adaptive_smoothing = BASE_SMOOTHING * (1.0f - velocity_factor * 0.8f);
+        if (!face_detector_ || !face_detector_->detect(frame)) {
+            motion_tracker_.no_face_counter++;
+            motion_tracker_.validation_state = FaceValidationState::NO_FACE;
             
-            motion_tracker_.smoothed_x = adaptive_smoothing * motion_tracker_.smoothed_x 
-                                       + (1.0f - adaptive_smoothing) * raw_x;
-            motion_tracker_.smoothed_y = adaptive_smoothing * motion_tracker_.smoothed_y 
-                                       + (1.0f - adaptive_smoothing) * raw_y;
+            if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
+                static_cast<int>(motion_tracker_.progress * 100), false);
+            
+            if (!in_grace_period && motion_tracker_.no_face_counter > FACE_TIMEOUT_FRAMES) {
+                handle_face_timeout();
+                startup_frames = 0;
+            }
+            return;
         }
-    }
-    
-    int screen_x = std::max(0, std::min(465, static_cast<int>(motion_tracker_.smoothed_x)));
-    int screen_y = std::max(0, std::min(465, static_cast<int>(motion_tracker_.smoothed_y)));
-    
-    float progress = motion_tracker_.progress;
-    if (is_valid) {
-        progress = calculate_circular_motion_progress(cv::Point2f(nose_x_norm, nose_y_norm));
-    }
-    
-    if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 
-        static_cast<int>(progress * 100), is_valid);
-    
-    // Progress messages to mobile removed - not needed
-    
-    if (progress >= 1.0f) {
-        if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 100, true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        set_state(SystemState::PROCESSING);
-        return;
+        
+        auto& landmarks = frame->metadata.landmarks;
+        if (landmarks.size() < 468) {
+            motion_tracker_.no_face_counter++;
+            motion_tracker_.validation_state = FaceValidationState::NO_FACE;
+            if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
+                static_cast<int>(motion_tracker_.progress * 100), false);
+            return;
+        }
+        
+        // Relaxed validation - just check if face is detected, no extreme yaw check
+        bool is_valid = frame->metadata.face_detected && landmarks.size() >= 468;
+        
+        if (frame->metadata.face_detected) {
+            motion_tracker_.no_face_counter = 0;
+        } else {
+            motion_tracker_.no_face_counter++;
+        }
+        
+        float nose_x_rot = landmarks[4].x;
+        float nose_y_rot = landmarks[4].y;
+        
+        float nose_x_norm = nose_x_rot / frame->metadata.frame_width;
+        float nose_y_norm = nose_y_rot / frame->metadata.frame_height;
+        
+        // Camera is rotated 90° - swap X and Y axes
+        // Camera Y → Screen X, Camera X → Screen Y
+        float raw_x = nose_y_norm * 465.0f;
+        float raw_y = nose_x_norm * 465.0f;
+        // No mirroring needed
+        
+        constexpr float BASE_SMOOTHING = 0.15f;
+        constexpr float DEAD_ZONE = 3.0f;
+        constexpr float VELOCITY_THRESHOLD = 20.0f;
+        
+        if (!motion_tracker_.smoothing_initialized) {
+            motion_tracker_.smoothed_x = raw_x;
+            motion_tracker_.smoothed_y = raw_y;
+            motion_tracker_.smoothing_initialized = true;
+        } else {
+            float dx = raw_x - motion_tracker_.smoothed_x;
+            float dy = raw_y - motion_tracker_.smoothed_y;
+            float distance = std::sqrt(dx * dx + dy * dy);
+            
+            if (distance > DEAD_ZONE) {
+                float velocity_factor = std::min(distance / VELOCITY_THRESHOLD, 1.0f);
+                float adaptive_smoothing = BASE_SMOOTHING * (1.0f - velocity_factor * 0.8f);
+                
+                motion_tracker_.smoothed_x = adaptive_smoothing * motion_tracker_.smoothed_x 
+                                           + (1.0f - adaptive_smoothing) * raw_x;
+                motion_tracker_.smoothed_y = adaptive_smoothing * motion_tracker_.smoothed_y 
+                                           + (1.0f - adaptive_smoothing) * raw_y;
+            }
+        }
+        
+        int screen_x = std::max(0, std::min(465, static_cast<int>(motion_tracker_.smoothed_x)));
+        int screen_y = std::max(0, std::min(465, static_cast<int>(motion_tracker_.smoothed_y)));
+        
+        float progress = motion_tracker_.progress;
+        if (is_valid) {
+            progress = calculate_circular_motion_progress(cv::Point2f(nose_x_norm, nose_y_norm));
+        }
+        
+        if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 
+            static_cast<int>(progress * 100), is_valid);
+        
+        // Progress messages to mobile removed - not needed
+        
+        if (progress >= 1.0f) {
+            if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 100, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            set_state(SystemState::PROCESSING);
+            return;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ handle_align exception: " << e.what() << std::endl;
+        set_state(SystemState::ERROR);
+    } catch (...) {
+        std::cerr << "❌ handle_align unknown exception" << std::endl;
+        set_state(SystemState::ERROR);
     }
 }
 
 void SystemController::handle_face_timeout() {
-    nlohmann::json error_msg = {
-        {"type", "error"},
-        {"code", "timeout_no_face"},
-        {"message", "No face detected"}
-    };
-    if (network_mgr_) network_mgr_->send_message(error_msg.dump());
-    
-    if (ring_buffer_) ring_buffer_->set_recording_active(false);
-    // NOTE: Don't clear ring_buffer - causes race condition
-    
-    if (serial_comm_) serial_comm_->queue_error("Face not detected");
-    set_state(SystemState::ERROR);
+    try {
+        nlohmann::json error_msg = {
+            {"type", "error"},
+            {"code", "timeout_no_face"},
+            {"message", "No face detected"}
+        };
+        if (network_mgr_) network_mgr_->send_message(error_msg.dump());
+        
+        if (ring_buffer_) ring_buffer_->set_recording_active(false);
+        // NOTE: Don't clear ring_buffer - causes race condition
+        
+        if (serial_comm_) serial_comm_->queue_error("Face not detected");
+        set_state(SystemState::ERROR);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ handle_face_timeout exception: " << e.what() << std::endl;
+        set_state(SystemState::ERROR);
+    } catch (...) {
+        std::cerr << "❌ handle_face_timeout unknown exception" << std::endl;
+        set_state(SystemState::ERROR);
+    }
 }
 
 SystemController::FaceValidationState SystemController::validate_face_position(FrameBox* frame) {
-    if (!frame || !frame->metadata.face_detected) {
+    try {
+        if (!frame || !frame->metadata.face_detected) {
+            return FaceValidationState::NO_FACE;
+        }
+        
+        if (frame->metadata.landmarks.size() < 468) {
+            return FaceValidationState::NO_FACE;
+        }
+        
+        // Check orientation only (no depth-based distance in IR-only mode)
+        if (is_face_orientation_extreme(frame->metadata.landmarks)) {
+            return FaceValidationState::EXTREME_ROTATION;
+        }
+        
+        return FaceValidationState::VALID;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ validate_face_position exception: " << e.what() << std::endl;
+        return FaceValidationState::NO_FACE;
+    } catch (...) {
+        std::cerr << "❌ validate_face_position unknown exception" << std::endl;
         return FaceValidationState::NO_FACE;
     }
-    
-    if (frame->metadata.landmarks.size() < 468) {
-        return FaceValidationState::NO_FACE;
-    }
-    
-    // Check orientation only (no depth-based distance in IR-only mode)
-    if (is_face_orientation_extreme(frame->metadata.landmarks)) {
-        return FaceValidationState::EXTREME_ROTATION;
-    }
-    
-    return FaceValidationState::VALID;
 }
 
 bool SystemController::is_face_orientation_extreme(const std::vector<FrameBoxMetadata::Landmark>& landmarks) {
-    if (landmarks.size() < 264) return true;
-    
-    const auto& nose = landmarks[4];
-    const auto& left_eye = landmarks[33];
-    const auto& right_eye = landmarks[263];
-    
-    float eye_mid_y = (left_eye.y + right_eye.y) / 2.0f;
-    float eye_width = std::abs(right_eye.y - left_eye.y);
-    
-    if (eye_width < 20.0f) return true;
-    
-    float nose_offset = std::abs(nose.y - eye_mid_y) / eye_width;
-    return nose_offset > EXTREME_YAW_THRESHOLD;
+    try {
+        if (landmarks.size() < 264) return true;
+        
+        const auto& nose = landmarks[4];
+        const auto& left_eye = landmarks[33];
+        const auto& right_eye = landmarks[263];
+        
+        float eye_mid_y = (left_eye.y + right_eye.y) / 2.0f;
+        float eye_width = std::abs(right_eye.y - left_eye.y);
+        
+        if (eye_width < 20.0f) return true;
+        
+        float nose_offset = std::abs(nose.y - eye_mid_y) / eye_width;
+        return nose_offset > EXTREME_YAW_THRESHOLD;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ is_face_orientation_extreme exception: " << e.what() << std::endl;
+        return true;  // Conservative - reject if exception
+    } catch (...) {
+        std::cerr << "❌ is_face_orientation_extreme unknown exception" << std::endl;
+        return true;
+    }
 }
 
 float SystemController::calculate_circular_motion_progress(const cv::Point2f& nose) {
-    motion_tracker_.smoothed_nose_x = 
-        NOSE_SMOOTHING_FACTOR * motion_tracker_.smoothed_nose_x + 
-        (1.0f - NOSE_SMOOTHING_FACTOR) * nose.x;
-    motion_tracker_.smoothed_nose_y = 
-        NOSE_SMOOTHING_FACTOR * motion_tracker_.smoothed_nose_y + 
-        (1.0f - NOSE_SMOOTHING_FACTOR) * nose.y;
-    
-    float smooth_x = motion_tracker_.smoothed_nose_x;
-    float smooth_y = motion_tracker_.smoothed_nose_y;
-    
-    float dx = smooth_x - SPIRAL_CENTER_X;
-    float dy = smooth_y - SPIRAL_CENTER_Y;
-    float current_angle = std::atan2(dy, dx);
-    
-    float ideal_x = SPIRAL_CENTER_X + SPIRAL_RADIUS * std::cos(current_angle);
-    float ideal_y = SPIRAL_CENTER_Y + SPIRAL_RADIUS * std::sin(current_angle);
-    
-    float display_norm_x = (1.0f - MAGNETIC_STRENGTH) * smooth_x + MAGNETIC_STRENGTH * ideal_x;
-    float display_norm_y = (1.0f - MAGNETIC_STRENGTH) * smooth_y + MAGNETIC_STRENGTH * ideal_y;
-    
-    motion_tracker_.display_x = display_norm_x * 465.0f;
-    motion_tracker_.display_y = display_norm_y * 465.0f;
-    motion_tracker_.smoothed_x = motion_tracker_.display_x;
-    motion_tracker_.smoothed_y = motion_tracker_.display_y;
-    
-    motion_tracker_.nose_positions.push_back(nose);
-    if (motion_tracker_.nose_positions.size() > 60) {
-        motion_tracker_.nose_positions.erase(motion_tracker_.nose_positions.begin());
-    }
-    
-    if (!motion_tracker_.angle_initialized) {
-        motion_tracker_.last_angle = current_angle;
-        motion_tracker_.angle_initialized = true;
+    try {
+        motion_tracker_.smoothed_nose_x = 
+            NOSE_SMOOTHING_FACTOR * motion_tracker_.smoothed_nose_x + 
+            (1.0f - NOSE_SMOOTHING_FACTOR) * nose.x;
+        motion_tracker_.smoothed_nose_y = 
+            NOSE_SMOOTHING_FACTOR * motion_tracker_.smoothed_nose_y + 
+            (1.0f - NOSE_SMOOTHING_FACTOR) * nose.y;
+        
+        float smooth_x = motion_tracker_.smoothed_nose_x;
+        float smooth_y = motion_tracker_.smoothed_nose_y;
+        
+        float dx = smooth_x - SPIRAL_CENTER_X;
+        float dy = smooth_y - SPIRAL_CENTER_Y;
+        float current_angle = std::atan2(dy, dx);
+        
+        float ideal_x = SPIRAL_CENTER_X + SPIRAL_RADIUS * std::cos(current_angle);
+        float ideal_y = SPIRAL_CENTER_Y + SPIRAL_RADIUS * std::sin(current_angle);
+        
+        float display_norm_x = (1.0f - MAGNETIC_STRENGTH) * smooth_x + MAGNETIC_STRENGTH * ideal_x;
+        float display_norm_y = (1.0f - MAGNETIC_STRENGTH) * smooth_y + MAGNETIC_STRENGTH * ideal_y;
+        
+        motion_tracker_.display_x = display_norm_x * 465.0f;
+        motion_tracker_.display_y = display_norm_y * 465.0f;
+        motion_tracker_.smoothed_x = motion_tracker_.display_x;
+        motion_tracker_.smoothed_y = motion_tracker_.display_y;
+        
+        motion_tracker_.nose_positions.push_back(nose);
+        if (motion_tracker_.nose_positions.size() > 60) {
+            motion_tracker_.nose_positions.erase(motion_tracker_.nose_positions.begin());
+        }
+        
+        if (!motion_tracker_.angle_initialized) {
+            motion_tracker_.last_angle = current_angle;
+            motion_tracker_.angle_initialized = true;
+            return motion_tracker_.progress;
+        }
+        
+        float delta = current_angle - motion_tracker_.last_angle;
+        while (delta > 3.14159f) delta -= 2.0f * 3.14159f;
+        while (delta < -3.14159f) delta += 2.0f * 3.14159f;
+        
+        float velocity = std::abs(delta);
+        if (velocity > MOTION_PAUSE_THRESHOLD && velocity < 0.8f) {
+            float boosted_delta = velocity * PROGRESS_BOOST;
+            motion_tracker_.total_rotation += boosted_delta;
+            motion_tracker_.last_angle = current_angle;
+        }
+        
+        float new_progress = motion_tracker_.total_rotation / SPIRAL_COMPLETE_ANGLE;
+        if (new_progress > 1.0f) new_progress = 1.0f;
+        
+        if (new_progress > motion_tracker_.progress) {
+            motion_tracker_.progress = new_progress;
+        }
+        
+        return motion_tracker_.progress;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ calculate_circular_motion_progress exception: " << e.what() << std::endl;
+        return motion_tracker_.progress;
+    } catch (...) {
+        std::cerr << "❌ calculate_circular_motion_progress unknown exception" << std::endl;
         return motion_tracker_.progress;
     }
-    
-    float delta = current_angle - motion_tracker_.last_angle;
-    while (delta > 3.14159f) delta -= 2.0f * 3.14159f;
-    while (delta < -3.14159f) delta += 2.0f * 3.14159f;
-    
-    float velocity = std::abs(delta);
-    if (velocity > MOTION_PAUSE_THRESHOLD && velocity < 0.8f) {
-        float boosted_delta = velocity * PROGRESS_BOOST;
-        motion_tracker_.total_rotation += boosted_delta;
-        motion_tracker_.last_angle = current_angle;
-    }
-    
-    float new_progress = motion_tracker_.total_rotation / SPIRAL_COMPLETE_ANGLE;
-    if (new_progress > 1.0f) new_progress = 1.0f;
-    
-    if (new_progress > motion_tracker_.progress) {
-        motion_tracker_.progress = new_progress;
-    }
-    
-    return motion_tracker_.progress;
 }
 
 void SystemController::handle_processing() {
@@ -1381,13 +1471,13 @@ void SystemController::handle_processing() {
 }
 
 void SystemController::on_websocket_message(const std::string& message) {
-    if (message.empty()) {
-        if (serial_comm_) serial_comm_->queue_error("Connection lost");
-        set_state(SystemState::ERROR);
-        return;
-    }
-    
     try {
+        if (message.empty()) {
+            if (serial_comm_) serial_comm_->queue_error("Connection lost");
+            set_state(SystemState::ERROR);
+            return;
+        }
+        
         nlohmann::json msg_json = nlohmann::json::parse(message);
         std::string msg_type = msg_json.value("type", "");
         
@@ -1513,45 +1603,61 @@ void SystemController::on_websocket_message(const std::string& message) {
             // Server acknowledgments - ignore silently
         }
         
-    } catch (...) {}
+    } catch (const std::exception& e) {
+        std::cerr << "❌ on_websocket_message exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ on_websocket_message unknown exception" << std::endl;
+    }
 }
 
 bool SystemController::load_device_config() {
-    if (!TrustZoneIdentity::initialize()) {
-        return false;
-    }
-    
-    device_id_ = TrustZoneIdentity::get_device_id();
-    hardware_id_ = TrustZoneIdentity::get_hardware_serial();
-    
-    std::cout << "✅ Device ID: " << device_id_ << std::endl;
-    
-    std::string config_path = "/etc/mdai/device_config.json";
-    std::ifstream config_file(config_path);
-    
-    if (!config_file.is_open()) {
-        nlohmann::json config;
-        config["device_id"] = device_id_;
-        config["hardware_id"] = hardware_id_;
-        
-        std::ofstream out_file(config_path);
-        out_file << config.dump(2);
-        out_file.close();
-        return true;
-    }
-    
     try {
+        if (!TrustZoneIdentity::initialize()) {
+            return false;
+        }
+        
+        device_id_ = TrustZoneIdentity::get_device_id();
+        hardware_id_ = TrustZoneIdentity::get_hardware_serial();
+        
+        std::cout << "✅ Device ID: " << device_id_ << std::endl;
+        
+        std::string config_path = "/etc/mdai/device_config.json";
+        std::ifstream config_file(config_path);
+        
+        if (!config_file.is_open()) {
+            nlohmann::json config;
+            config["device_id"] = device_id_;
+            config["hardware_id"] = hardware_id_;
+            
+            std::ofstream out_file(config_path);
+            out_file << config.dump(2);
+            out_file.close();
+            return true;
+        }
+        
         nlohmann::json config;
         config_file >> config;
         std::string stored_device_id = config["device_id"].get<std::string>();
         return stored_device_id == device_id_;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ load_device_config exception: " << e.what() << std::endl;
+        return false;
     } catch (...) {
+        std::cerr << "❌ load_device_config unknown exception" << std::endl;
         return false;
     }
 }
 
 bool SystemController::check_wifi_on_boot() {
-    return network_mgr_ && network_mgr_->is_connected_to_internet();
+    try {
+        return network_mgr_ && network_mgr_->is_connected_to_internet();
+    } catch (const std::exception& e) {
+        std::cerr << "❌ check_wifi_on_boot exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ check_wifi_on_boot unknown exception" << std::endl;
+        return false;
+    }
 }
 
 void SystemController::handle_boot() {
@@ -1658,84 +1764,103 @@ bool SystemController::handle_wifi_qr(const std::string& qr_data) {
             return false;
         }
         
+    } catch (const std::exception& e) {
+        std::cerr << "❌ handle_wifi_qr exception: " << e.what() << std::endl;
+        if (serial_comm_) serial_comm_->queue_state(12);
+        return false;
     } catch (...) {
+        std::cerr << "❌ handle_wifi_qr unknown exception" << std::endl;
         if (serial_comm_) serial_comm_->queue_state(12);
         return false;
     }
 }
 
 bool SystemController::check_camera_health() {
-    if (!producer_) return false;
-    return producer_->is_camera_healthy(3000);
+    try {
+        if (!producer_) return false;
+        return producer_->is_camera_healthy(3000);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ check_camera_health exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ check_camera_health unknown exception" << std::endl;
+        return false;
+    }
 }
 
 void SystemController::handle_hardware_error(const std::string& component, const std::string& error_msg) {
-    std::cerr << "❌ Hardware FAILURE [" << component << "]: " << error_msg << std::endl;
-    
-    // Track failure count and time
-    if (hardware_failure_count_ == 0) {
-        first_failure_time_ = std::chrono::steady_clock::now();
-    }
-    hardware_failure_count_++;
-    
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - first_failure_time_).count();
-    
-    // Stage 1: After MAX_RETRIES failures, restart the service
-    if (hardware_failure_count_ == MAX_HARDWARE_RETRIES) {
-        std::cerr << "🔄 Max retries reached - RESTARTING SERVICE..." << std::endl;
-        if (serial_comm_) {
-            serial_comm_->queue_error("Restarting service...");
-            serial_comm_->queue_state(12);
+    try {
+        std::cerr << "❌ Hardware FAILURE [" << component << "]: " << error_msg << std::endl;
+        
+        // Track failure count and time
+        if (hardware_failure_count_ == 0) {
+            first_failure_time_ = std::chrono::steady_clock::now();
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        hardware_failure_count_++;
         
-        // Kill this process - systemd will restart it
-        running_ = false;
-        std::exit(1);  // Exit with error code, systemd will restart
-        return;
-    }
-    
-    // Stage 2: If still failing after timeout, reboot device
-    if (elapsed > HARDWARE_FAILURE_REBOOT_TIMEOUT_SEC && hardware_failure_count_ > MAX_HARDWARE_RETRIES) {
-        std::cerr << "🔄 Hardware failure persists for " << elapsed << "s - REBOOTING DEVICE..." << std::endl;
-        if (serial_comm_) {
-            serial_comm_->queue_error("Hardware failure - rebooting");
-            serial_comm_->queue_state(12);
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - first_failure_time_).count();
         
-        // Reboot the device
-        (void)std::system("sudo reboot");
-        return;
-    }
-    
-    // Try to recover the component
-    if (component == "Camera") {
-        if (serial_comm_) serial_comm_->queue_error("Camera error - reconnecting...");
-        
-        // Stop and reset camera
-        if (producer_) {
-            try {
-                producer_->stop();
-            } catch (...) {}
-            producer_.reset();
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-        }
-        
-        // Try to reinitialize
-        try {
-            initialize_camera();
-            
-            if (producer_ && producer_->is_running()) {
-                std::cout << "✅ Camera recovered (attempt " << hardware_failure_count_ << ")" << std::endl;
-                hardware_failure_count_ = 0;  // Reset on success
-            } else {
-                std::cerr << "⚠️ Camera recovery failed (attempt " << hardware_failure_count_ << ")" << std::endl;
+        // Stage 1: After MAX_RETRIES failures, restart the service
+        if (hardware_failure_count_ == MAX_HARDWARE_RETRIES) {
+            std::cerr << "🔄 Max retries reached - RESTARTING SERVICE..." << std::endl;
+            if (serial_comm_) {
+                serial_comm_->queue_error("Restarting service...");
+                serial_comm_->queue_state(12);
             }
-        } catch (const std::exception& e) {
-            std::cerr << "❌ Camera init exception: " << e.what() << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            
+            // Kill this process - systemd will restart it
+            running_ = false;
+            std::exit(1);  // Exit with error code, systemd will restart
+            return;
         }
+        
+        // Stage 2: If still failing after timeout, reboot device
+        if (elapsed > HARDWARE_FAILURE_REBOOT_TIMEOUT_SEC && hardware_failure_count_ > MAX_HARDWARE_RETRIES) {
+            std::cerr << "🔄 Hardware failure persists for " << elapsed << "s - REBOOTING DEVICE..." << std::endl;
+            if (serial_comm_) {
+                serial_comm_->queue_error("Hardware failure - rebooting");
+                serial_comm_->queue_state(12);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            
+            // Reboot the device
+            (void)std::system("sudo reboot");
+            return;
+        }
+        
+        // Try to recover the component
+        if (component == "Camera") {
+            if (serial_comm_) serial_comm_->queue_error("Camera error - reconnecting...");
+            
+            // Stop and reset camera
+            if (producer_) {
+                try {
+                    producer_->stop();
+                } catch (...) {}
+                producer_.reset();
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+            
+            // Try to reinitialize
+            try {
+                initialize_camera();
+                
+                if (producer_ && producer_->is_running()) {
+                    std::cout << "✅ Camera recovered (attempt " << hardware_failure_count_ << ")" << std::endl;
+                    hardware_failure_count_ = 0;  // Reset on success
+                } else {
+                    std::cerr << "⚠️ Camera recovery failed (attempt " << hardware_failure_count_ << ")" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "❌ Camera init exception: " << e.what() << std::endl;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ handle_hardware_error exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ handle_hardware_error unknown exception" << std::endl;
     }
 }
 

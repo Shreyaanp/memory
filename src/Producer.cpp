@@ -134,25 +134,45 @@ bool Producer::is_camera_healthy(int timeout_ms) const {
 }
 
 int64_t Producer::get_ms_since_last_frame() const {
-    if (!first_frame_received_.load()) {
+    try {
+        if (!first_frame_received_.load()) {
+            return -1;
+        }
+        
+        std::lock_guard<std::mutex> lock(frame_time_mutex_);
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_frame_time_
+        ).count();
+    } catch (const std::exception& e) {
+        std::cerr << "❌ get_ms_since_last_frame exception: " << e.what() << std::endl;
+        return -1;
+    } catch (...) {
+        std::cerr << "❌ get_ms_since_last_frame unknown exception" << std::endl;
         return -1;
     }
-    
-    std::lock_guard<std::mutex> lock(frame_time_mutex_);
-    auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_frame_time_
-    ).count();
 }
 
 void Producer::set_error_callback(std::function<void(const std::string&)> callback) {
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    error_callback_ = callback;
+    try {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        error_callback_ = callback;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ set_error_callback exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ set_error_callback unknown exception" << std::endl;
+    }
 }
 
 void Producer::set_status_callback(std::function<void(const std::string&)> callback) {
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    status_callback_ = callback;
+    try {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        status_callback_ = callback;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ set_status_callback exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ set_status_callback unknown exception" << std::endl;
+    }
 }
 
 bool Producer::configure_pipeline() {
@@ -226,6 +246,10 @@ void Producer::configure_sensor_options() {
         
     } catch (const rs2::error& e) {
         report_error(std::string("Error configuring sensor: ") + e.what());
+    } catch (const std::exception& e) {
+        report_error(std::string("❌ configure_sensor_options exception: ") + e.what());
+    } catch (...) {
+        report_error("❌ configure_sensor_options unknown exception");
     }
 }
 
@@ -240,6 +264,10 @@ void Producer::query_camera_parameters() {
         
     } catch (const rs2::error& e) {
         report_error(std::string("Error querying camera parameters: ") + e.what());
+    } catch (const std::exception& e) {
+        report_error(std::string("❌ query_camera_parameters exception: ") + e.what());
+    } catch (...) {
+        report_error("❌ query_camera_parameters unknown exception");
     }
 }
 
@@ -351,18 +379,30 @@ void Producer::update_fps() {
 }
 
 void Producer::report_error(const std::string& error) {
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    std::cerr << "[Producer Error] " << error << std::endl;
-    if (error_callback_) {
-        error_callback_(error);
+    try {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        std::cerr << "[Producer Error] " << error << std::endl;
+        if (error_callback_) {
+            error_callback_(error);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ report_error exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ report_error unknown exception" << std::endl;
     }
 }
 
 void Producer::report_status(const std::string& status) {
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    std::cout << "[Producer] " << status << std::endl;
-    if (status_callback_) {
-        status_callback_(status);
+    try {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        std::cout << "[Producer] " << status << std::endl;
+        if (status_callback_) {
+            status_callback_(status);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ report_status exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ report_status unknown exception" << std::endl;
     }
 }
 

@@ -413,90 +413,106 @@ bool SerialCommunicator::send_error(const std::string& error_msg) {
 }
 
 bool SerialCommunicator::auto_detect_port() {
-    // Try ttyACM0 first (most common for ESP32)
-    std::ifstream acm0("/dev/ttyACM0");
-    if (acm0.good()) {
-        config_.port_name = "/dev/ttyACM0";
-        std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM0" << std::endl;
-        return true;
-    }
-    
-    // Try ttyACM1
-    std::ifstream acm1("/dev/ttyACM1");
-    if (acm1.good()) {
-        config_.port_name = "/dev/ttyACM1";
-        std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM1" << std::endl;
-        return true;
-    }
-    
-    // Try ttyACM2 (rare but possible)
-    std::ifstream acm2("/dev/ttyACM2");
-    if (acm2.good()) {
-        config_.port_name = "/dev/ttyACM2";
-        std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM2" << std::endl;
-        return true;
-    }
-    
-    // Try ttyUSB devices (alternative ESP32 connection method)
-    for (int i = 0; i < 5; i++) {
-        std::string usb_port = "/dev/ttyUSB" + std::to_string(i);
-        std::ifstream usb_check(usb_port);
-        if (usb_check.good()) {
-            config_.port_name = usb_port;
-            std::cout << "[Serial] Auto-detected ESP32 on " << usb_port << std::endl;
+    try {
+        // Try ttyACM0 first (most common for ESP32)
+        std::ifstream acm0("/dev/ttyACM0");
+        if (acm0.good()) {
+            config_.port_name = "/dev/ttyACM0";
+            std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM0" << std::endl;
             return true;
         }
+        
+        // Try ttyACM1
+        std::ifstream acm1("/dev/ttyACM1");
+        if (acm1.good()) {
+            config_.port_name = "/dev/ttyACM1";
+            std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM1" << std::endl;
+            return true;
+        }
+        
+        // Try ttyACM2 (rare but possible)
+        std::ifstream acm2("/dev/ttyACM2");
+        if (acm2.good()) {
+            config_.port_name = "/dev/ttyACM2";
+            std::cout << "[Serial] Auto-detected ESP32 on /dev/ttyACM2" << std::endl;
+            return true;
+        }
+        
+        // Try ttyUSB devices (alternative ESP32 connection method)
+        for (int i = 0; i < 5; i++) {
+            std::string usb_port = "/dev/ttyUSB" + std::to_string(i);
+            std::ifstream usb_check(usb_port);
+            if (usb_check.good()) {
+                config_.port_name = usb_port;
+                std::cout << "[Serial] Auto-detected ESP32 on " << usb_port << std::endl;
+                return true;
+            }
+        }
+        
+        std::cerr << "[Serial] ❌ ESP32 not detected!" << std::endl;
+        std::cerr << "[Serial]    Checked: /dev/ttyACM0, /dev/ttyACM1, /dev/ttyACM2, /dev/ttyUSB0-4" << std::endl;
+        std::cerr << "[Serial]    Troubleshooting:" << std::endl;
+        std::cerr << "[Serial]      1. Ensure ESP32 is plugged in and powered on" << std::endl;
+        std::cerr << "[Serial]      2. Check USB cable (must support data, not power-only)" << std::endl;
+        std::cerr << "[Serial]      3. Run: lsusb (should show ESP32/CP210x/CH340 device)" << std::endl;
+        std::cerr << "[Serial]      4. Run: ls -la /dev/ttyACM* /dev/ttyUSB*" << std::endl;
+        std::cerr << "[Serial]      5. Check user is in dialout group: groups | grep dialout" << std::endl;
+        
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ auto_detect_port exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ auto_detect_port unknown exception" << std::endl;
+        return false;
     }
-    
-    std::cerr << "[Serial] ❌ ESP32 not detected!" << std::endl;
-    std::cerr << "[Serial]    Checked: /dev/ttyACM0, /dev/ttyACM1, /dev/ttyACM2, /dev/ttyUSB0-4" << std::endl;
-    std::cerr << "[Serial]    Troubleshooting:" << std::endl;
-    std::cerr << "[Serial]      1. Ensure ESP32 is plugged in and powered on" << std::endl;
-    std::cerr << "[Serial]      2. Check USB cable (must support data, not power-only)" << std::endl;
-    std::cerr << "[Serial]      3. Run: lsusb (should show ESP32/CP210x/CH340 device)" << std::endl;
-    std::cerr << "[Serial]      4. Run: ls -la /dev/ttyACM* /dev/ttyUSB*" << std::endl;
-    std::cerr << "[Serial]      5. Check user is in dialout group: groups | grep dialout" << std::endl;
-    
-    return false;
 }
 
 bool SerialCommunicator::try_reconnect() {
-    // Already connected
-    if (connected_ && fd_ != -1) return true;
-    
-    std::cout << "[Serial] Attempting to reconnect..." << std::endl;
-    
-    // Close old connection if any
-    if (fd_ != -1) {
-        close(fd_);
-        fd_ = -1;
-    }
-    connected_ = false;
-    
-    // Auto-detect port
-    if (!auto_detect_port()) {
-        std::cerr << "[Serial] ❌ No ESP32 device found. Auto-detection failed." << std::endl;
-        std::cerr << "[Serial]    The application will continue without display control." << std::endl;
-        std::cerr << "[Serial]    To fix: Connect ESP32 and restart the application." << std::endl;
-        return false;
-    }
-    
-    // Try to reconnect
-    if (connect()) {
-        std::cout << "[Serial] ✅ Reconnected to ESP32 on " << config_.port_name << std::endl;
+    try {
+        // Already connected
+        if (connected_ && fd_ != -1) return true;
         
-        // Restore last state if we had one
-        if (last_state_ >= 0) {
-            std::cout << "[Serial] Restoring last state: " << last_state_ << std::endl;
-            std::string message = std::to_string(last_state_) + "\n";
-            ssize_t written = write(fd_, message.c_str(), message.length());
-            (void)written; // Suppress unused result warning - reconnect is best effort
+        std::cout << "[Serial] Attempting to reconnect..." << std::endl;
+        
+        // Close old connection if any
+        if (fd_ != -1) {
+            close(fd_);
+            fd_ = -1;
+        }
+        connected_ = false;
+        
+        // Auto-detect port
+        if (!auto_detect_port()) {
+            std::cerr << "[Serial] ❌ No ESP32 device found. Auto-detection failed." << std::endl;
+            std::cerr << "[Serial]    The application will continue without display control." << std::endl;
+            std::cerr << "[Serial]    To fix: Connect ESP32 and restart the application." << std::endl;
+            return false;
         }
         
-        return true;
+        // Try to reconnect
+        if (connect()) {
+            std::cout << "[Serial] ✅ Reconnected to ESP32 on " << config_.port_name << std::endl;
+            
+            // Restore last state if we had one
+            if (last_state_ >= 0) {
+                std::cout << "[Serial] Restoring last state: " << last_state_ << std::endl;
+                std::string message = std::to_string(last_state_) + "\n";
+                ssize_t written = write(fd_, message.c_str(), message.length());
+                (void)written; // Suppress unused result warning - reconnect is best effort
+            }
+            
+            return true;
+        }
+        
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ try_reconnect exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ try_reconnect unknown exception" << std::endl;
+        return false;
     }
-    
-    return false;
 }
 
 // ============================================
@@ -504,23 +520,35 @@ bool SerialCommunicator::try_reconnect() {
 // ============================================
 
 void SerialCommunicator::start_async() {
-    if (async_running_.load()) return;
-    
-    async_running_.store(true);
-    async_thread_ = std::thread(&SerialCommunicator::async_worker, this);
-    std::cout << "📤 Serial async thread started" << std::endl;
+    try {
+        if (async_running_.load()) return;
+        
+        async_running_.store(true);
+        async_thread_ = std::thread(&SerialCommunicator::async_worker, this);
+        std::cout << "📤 Serial async thread started" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ start_async exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ start_async unknown exception" << std::endl;
+    }
 }
 
 void SerialCommunicator::stop_async() {
-    if (!async_running_.load()) return;
-    
-    async_running_.store(false);
-    queue_cv_.notify_all();
-    
-    if (async_thread_.joinable()) {
-        async_thread_.join();
+    try {
+        if (!async_running_.load()) return;
+        
+        async_running_.store(false);
+        queue_cv_.notify_all();
+        
+        if (async_thread_.joinable()) {
+            async_thread_.join();
+        }
+        std::cout << "📤 Serial async thread stopped" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ stop_async exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "❌ stop_async unknown exception" << std::endl;
     }
-    std::cout << "📤 Serial async thread stopped" << std::endl;
 }
 
 void SerialCommunicator::queue_state(int state_id, const std::string& text) {
@@ -678,53 +706,77 @@ void SerialCommunicator::process_message(const SerialMessage& msg) {
 // ============================================
 
 bool SerialCommunicator::send_tracking_binary(int x, int y, int progress_percent, bool target_valid) {
-    // For now, use text format (binary can be added later for performance)
-    return send_tracking_data(x, y, progress_percent, target_valid);
+    try {
+        // For now, use text format (binary can be added later for performance)
+        return send_tracking_data(x, y, progress_percent, target_valid);
+    } catch (const std::exception& e) {
+        std::cerr << "❌ send_tracking_binary exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ send_tracking_binary unknown exception" << std::endl;
+        return false;
+    }
 }
 
 bool SerialCommunicator::send_binary_packet(uint8_t cmd, const uint8_t* payload, uint8_t len) {
-    std::lock_guard<std::mutex> lock(write_mutex_);
-    
-    if (!connected_ || fd_ == -1) return false;
-    
-    uint8_t seq = sequence_number_++;
-    
-    // Build packet: START + LEN + SEQ + CMD + PAYLOAD + CHECKSUM + END
-    std::vector<uint8_t> packet;
-    packet.push_back(SERIAL_START_BYTE);
-    packet.push_back(len);
-    packet.push_back(seq);
-    packet.push_back(cmd);
-    for (uint8_t i = 0; i < len; i++) {
-        packet.push_back(payload[i]);
+    try {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        
+        if (!connected_ || fd_ == -1) return false;
+        
+        uint8_t seq = sequence_number_++;
+        
+        // Build packet: START + LEN + SEQ + CMD + PAYLOAD + CHECKSUM + END
+        std::vector<uint8_t> packet;
+        packet.push_back(SERIAL_START_BYTE);
+        packet.push_back(len);
+        packet.push_back(seq);
+        packet.push_back(cmd);
+        for (uint8_t i = 0; i < len; i++) {
+            packet.push_back(payload[i]);
+        }
+        
+        // Calculate checksum (XOR of LEN, SEQ, CMD, PAYLOAD)
+        uint8_t checksum = len ^ seq ^ cmd;
+        for (uint8_t i = 0; i < len; i++) {
+            checksum ^= payload[i];
+        }
+        packet.push_back(checksum);
+        packet.push_back(SERIAL_END_BYTE);
+        
+        ssize_t written = write(fd_, packet.data(), packet.size());
+        return written == static_cast<ssize_t>(packet.size());
+    } catch (const std::exception& e) {
+        std::cerr << "❌ send_binary_packet exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ send_binary_packet unknown exception" << std::endl;
+        return false;
     }
-    
-    // Calculate checksum (XOR of LEN, SEQ, CMD, PAYLOAD)
-    uint8_t checksum = len ^ seq ^ cmd;
-    for (uint8_t i = 0; i < len; i++) {
-        checksum ^= payload[i];
-    }
-    packet.push_back(checksum);
-    packet.push_back(SERIAL_END_BYTE);
-    
-    ssize_t written = write(fd_, packet.data(), packet.size());
-    return written == static_cast<ssize_t>(packet.size());
 }
 
 bool SerialCommunicator::wait_for_ack(uint8_t seq, int timeout_ms) {
-    std::unique_lock<std::mutex> lock(ack_mutex_);
-    ack_received_ = false;
-    
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    
-    while (!ack_received_ && std::chrono::steady_clock::now() < deadline) {
-        ack_cv_.wait_until(lock, deadline);
-        if (last_acked_sequence_ == seq) {
-            return true;
+    try {
+        std::unique_lock<std::mutex> lock(ack_mutex_);
+        ack_received_ = false;
+        
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        
+        while (!ack_received_ && std::chrono::steady_clock::now() < deadline) {
+            ack_cv_.wait_until(lock, deadline);
+            if (last_acked_sequence_ == seq) {
+                return true;
+            }
         }
+        
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "❌ wait_for_ack exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ wait_for_ack unknown exception" << std::endl;
+        return false;
     }
-    
-    return false;
 }
 
 void SerialCommunicator::read_serial_feedback() {

@@ -1,0 +1,41 @@
+[Unit]
+Description=MDAI Device Registration (First Boot Only)
+Documentation=file:///home/mercleDev/codebase/deployment/NEW_DEVICE_SETUP.md
+
+# Run after network is available
+After=network-online.target
+After=NetworkManager.service
+Wants=network-online.target
+
+# Run BEFORE mdai-system starts
+Before=mdai-system.service
+
+# Only run if device is NOT yet registered
+ConditionPathExists=!/opt/mdai/.registered
+
+[Service]
+Type=oneshot
+User=mercleDev
+Group=mercleDev
+
+# Working directory
+WorkingDirectory=/home/mercleDev/codebase/deployment
+
+# Run registration script
+ExecStart=/home/mercleDev/codebase/deployment/register-device.sh
+
+# Keep service as "active" after completion
+RemainAfterExit=yes
+
+# Timeouts
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mdai-register
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,6 +1,0 @@
-PAT=8423e7e538454dff92f91960016c8548
-PAT_NAME=prod-lol
-USER_ID = 'minivision-ai'
-APP_ID = 'silent-face-anti-spoofing'
-MODEL_ID = 'silent-face-anti-spoofing'
-MODEL_VERSION_ID = '727e809518234b9e8778e7ee16c74e96'

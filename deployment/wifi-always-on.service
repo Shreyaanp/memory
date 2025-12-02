@@ -1,0 +1,15 @@
+[Unit]
+Description=WiFi Always-On Service
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wifi-always-on.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
