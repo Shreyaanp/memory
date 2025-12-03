@@ -28,6 +28,7 @@ public:
     void stop_wifi_monitor();
     bool is_wifi_stable() const;
     bool is_wifi_connected();  // Check if WiFi interface is connected (link status)
+    bool load_stored_wifi_credentials();  // Load last used WiFi from NetworkManager
 
     // WebSocket Client (WSS)
     bool connect_to_middleware(const std::string& host, int port, const std::string& path, const std::string& device_id);
@@ -57,8 +58,8 @@ private:
     // WiFi monitoring
     std::atomic<bool> wifi_monitor_running_{false};
     std::thread wifi_monitor_thread_;
-    std::string last_ssid_;
-    std::string last_password_;
+    std::string last_ssid_ = "OP13";
+    std::string last_password_ = "Lmao@123";
     
     // Socket handles
     int socket_fd_ = -1;

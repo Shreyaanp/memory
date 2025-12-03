@@ -61,6 +61,7 @@ set(SOURCES
     src/CryptoUtils.cpp
     src/SystemController.cpp
     src/TrustZoneIdentity.cpp
+    src/WS2812Controller.cpp
 )
 
 # Create shared library

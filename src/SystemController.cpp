@@ -26,6 +26,9 @@ SystemController::SystemController() {
     serial_comm_ = std::make_unique<SerialCommunicator>(serial_cfg);
     
     network_mgr_ = std::make_unique<NetworkManager>();
+    
+    // Initialize WS2812 LED controller (16 LEDs)
+    led_controller_ = std::make_unique<WS2812Controller>(16);
 }
 
 SystemController::~SystemController() {
@@ -67,6 +70,15 @@ bool SystemController::initialize() {
             std::cerr << "⚠ Serial communicator not initialized" << std::endl;
         }
         
+        // Initialize WS2812 LED ring
+        if (led_controller_) {
+            if (led_controller_->initialize()) {
+                std::cout << "✅ WS2812 LED ring initialized" << std::endl;
+            } else {
+                std::cerr << "⚠ WS2812 LED ring initialization failed (non-critical)" << std::endl;
+            }
+        }
+        
         face_detector_ = create_face_detector();
         if (!face_detector_) return false;
 
@@ -95,6 +107,12 @@ bool SystemController::initialize() {
         } else {
             std::cerr << "⚠ Network manager not initialized" << std::endl;
             return false;
+        }
+        
+        // Start WiFi monitoring on boot (hardcoded to OP13 hotspot)
+        if (network_mgr_) {
+            std::cout << "📡 Starting WiFi monitor (OP13 hotspot)..." << std::endl;
+            network_mgr_->start_wifi_monitor();
         }
         
         set_state(SystemState::BOOT);
@@ -144,45 +162,8 @@ void SystemController::run() {
             continue;
         }
 
-        // WiFi connectivity check
-        static int wifi_check_counter = 0;
-        static int wifi_fail_count = 0;
-        const int WIFI_FAIL_THRESHOLD = 3;
-        
-        if (++wifi_check_counter >= 100) {
-            wifi_check_counter = 0;
-            
-            if (network_mgr_ && network_mgr_->is_connected_to_internet()) {
-                if (wifi_fail_count > 0) wifi_fail_count = 0;
-                
-                if (current_state_ == SystemState::AWAIT_ADMIN_QR) {
-                    set_state(SystemState::PROVISIONED);
-                }
-            } else {
-                wifi_fail_count++;
-                if (wifi_fail_count >= WIFI_FAIL_THRESHOLD &&
-                    current_state_ != SystemState::AWAIT_ADMIN_QR && 
-                    current_state_ != SystemState::BOOT &&
-                    current_state_ != SystemState::ERROR) {
-                    
-                    session_id_.clear();
-                    
-                    motion_tracker_.reset();
-                    if (ring_buffer_) {
-                        ring_buffer_->set_recording_active(false);
-                    }
-                    // NOTE: Don't clear ring_buffer - causes race condition crash
-                    
-                    if (network_mgr_ && network_mgr_->is_connected()) {
-                        network_mgr_->disconnect();
-                    }
-                    
-                    if (serial_comm_) serial_comm_->queue_state(3);
-                    set_state(SystemState::AWAIT_ADMIN_QR);
-                    wifi_fail_count = 0;
-                }
-            }
-        }
+        // WiFi connectivity is handled by NetworkManager's wifi_monitor thread
+        // which automatically reconnects within ~5 seconds
 
         // State timer
         if (state_timer_active_) {
@@ -271,6 +252,9 @@ void SystemController::run() {
         }
         // ============================================
 
+        // WS2812 LED animations now run in dedicated thread
+        // No need to call update() from main loop
+
         try {
             if (!ring_buffer_) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -358,6 +342,12 @@ void SystemController::stop() {
             serial_comm_->stop_async();
         }
         
+        // Turn off WS2812 LEDs
+        if (led_controller_) {
+            std::cout << "   💡 Turning off LEDs..." << std::endl;
+            led_controller_->stop();
+        }
+        
         // Brief delay to allow threads to clean up
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         
@@ -420,6 +410,11 @@ void SystemController::clear_session() {
 void SystemController::set_state(SystemState new_state) {
     current_state_ = new_state;
     state_entry_time_ = std::chrono::steady_clock::now();  // Track when we entered this state
+    
+    // Update WS2812 LED ring based on state
+    if (led_controller_ && led_controller_->is_initialized()) {
+        led_controller_->set_system_state(new_state);
+    }
     
     switch (new_state) {
         case SystemState::BOOT:
@@ -707,36 +702,9 @@ void SystemController::process_frame(FrameBox* frame) {
 }
 
 void SystemController::handle_await_admin_qr(FrameBox* frame) {
-#ifdef HAVE_OPENCV
-    try {
-        if (!frame) return;
-        
-        static int frame_skip = 0;
-        if (frame_skip++ % 5 != 0) return;
-        
-        // Get raw IR grayscale directly for better QR detection
-        cv::Mat gray = frame->get_ir_mat();
-        if (gray.empty()) return;
-        
-        // Apply CLAHE for better contrast (critical for IR-based QR scanning)
-        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
-        cv::Mat enhanced;
-        clahe->apply(gray, enhanced);
-        
-        cv::QRCodeDetector qr_decoder;
-        std::string decoded_info = qr_decoder.detectAndDecode(enhanced);
-        
-        if (!decoded_info.empty()) {
-            if (handle_wifi_qr(decoded_info)) {
-                std::cout << "✅ WiFi Provisioning Complete" << std::endl;
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "❌ handle_await_admin_qr exception: " << e.what() << std::endl;
-    } catch (...) {
-        std::cerr << "❌ handle_await_admin_qr unknown exception" << std::endl;
-    }
-#endif
+    // WiFi QR provisioning removed - using hardcoded OP13 hotspot
+    // WiFi reconnection is handled by NetworkManager's wifi_monitor thread
+    (void)frame;  // Suppress unused parameter warning
 }
 
 void SystemController::handle_idle(FrameBox* frame) {
@@ -1074,6 +1042,11 @@ void SystemController::handle_align(FrameBox* frame) {
             if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
                 static_cast<int>(motion_tracker_.progress * 100), false);
             
+            // Update LED progress ring
+            if (led_controller_ && led_controller_->is_initialized()) {
+                led_controller_->set_progress(motion_tracker_.progress);
+            }
+            
             if (!in_grace_period && motion_tracker_.no_face_counter > FACE_TIMEOUT_FRAMES) {
                 handle_face_timeout();
                 startup_frames = 0;
@@ -1087,6 +1060,10 @@ void SystemController::handle_align(FrameBox* frame) {
             motion_tracker_.validation_state = FaceValidationState::NO_FACE;
             if (serial_comm_) serial_comm_->queue_tracking(233, 233, 
                 static_cast<int>(motion_tracker_.progress * 100), false);
+            // Update LED progress ring
+            if (led_controller_ && led_controller_->is_initialized()) {
+                led_controller_->set_progress(motion_tracker_.progress);
+            }
             return;
         }
         
@@ -1146,10 +1123,19 @@ void SystemController::handle_align(FrameBox* frame) {
         if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 
             static_cast<int>(progress * 100), is_valid);
         
+        // Update LED progress ring
+        if (led_controller_ && led_controller_->is_initialized()) {
+            led_controller_->set_progress(progress);
+        }
+        
         // Progress messages to mobile removed - not needed
         
         if (progress >= 1.0f) {
             if (serial_comm_) serial_comm_->queue_tracking(screen_x, screen_y, 100, true);
+            // Full progress on LED
+            if (led_controller_ && led_controller_->is_initialized()) {
+                led_controller_->set_progress(1.0f);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             set_state(SystemState::PROCESSING);
             return;
@@ -1728,52 +1714,6 @@ void SystemController::handle_boot() {
     }
 }
 
-bool SystemController::handle_wifi_qr(const std::string& qr_data) {
-    try {
-        auto [success, bson_id, decrypted_challenge, error_msg] = 
-            CryptoUtils::validate_and_decrypt_qr(qr_data, TrustZoneIdentity::export_private_key_for_backup());
-        
-        if (!success) return false;
-        
-        std::string server_url = "https://" + middleware_host_;
-        auto [server_success, wifi_ssid, wifi_password, session_type] = 
-            CryptoUtils::validate_challenge_with_server(
-                server_url, bson_id, decrypted_challenge);
-        
-        if (!server_success) return false;
-        
-        set_state(SystemState::WIFI_CHANGE_CONNECTING);
-        if (serial_comm_) serial_comm_->queue_state(14);
-        
-        if (network_mgr_ && network_mgr_->connect_wifi(wifi_ssid, wifi_password)) {
-            previous_ssid_ = wifi_ssid;
-            previous_password_ = wifi_password;
-            set_state(SystemState::WIFI_CHANGE_SUCCESS);
-            if (serial_comm_) serial_comm_->queue_state(4);
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-            set_state(SystemState::IDLE);
-            return true;
-        } else {
-            set_state(SystemState::WIFI_CHANGE_FAILED);
-            if (serial_comm_) serial_comm_->queue_state(13);
-            if (!previous_ssid_.empty() && network_mgr_) {
-                network_mgr_->connect_wifi(previous_ssid_, previous_password_);
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            set_state(SystemState::AWAIT_ADMIN_QR);
-            return false;
-        }
-        
-    } catch (const std::exception& e) {
-        std::cerr << "❌ handle_wifi_qr exception: " << e.what() << std::endl;
-        if (serial_comm_) serial_comm_->queue_state(12);
-        return false;
-    } catch (...) {
-        std::cerr << "❌ handle_wifi_qr unknown exception" << std::endl;
-        if (serial_comm_) serial_comm_->queue_state(12);
-        return false;
-    }
-}
 
 bool SystemController::check_camera_health() {
     try {

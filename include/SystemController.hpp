@@ -12,6 +12,7 @@
 #include "NetworkManager.hpp"
 #include "CryptoUtils.hpp"
 #include "TrustZoneIdentity.hpp"
+#include "WS2812Controller.hpp"
 
 #include <memory>
 #include <atomic>
@@ -70,6 +71,7 @@ private:
     std::unique_ptr<FaceDetector> face_detector_;
     std::unique_ptr<SerialCommunicator> serial_comm_;
     std::unique_ptr<NetworkManager> network_mgr_;
+    std::unique_ptr<WS2812Controller> led_controller_;  // WS2812 LED ring
 
     // State Management
     std::atomic<SystemState> current_state_{SystemState::BOOT};
@@ -86,8 +88,6 @@ private:
     // Configuration
     std::string device_id_;
     std::string hardware_id_;
-    std::string previous_ssid_;
-    std::string previous_password_;
     std::string session_id_;
     // platform_id removed - handled server-side only
     
@@ -191,7 +191,6 @@ private:
     void handle_face_timeout();
     
     // QR Handlers
-    bool handle_wifi_qr(const std::string& qr_data);
     std::string load_qr_shared_key();
     
     // Camera Management (simplified - single mode)
